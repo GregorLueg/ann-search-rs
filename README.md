@@ -6,494 +6,176 @@
 
 # ann-search-rs
 
-Various approximate nearest neighbour/vector searches implemented in Rust (with
-focus on computational biology applications, specifically single cell). The
-search algorithms are designed for (mostly) high in-memory performance. Indices
-can be saved to disk and loaded back in via the `serialise` feature. Longer
-term, I might add the option to add/remove vectors from some of the indices. The
-package also has an evolving thin wrapper for [Python](https://pypi.org/project/ann-search/)
-now, too.
+Approximate nearest neighbour search in Rust, built for computational biology
+and single cell in particular. Everything is in memory and tuned for speed:
+SIMD distance kernels with runtime dispatch (SSE, AVX2, AVX-512, NEON), rayon
+across queries, and GPU paths via wgpu or, on Apple Silicon, MLX.
 
-## Table of Contents
+It started as the kNN code in [bixverse](https://github.com/GregorLueg/bixverse),
+where kNN graphs are everywhere, and grew into far more indices than originally
+planned. The algorithms are other people's great ideas; this is a Rust
+implementation of them. There is a Python wrapper on
+[PyPI](https://pypi.org/project/ann-search/) (`ann-search`), and changes live in
+the [CHANGELOG](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md).
 
-- [Description](#description)
-- [Features](#features)
-- [Installation](#installation)
-- [Example usage](#example-usage)
-- [Gridsearches and performance](#running-the-grid-searches)
-- [FEATURE: quantisation](#quantised-indices)
-- [FEATURE: GPU acceleration](#gpu)
-- [FEATURE: Binary indices](#binarised-indices)
-- [FEATURE: Saving and loading](#saving-and-loading-indices)
+## What's in it
 
-## Description
+| Family | Indices | Feature |
+|---|---|---|
+| Exact | Exhaustive (GEMM), KmKnn | default |
+| Trees and hashing | Annoy, BallTree, Kd forest, LSH | default |
+| Graphs | HNSW, NN-Descent, Vamana, NSG, RNN-Descent | default |
+| Clustered | IVF, SOAR | default |
+| Quantised | BF16, SQ8 (exhaustive, IVF, HNSW), PQ, OPQ, SOAR-PQ, SOAR-OPQ | `quantised` |
+| Binary | Bitwise (SimHash, PCA hashing, sign), RaBitQ (exhaustive, IVF, HNSW), TurboQuant, Quantised Graph | `binary` |
+| GPU (wgpu) | Exhaustive, IVF, CAGRA-style, NN-Descent and clustered NN-Descent kNN graphs | `gpu` |
+| GPU (MLX) | Exhaustive, IVF, CAGRA-style, NN-Descent | `mlx`, experimental |
 
-Extracted function for approximate nearest neighbour searches specifically
-with single cell in mind from [bixverse](https://github.com/GregorLueg/bixverse),
-a R/Rust package designed for computational biology, that has a ton of
-functionality for single cell. Within all of the single cell functions, kNN
-generations are ubiqituos, thus, I want to expose the APIs to other packages.
-Feel free to use these implementations where you might need approximate nearest
-neighbour searches. This work is based on the great work from others who
-figured out how to design these algorithms and is just an implementation into
-Rust of many of these. Over time, I started getting interested into vector
-searches and implement WAY more indices and new stuff into this than initially
-anticipated. If you want to see what changed, please check this
-[one out](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.md)
+Distances: squared Euclidean, cosine, and Manhattan on a subset of the indices.
 
-## Features
-
-- **Multiple ANN algorithms**:
-  - *Annoy (Approximate Nearest Neighbours Oh Yeah)*
-  - *BallTree*
-  - *Exhaustive flat index*
-  - *HNSW (Hierarchical Navigable Small World)*
-  - *IVF (Inverted File index)*
-  - *Kd forest (based on Kd trees)*
-  - *KmKnn (k-means kNN)*
-  - *LSH (Locality Sensitive Hashing)*
-  - *NNDescent (Nearest Neighbour Descent)*
-  (heavily inspired by [PyNNDescent](https://github.com/lmcinnes/pynndescent)).
-  - *Navigating Spread-out Graph (NSG)*
-  - *Relative NN-Descent*
-  - *SOAR (IVF with spilled secondary assignments)*
-  - *Vamana (the graph powering DiskANN)*
-
-- **Distance metrics**:
-  - Euclidean
-  - Cosine
-  - Manhattan (support for a subset of the approximate nearest neighbour
-    searches).
-
-- **High performance**: Optimised implementations with SIMD, heavy
-  multi-threading were possible and optimised structures for memory access.
-
-- **Flexible inputs**: every `build_*` and `query_*` function takes a faer
-  matrix, an `ndarray` 2-D array (optional feature) or a plain row-major slice
-  with its shape. Rows are always samples, columns are always features.
-
-- **Quantised indices** (optional feature):
-  - *BF16* (brain float 16 storage for exhaustive and IVF)
-  - *SQ8* (uniform 8-bit quantisation for exhaustive, IVF and HNSW)
-  - *PQ* (product quantisation for exhaustive and IVF)
-  - *OPQ* (optimised product quantisation for exhaustive and IVF)
-  - *SOAR-PQ* and *SOAR-OPQ* (the above with spilled secondary assignments)
-
-- **GPU-accelerated indices** (optional feature):
-  - *Exhaustive flat index with GPU acceleration*
-  - *IVF (Inverted File index) with GPU acceleration*
-  - *CAGRA style index*
-  - *NN-Descent kNN-graph builders, plain and clustered for datasets past the
-    device's per-binding limit*
-
-- **Self-kNN graph generation**: NN-Descent on CPU and GPU hands back the graph
-  it built during construction, no search pass needed. See the
-  [kNN-graph benchmarks](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
-
-- **(Near) Binarised indices** (optional feature):
-  - *Binary* (different types of binary quantisations for exhaustive and IVF
-    indices.)
-  - *RaBitQ* (RaBitQ quantisation for exhaustive, IVF and HNSW.)
-  - *Quantised Graph* (a RaBitQ-based version that leverages RaBitQ and SIMD
-    for extremely fast querying)
-  - *TurboQuant* (Turbo Quantisation for exhaustive and IVF indices.)
+Every index has a `query_*_self` path for the full self-kNN graph, and most take
+a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
+re-entering, NN-Descent hands back the graph it built anyway.
 
 ## Installation
 
-Add this to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-ann-search-rs = "*"
+ann-search-rs = { version = "0.11", features = ["quantised", "binary"] }
 ```
 
-### Note
+Optional features:
 
-With version `"0.4.2"` some breaking API changes were introduced: this harmonise
-several of the functions and avoid panics in favour of errors. A key change
-was also the cubecl version bump, which changes quite a few APIs for the
-GPU-accelerated version.
+- `quantised`, `binary`, `gpu`, `mlx`: the index families above.
+- `serialise`: save indices to disk and load them back.
+- `ndarray`: accept `ndarray` 2-D arrays. Off by default, since it makes
+  `ndarray` a public dependency.
+- `synthetic`: the dataset generators behind the benchmark tables.
+- `mimalloc`: mimalloc as the global allocator.
+- `accelerate` (default): routes dense GEMM through Apple Accelerate on macOS.
+  No effect elsewhere. Turn it off with `default-features = false`.
 
-Version `"0.6.0"` opened up the inputs via the `AnnMatrix` trait. Existing code
-passing faer matrices keeps working unchanged, but a few of the lower-level
-binariser and quantiser constructors now take flat slices instead of a `MatRef`.
-
-The SQ8 indices were rebuilt on a shared-scale `u8` quantiser. The old
-per-dimension scales did not cancel in a code-to-code distance, so the index was
-ranking by the wrong quantity: recall@10 on 128-D synthetic cell embeddings goes
-0.26 to 0.95, and the exhaustive scan is now faster than `f32` rather than
-slower. `build_exhaustive_sq8_index` and `build_ivf_sq8_index` gained an
-`Option<UniformQuantParams>`; `ScalarQuantiser` is gone.
-
-## Example Usage
-
-Below shows an example on how to use for example the HNSW index and query it.
-
-### HNSW
+## Usage
 
 ```rust
-use ann_search_rs::{build_hnsw_index, query_hnsw_index};
+use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self};
 use faer::Mat;
 
-// Build the HNSW index
-let data = Mat::from_fn(1000, 128, |_, _| rand::random::<f32>());
-let hnsw_idx = build_hnsw_index(
-  data.as_ref(),
-  16,             // m
-  100,            // ef_construction
-  "euclidean",    // distance metric
-  42,             // seed
-  false           // verbosity
+let data = Mat::from_fn(10_000, 32, |_, _| rand::random::<f32>());
+let index = build_hnsw_index(
+    data.as_ref(),
+    16,          // m
+    100,         // ef_construction
+    "euclidean", // or "cosine", "manhattan"
+    42,          // seed
+    false,       // verbose
 );
 
-// Query the HNSW index
-// In this case we are doing a full self query
-let query = Mat::from_fn(10, 128, |_, _| rand::random::<f32>());
-let (hnsw_indices, hnsw_dists) = query_hnsw_index(
-  query.as_ref(),
-  &hnsw_idx,
-  15,             // k
-  200,            // ef_search
-  true,           // return distances
-  false           // verbosity
-);
+// Cross-set query: k = 15, ef_search = 200, return distances
+let query = Mat::from_fn(100, 32, |_, _| rand::random::<f32>());
+let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, false)?;
+
+// Self-kNN graph, indices only
+let (graph, _) = query_hnsw_self(&index, 15, 200, false, false)?;
 ```
 
-The input does not have to be a faer matrix. Every `build_*` and `query_*`
-function accepts anything implementing `AnnMatrix`, so an `ndarray` view (with
-the `ndarray` feature) or a row-major slice with its shape work just as well:
+Every index follows the same `build_*` / `query_*` / `query_*_self` pattern.
+Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
+row-major slice with its shape. Rows are samples, columns are features, always:
 
 ```rust
-let hnsw_idx = build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, false);
-let hnsw_idx = build_hnsw_index((flat.as_slice(), 1000, 128), 16, 100, "euclidean", 42, false);
+let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, false);
 ```
 
-Orientation is fixed throughout: rows are samples, columns are features.
+The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
+Quickest way to see how one behaves on your kind of data.
 
-The package provides a number of different approximate nearest neighbour
-searches. The overall design is very similar and if you wish details on usage,
-please refer to the `examples/*.rs` section which shows you the grid searches
-across various parameters per given index. This and the documentation is a
-good starting point to understand how the crate works.
+## Benchmarks
 
-## Performance and parameters
+Against hnswlib, faiss, annoy, pynndescent and usearch on Fashion-MNIST, SIFT
+and GloVe, compared at equal recall:
+[comparison](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_comparison.md).
 
-### macOS and Apple Accelerate
+Internal gridsearches, per feature:
 
-On macOS the default `accelerate` feature routes every dense CPU GEMM (k-means
-assignment, exhaustive search, the binariser and OPQ rotations, LSH projections)
-through Apple's Accelerate framework. It ships with every macOS, so there is
-nothing to install, and it has no effect on other platforms. Turn it off with
-`default-features = false`.
+- [Standard CPU indices](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md)
+- [Quantised](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md)
+- [Binary](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md)
+- [GPU (wgpu)](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md)
+- [MLX](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_mlx.md)
+- [kNN graph generation](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md)
 
-The benchmark tables in `docs/` are generated **without** it, so they show what
-Linux and Windows builds get. On an M1 Max, Accelerate on top of those numbers
-measured roughly:
-
-| path | speed-up |
-|---|---|
-| exhaustive search (query and self-kNN) | ~2x |
-| IVF and binary IVF build | ~1.5x |
-| OPQ build | ~10% |
-| NN-Descent, LSH | negligible |
-
-These are Apple Silicon numbers. Do not expect them elsewhere.
-
-### Synthetic data sets
-
-**GaussianNoise**
-
-Isotropic Gaussian clusters with variable sizes and per-cluster standard
-deviations, centred across the full ambient space. A fraction of points
-(`DEFAULT_BRIDGE_FRACTION`: 20%) are placed on thin Gaussian tubes interpolating
-between each cluster and its nearest neighbour, so clusters are connected rather
-than fully isolated. Useful as a baseline where structure is axis-agnostic and
-mostly well-separated.
-
-**Correlated**
-
-Well-separated clusters, each an arbitrarily-oriented ellipsoid with a low-rank
-power-law covariance (cluster-local anisotropy), plus a globally-shared off-axis
-subspace carrying inter-dimension correlation. The structured variance is
-deliberately not aligned with the coordinate axes, so a learned rotation (OPQ)
-can recover it while axis-aligned PQ cannot. `correlation_strength` splits
-variance between the shared global subspace (1.0) and the cluster-local one
-(0.0). Designed to separate rotation-aware from axis-aligned quantisers.
-
-**LowRank**
-
-Data that genuinely lives in a low-dimensional subspace (`intrinsic_dim`),
-isometrically embedded into the full space (`dim`) via an orthonormal rotation,
-with minimal isotropic noise for measurement error. Clusters follow a two-level
-lineage hierarchy (roots, then leaves around each root), and a fraction of points
-(`DEFAULT_TRAJECTORY_FRACTION`: 15%) lie on quadratic Bezier trajectories
-chaining leaves within a lineage. Models the manifold hypothesis: locally
-low-dimensional, globally curved, so a single global rotation cannot flatten it.
-
-**CellEmbedding**
-
-Approximates the geometry of foundation-model cell embeddings (Geneformer/scGPT
-style) at 256-768 dimensions. Combines five properties, each targeting a distinct
-quantisation failure mode: a strong shared anisotropy cone (large mean offset,
-high pairwise cosine) that defeats cosine- and sign-based methods; a few
-axis-aligned rogue dimensions with outsized variance that dominate dot products
-and starve PQ codebooks; per-cell-type low-rank oriented subspaces whose union is
-full-rank, so no single OPQ rotation fully aligns them; differentiation
-trajectories between related types (curved manifold); and per-cell lognormal norm
-variation standing in for library size/sequencing depth. Recommended with
-dim=256 to dim=768 and n_clusters=25+. Note the constants here are
-plausible rather than fitted to real embeddings — if you have a real
-Geneformer/scGPT matrix, fit the cone, rogue-dim magnitudes and eigenspectrum to
-it before trusting benchmark conclusions.
-
-### Running the grid searches
-
-To identify good basic thresholds, there are a set of different gridsearch
-scripts available. These can be run via
+These run on four synthetic datasets from the `synthetic` feature: Gaussian
+clusters joined by bridges, correlated anisotropic clusters (separates OPQ from
+PQ), low-rank manifolds with lineage trajectories, and a mock of
+foundation-model cell embeddings. To rerun one:
 
 ```bash
-# Run with default parameters
-cargo run --example gridsearch_annoy --release
-
-# Override specific parameters
-cargo run --example gridsearch_annoy --release -- --n-samples 500000 --dim 32 --distance euclidean
-
-# Available parameters with their defaults:
-# --n-samples 150_000
-# --dim 32
-# --n-clusters 25
-# --k 15
-# --seed 42
-# --distance euclidean
-# --data gaussian
-# --intrinsic-dim 16   (lowrank data only)
+cargo run --example gridsearch_hnsw --release
+cargo run --example gridsearch_ivf --release -- --n-samples 500000 --dim 128 --distance cosine
+cargo run --example gridsearch_pq --release --features quantised
 ```
 
-Every index is trained on 150k samples with 32 dimensions distance and 25 distinct
-clusters (of different sizes each). Then the index is tested against a subset of
-10% of samples with a little Gaussian noise added and for full kNN self
-generation. Below are the results shown for `Annoy` with the GaussianNoise
-data sets.
-
-```
-=====================================================================================================================================================
-Benchmark: 150k samples, 32D
-=====================================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
------------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        11.93       674.61       686.53       1.0000          1.0000            1.0000        18.31
-Exhaustive (self)                                         11.93     6_462.19     6_474.11       1.0000          1.0000            1.0000        18.31
-IVF-nl273-np13 (query)                                   209.47        78.83       288.30       0.9973          1.0002            1.0000        18.35
-IVF-nl273-np16 (query)                                   209.47        88.95       298.42       0.9996          1.0000            1.0000        18.35
-IVF-nl273-np23 (query)                                   209.47       113.22       322.69       1.0000          1.0000            1.0000        18.35
-IVF-nl273 (self)                                         209.47       941.43     1_150.90       1.0000          1.0000            1.0000        18.35
-IVF-nl387-np19 (query)                                   308.95        82.18       391.13       0.9989          1.0001            1.0000        18.36
-IVF-nl387-np27 (query)                                   308.95       101.92       410.87       1.0000          1.0000            1.0000        18.36
-IVF-nl387 (self)                                         308.95       855.70     1_164.65       1.0000          1.0000            1.0000        18.36
-IVF-nl547-np23 (query)                                   533.13        79.03       612.16       0.9936          1.0004            1.0000        18.38
-IVF-nl547-np27 (query)                                   533.13        94.97       628.10       0.9985          1.0001            1.0000        18.38
-IVF-nl547-np33 (query)                                   533.13       111.11       644.25       1.0000          1.0000            1.0000        18.38
-IVF-nl547 (self)                                         533.13       790.97     1_324.11       1.0000          1.0000            1.0000        18.38
------------------------------------------------------------------------------------------------------------------------------------------------------
-```
-
-And MacOS with `Accelerate` this is even faster, see here:
-
-```
-=====================================================================================================================================================
-Benchmark: 150k samples, 32D
-=====================================================================================================================================================
-Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
------------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        12.06       503.92       515.98       1.0000          1.0000            1.0000        18.31
-Exhaustive (self)                                         12.06     4_721.26     4_733.32       1.0000          1.0000            1.0000        18.31
-IVF-nl273-np13 (query)                                   166.62        80.75       247.37       0.9973          1.0002            1.0000        18.35
-IVF-nl273-np16 (query)                                   166.62        97.69       264.31       0.9996          1.0000            1.0000        18.35
-IVF-nl273-np23 (query)                                   166.62       114.68       281.30       1.0000          1.0000            1.0000        18.35
-IVF-nl273 (self)                                         166.62       938.69     1_105.31       1.0000          1.0000            1.0000        18.35
-IVF-nl387-np19 (query)                                   239.50        81.60       321.09       0.9989          1.0001            1.0000        18.36
-IVF-nl387-np27 (query)                                   239.50       104.79       344.29       1.0000          1.0000            1.0000        18.36
-IVF-nl387 (self)                                         239.50       826.84     1_066.34       1.0000          1.0000            1.0000        18.36
-IVF-nl547-np23 (query)                                   369.32        74.69       444.01       0.9936          1.0004            1.0000        18.38
-IVF-nl547-np27 (query)                                   369.32        87.23       456.55       0.9985          1.0001            1.0000        18.38
-IVF-nl547-np33 (query)                                   369.32       101.64       470.96       1.0000          1.0000            1.0000        18.38
-IVF-nl547 (self)                                         369.32       773.66     1_142.98       1.0000          1.0000            1.0000        18.38
------------------------------------------------------------------------------------------------------------------------------------------------------
-```
-
-Detailed benchmarks on all the "standard" CPU-based indices can be found
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_standard.md).
-Every index was tested on every data set with 32 dimensions (mimicking typical
-single cell scenarios) and against the cell embedding data set with 128
-dimensions.
-
-## Quantised indices
-
-The crate also provides some quantised approximate nearest neighbour searches,
-designed for very large data sets where memory (and query time) starts becoming
-constraining. There are a total of four different quantisation methods available
-(plus some binary quantisation, see further below). The crate does NOT provide
-re-ranking on the full vectors (yet) for these quantised indices.
-
-- *BF16*: An exhaustive search and IVF index are available with BF16
-  quantisation. In this case the `f32` or `f64` are transformed during storage
-  into `bf16` floats. These keep the range of `f32`; however, they reduce
-  precision.
-- *SQ8*: Uniform scalar quantisation to `u8`, with a per-dimension offset and a
-  **single scale shared across every dimension**. That shared scale is what makes
-  the integer distance between two codes preserve the ordering of the float one,
-  so one kernel serves both index construction and query. 4x smaller than `f32`
-  and faster to scan, since the arithmetic is integer. Exhaustive, IVF and HNSW
-  indices are provided.
-- *PQ*: Uses product quantisation. Useful when the dimensions of the vectors
-  are incredibly large and one needs to compress the index in memory even
-  further. Only useful when dim ≥ 128 in most cases and ideal for very large
-  dimensions. Exhaustive and IVF are available with product quantisation.
-  Exhaustive PQ is not recommend due to worse performance across the board
-  compared to IVF-PQ – the index was added for completeness.
-- *OPQ*: Optimised product quantisation. Learns a rotation to de-correlate the
-  residuals before the subvector split. Same indices as for PQ.
-- *SOAR-PQ / SOAR-OPQ*: IVF-PQ and IVF-OPQ where each vector is written into two
-  cells rather than one. PQ has to rebuild an ADC lookup table per probed cell,
-  so pulling twice the candidates out of one cell can beat probing two.
-
-The benchmarks can be found
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_quantised.md).
-If you wish to use these, please add the `"quantised"` feature:
-
-```toml
-[dependencies]
-ann-search-rs = { version = "*", features = ["quantised"] }
-```
+The tables are generated without Accelerate, so they show what Linux and
+Windows get. On an M1 Max, Accelerate makes exhaustive search about 2x faster
+and IVF builds about 1.5x.
 
 ## GPU
 
-GPU-accelerated exhaustive and IVF indices, a
-[CAGRA-style index](https://arxiv.org/abs/2308.15136) added in `0.2.6`, and two
-raw kNN-graph builders: `build_knn_graph_gpu` for anything that fits the
-device's per-binding limit, and `build_clustered_knn_graph_gpu` for anything
-past it. Under the hood this uses
-[cubecl](https://github.com/tracel-ai/cubecl) with the wgpu backend, which makes
-it largely agnostic to the hardware; see
-[the cubecl docs](https://burn.dev/books/cubecl/getting-started/installation.html)
-for details. Benchmarks are
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_gpu.md),
-with the kNN-graph paths split out
-[here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_knn_graph.md).
-Any dimensionality works: rows are padded to a multiple of the kernels' line
-size on build and on query, so the caller never has to round `dim` up. To unlock
-GPU-acceleration, please use:
+The `gpu` feature runs on [CubeCL](https://github.com/tracel-ai/cubecl) with
+the wgpu backend, so the same kernels run on Metal, Vulkan and DX12. Any
+dimensionality works; rows are padded internally. Device limits are queried at
+runtime, so a smaller GPU gets smaller staging tiles.
 
-```toml
-[dependencies]
-ann-search-rs = { version = "*", features = ["gpu"] }
+Beyond the indices, `build_knn_graph_gpu` returns a raw kNN graph for anything
+that fits the device's per-binding limit, and `build_clustered_knn_graph_gpu`
+splits larger datasets into overlapping k-means clusters first. Either can feed
+`build_nsg_from_gpu_knn`.
+
+## MLX (experimental)
+
+Apple Silicon only. The `mlx` feature drives Metal through
+[mlx-c](https://github.com/ml-explore/mlx-c) instead of wgpu: MLX's GEMM plus
+hand-written Metal kernels for top-k, the IVF cluster scan and the CAGRA beam
+search. On an M1 Max at 500k x 128, exhaustive self-kNN goes 47.7 s to 15.4 s
+against wgpu and the CAGRA build 6.2 s to 4.4 s. f32 only.
+
+```bash
+brew install mlx-c
 ```
 
-## Binarised indices
-
-For the most extreme compression needs, binary indices are also provided. There
-are three approaches for binarisation available in the crate:
-
-- Bitwise binarisation either leveraging a SimHash random projection, PCA
-  hashing or sign-based binarisation. SimHash and PCA hashing centre on a
-  per-feature mean; sign-based does not centre at all, so it wants
-  high-dimensional data with mixed signs. A sign-based index unlocks the
-  asymmetric query path, which re-sorts the Hamming candidates on a float query
-  against the binary codes before anything touches disk.
-- [RaBitQ](https://arxiv.org/abs/2405.12497) binarisation while storing
-  additional data for approximate distance calculations.
-- [TurboQuant](https://arxiv.org/abs/2504.19874) a data-oblivious quantiser that
-  randomly rotates each vector and applies a per-coordinate scalar quantiser, so
-  there are no learned codebooks and indexing is near-instant.
-
-These can be used with Exhaustive or IVF indices and you have the option to
-store the original vectors on-disk to allow for subsequent re-ranking. This
-can drastically improve the Recall. To enable the feature, please use:
-
 ```toml
-[dependencies]
-ann-search-rs = { version = "*", features = ["binary"] }
+ann-search-rs = { version = "0.11", features = ["mlx"] }
 ```
 
-The benchmarks can be found [here](https://github.com/GregorLueg/ann-search-rs/blob/main/docs/benchmarks_binary.md).
+If mlx-c lives somewhere other than `/opt/homebrew`, set `MLX_C_PREFIX`. If it
+is not found at all, the build warns and carries on without the MLX code;
+`ann_search_rs::MLX_AVAILABLE` tells you which one you got. Crates building on
+this one can read `DEP_MLXC_AVAILABLE` in their build script to pick the MLX or
+the wgpu path.
 
-## Saving and loading indices
+## Saving and loading
 
-Building an index over a few million cells takes minutes. Doing it again on
-every process start gets old fast. The `serialise` feature adds `save_index` and
-`load_index` to every CPU, quantised and binary index:
-
-```toml
-[dependencies]
-ann-search-rs = { version = "*", features = ["serialise"] }
-```
+With `serialise`, every CPU, quantised and binary index can be saved and loaded:
 
 ```rust
 use ann_search_rs::cpu::hnsw::HnswIndex;
-use ann_search_rs::{build_hnsw_index, load_index, save_index};
+use ann_search_rs::{load_index, save_index};
 
-let index = build_hnsw_index(mat.as_ref(), 16, 200, "cosine", 42, false);
 save_index(&index, "my_index")?;
-
 let index: HnswIndex<f32> = load_index("my_index")?;
 ```
 
-The `IndexIo` trait is in the prelude, so with
-`use ann_search_rs::prelude::*;` the method form
-`index.save_index("my_index")` and `HnswIndex::<f32>::load_index("my_index")`
-works directly. The index types themselves live in their own modules, not the
-prelude.
+A saved index is a directory: `index.bin` plus, for binary indices with a
+re-ranking store, the on-disk vectors. Every file is written under a temporary
+name and `index.bin` is renamed last, so a save that dies half way never leaves
+something that loads clean and answers wrong. The header records the format
+version, the index kind and the float width, so loading an HNSW as an IVF, or
+`f32` as `f64`, is a typed error. The store files are raw native-endian dumps
+and do not survive a move between little- and big-endian machines.
 
-An index is a *directory*, not a single file. `index.bin` holds the payload
-(serde plus bincode, little-endian, variable-length integers so the file moves
-between 32- and 64-bit machines). The binary indices additionally carry their
-on-disk re-ranking store into the same directory, so a saved index is
-self-contained and can be moved. Saving into the directory the store already
-lives in skips the copy. Note the store files are raw native-endian dumps, so a
-bundle carrying one does not survive a move between a little- and a big-endian
-machine, even though `index.bin` on its own would.
-
-```
-my_index/
-  index.bin
-  vectors_flat.bin   # binary indices with a re-ranking store
-  norms.bin
-```
-
-`index.bin` opens with a header recording the format version, the index kind and
-the float width. Loading an HNSW index as an IVF one, or an `f32` index as
-`f64`, gives you a typed error rather than garbage.
-
-Saving is atomic in the sense that matters: every file goes to a temporary name
-first, and `index.bin` is the last thing renamed into place. A save that dies
-half way leaves the previous bundle alone, or leaves no `index.bin` and fails
-loudly on the next load. It never leaves a directory that loads clean and
-answers wrongly.
-
-The GPU indices are not covered. They hold live device handles, and
-`IvfIndexGpu` keeps its centroids on the GPU with no host copy, so persisting
-them needs more than a derive. Watch this space.
+GPU and MLX indices hold device buffers and cannot be saved. Rebuild them.
 
 ## Licence
 
-MIT License
-
-Copyright (c) 2025 Gregor Alexander Lueg
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+MIT, see [LICENSE](LICENSE).

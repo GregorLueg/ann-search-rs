@@ -3,6 +3,14 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.5.0
+
+Requires `ann-search-rs` 0.11.0
+
+- `CagraGpuIndex` picks up the GPU NN-Descent fixes: no duplicate neighbour ids
+  from the random initialisation, and mutual-neighbour duplicates dropped before
+  the local join.
+
 ## 0.4.1
 
 Requires `ann-search-rs` 0.10.1
