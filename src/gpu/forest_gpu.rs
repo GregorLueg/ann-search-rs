@@ -355,11 +355,13 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 ///
 /// Split host/device. Every level's random projection is a function of the
 /// tree seed and the level index alone, so all `max_depth` projections are
-/// generated upfront and their dot products come off the device in one
-/// `compute_dot_products_multi` launch per tree: one readback per tree rather
-/// than one launch plus one blocking readback per level. Medians and the
-/// partition scatter then run on the host under rayon, and the leaf pairwise
-/// distances plus the proposal merge go back to the device.
+/// generated upfront. The trees then go in batches sized by
+/// [`plan_forest_batch`]: the batch's dot products come off the device in one
+/// `compute_dot_products_multi` launch and one readback, medians and the
+/// partition scatter run on the host under rayon, and the leaf pairwise
+/// distances plus the proposal merge go back to the device. Only one batch's
+/// projections are ever alive, `batch * max_depth * n` floats rather than
+/// `n_trees * max_depth * n`.
 ///
 /// ### Params
 ///
@@ -439,74 +441,78 @@ where
     }
 
     let forest_start = Instant::now();
-
-    // Build trees in parallel
-    let cpu_start = Instant::now();
+    let mut tree_time = std::time::Duration::ZERO;
+    let mut merge_time = std::time::Duration::ZERO;
 
     let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid, &limits)?;
 
-    // Every tree's projections up front, so the dot products for the whole
-    // forest are one upload, one launch and one readback. Per-tree launches
-    // from the rayon pool each paid their own upload and readback sync, and
-    // those serialised on the client.
+    // Projections for the whole forest are tiny; their dot products are not.
+    // Those go a batch of trees at a time: one upload, one launch and one
+    // readback per batch, then the batch is partitioned, proposed and merged
+    // before the next is projected.
     let (projections_flat, tree_level_vecs) =
         forest_projections::<T>(n_trees, max_depth, dim, dim_padded, seed);
-
-    let all_dots = if max_depth > 0 {
-        let projections_gpu = GpuTensor::<R, T>::from_slice(
-            &projections_flat,
-            vec![n_trees * max_depth, dim_padded],
-            client,
-        )?;
-        let all_dots_gpu = GpuTensor::<R, T>::empty(vec![n_trees * max_depth, n], client)?;
-        let dot_count = checked_cube_count(
-            "compute_dot_products_multi",
-            dot_grid_x,
-            dot_grid_y,
-            n_trees as u32,
-            &limits,
-        )?;
-        unsafe {
-            compute_dot_products_multi::launch_unchecked::<T, R>(
-                client,
-                dot_count,
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.clone().into_tensor_arg(),
-                projections_gpu.into_tensor_arg(),
-                all_dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-                max_depth,
-            );
-        }
-        all_dots_gpu.read(client)?
-    } else {
-        Vec::new()
-    };
-
-    let (leaf_structures, router) = partition_forest(&all_dots, tree_level_vecs, n, max_depth, dim);
-
-    if verbose {
-        println!("    Tree construction: {:.2?}", cpu_start.elapsed());
-    }
-
-    // GPU phase: batched pairwise + merge
-    let gpu_start = Instant::now();
-    let trees_per_batch = 5;
+    let trees_per_batch = plan_forest_batch(n, max_depth, size_of::<T>(), FOREST_DOTS_BUDGET_BYTES);
     let n_batches = n_trees.div_ceil(trees_per_batch);
+    let mut level_vecs = tree_level_vecs.into_iter();
+    let mut router = ForestRouter::empty(max_depth, dim);
 
     for batch_idx in 0..n_batches {
         let batch_start = batch_idx * trees_per_batch;
-        let batch_end = (batch_start + trees_per_batch).min(n_trees);
+        let batch_trees = trees_per_batch.min(n_trees - batch_start);
 
+        let cpu_start = Instant::now();
+        let dots = if max_depth > 0 {
+            let rows = batch_trees * max_depth;
+            let off = batch_start * max_depth * dim_padded;
+            let projections_gpu = GpuTensor::<R, T>::from_slice(
+                &projections_flat[off..off + rows * dim_padded],
+                vec![rows, dim_padded],
+                client,
+            )?;
+            let dots_gpu = GpuTensor::<R, T>::empty(vec![rows, n], client)?;
+            let dot_count = checked_cube_count(
+                "compute_dot_products_multi",
+                dot_grid_x,
+                dot_grid_y,
+                batch_trees as u32,
+                &limits,
+            )?;
+            unsafe {
+                compute_dot_products_multi::launch_unchecked::<T, R>(
+                    client,
+                    dot_count,
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    projections_gpu.into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    n as u32,
+                    dim_vec,
+                    max_depth,
+                );
+            }
+            dots_gpu.read(client)?
+        } else {
+            Vec::new()
+        };
+        let leaf_structures = partition_trees(
+            &dots,
+            level_vecs.by_ref().take(batch_trees).collect(),
+            batch_start,
+            n,
+            max_depth,
+            &mut router,
+        );
+        drop(dots);
+        tree_time += cpu_start.elapsed();
+
+        let gpu_start = Instant::now();
         let mut batch_leaf_points: Vec<u32> = Vec::new();
         let mut batch_leaf_offsets: Vec<u32> = Vec::new();
 
-        for tree_idx in batch_start..batch_end {
-            let (leaf_points, leaf_offsets, n_leaves) = &leaf_structures[tree_idx];
-
+        for (leaf_points, leaf_offsets, n_leaves) in &leaf_structures {
             if *n_leaves == 0 {
                 continue;
             }
@@ -517,6 +523,7 @@ where
             }
             batch_leaf_points.extend_from_slice(leaf_points);
         }
+        drop(leaf_structures);
 
         batch_leaf_offsets.push(batch_leaf_points.len() as u32);
         let batch_leaves = batch_leaf_offsets.len() - 1;
@@ -601,13 +608,14 @@ where
             n,
             graph_idx_gpu.shape()[1],
         )?;
+        merge_time += gpu_start.elapsed();
     }
 
     if verbose {
+        println!("    Tree construction: {tree_time:.2?}");
         println!(
             "    GPU batched pairwise + merge ({} batches): {:.2?}",
-            n_batches,
-            gpu_start.elapsed()
+            n_batches, merge_time
         );
     }
 

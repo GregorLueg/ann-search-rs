@@ -1,10 +1,10 @@
 //! Random-projection forest initialisation for the MLX NN-Descent build.
 //!
-//! A port of `gpu_forest_init` without the query router. The projections of
-//! every tree come off one MLX GEMM and one readback; medians and partition
-//! scatters run on the host under rayon, as on the wgpu path; the leaf
-//! all-pairs proposals are a Metal kernel, merged into the graph with the
-//! NN-Descent merge, five trees per batch.
+//! A port of `gpu_forest_init`. The trees go in batches sized by
+//! `plan_forest_batch`: a batch's projections come off one MLX GEMM, medians
+//! and partition scatters run on the host under rayon, as on the wgpu path,
+//! and the leaf all-pairs proposals are a Metal kernel, merged into the graph
+//! with the NN-Descent merge.
 
 use std::time::Instant;
 
@@ -16,9 +16,6 @@ use crate::utils::rp_forest::*;
 ////////////
 // Consts //
 ////////////
-
-/// Trees whose leaves are proposed and merged per batch.
-const TREES_PER_BATCH: usize = 5;
 
 /// Target points per leaf; the tree depth is chosen for it.
 const TARGET_LEAF: usize = 64;
@@ -153,37 +150,10 @@ pub(crate) fn forest_init_mlx(
 
     let (projections, level_vecs) =
         forest_projections::<f32>(n_trees, max_depth, dim, dim_padded, seed);
-
-    // `[n_trees * max_depth, n]`: every level's projections contiguous.
-    let dots = if max_depth > 0 {
-        let proj = Array::from_f32(
-            &projections,
-            &[(n_trees * max_depth) as i32, dim_padded as i32],
-        );
-        let vecs_t = ctx.vecs.transpose(&ctx.stream)?;
-        let d = Array::addmm(
-            &Array::scalar_f32(0.0),
-            &proj,
-            &vecs_t,
-            1.0,
-            0.0,
-            &ctx.stream,
-        )?;
-        eval_all(&[&d], false)?;
-        Some(d)
-    } else {
-        None
-    };
-    let all_dots: &[f32] = match &dots {
-        Some(d) => d.as_f32()?,
-        None => &[],
-    };
-
-    let (leaves, router) = partition_forest(all_dots, level_vecs, n, max_depth, dim);
-    drop(dots);
-    if verbose {
-        println!("    Tree construction: {:.2?}", start.elapsed());
-    }
+    let trees_per_batch = plan_forest_batch(n, max_depth, 4, FOREST_DOTS_BUDGET_BYTES);
+    let mut level_vecs = level_vecs.into_iter();
+    let mut router = ForestRouter::empty(max_depth, dim);
+    let vecs_t = ctx.vecs.transpose(&ctx.stream)?;
 
     let leaf_k = MetalKernel::with_header(
         "nnd_leaf_pairs",
@@ -203,14 +173,52 @@ pub(crate) fn forest_init_mlx(
     let merge_params = ctx.params(0, 0, false);
     let p_shape = [n as i32, MLX_MAX_PROPOSALS as i32];
 
-    for batch in leaves.chunks(TREES_PER_BATCH) {
-        let mut points: Vec<u32> = Vec::with_capacity(batch.len() * n);
+    for batch_start in (0..n_trees).step_by(trees_per_batch) {
+        let batch_trees = trees_per_batch.min(n_trees - batch_start);
+
+        // `[batch_trees * max_depth, n]`: every level's projections contiguous.
+        let dots = if max_depth > 0 {
+            let rows = batch_trees * max_depth;
+            let off = batch_start * max_depth * dim_padded;
+            let proj = Array::from_f32(
+                &projections[off..off + rows * dim_padded],
+                &[rows as i32, dim_padded as i32],
+            );
+            let d = Array::addmm(
+                &Array::scalar_f32(0.0),
+                &proj,
+                &vecs_t,
+                1.0,
+                0.0,
+                &ctx.stream,
+            )?;
+            eval_all(&[&d], false)?;
+            Some(d)
+        } else {
+            None
+        };
+        let batch_dots: &[f32] = match &dots {
+            Some(d) => d.as_f32()?,
+            None => &[],
+        };
+        let leaves = partition_trees(
+            batch_dots,
+            level_vecs.by_ref().take(batch_trees).collect(),
+            batch_start,
+            n,
+            max_depth,
+            &mut router,
+        );
+        drop(dots);
+
+        let mut points: Vec<u32> = Vec::with_capacity(leaves.len() * n);
         let mut offsets: Vec<u32> = Vec::new();
-        for (lp, lo, _) in batch {
+        for (lp, lo, _) in &leaves {
             let base = points.len() as u32;
             offsets.extend(lo[..lo.len() - 1].iter().map(|&o| o + base));
             points.extend_from_slice(lp);
         }
+        drop(leaves);
         offsets.push(points.len() as u32);
         let n_leaves = offsets.len() - 1;
         if n_leaves == 0 {

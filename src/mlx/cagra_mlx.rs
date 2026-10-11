@@ -1343,7 +1343,7 @@ mod tests {
     ///
     /// The router over the first `N_ROUTER_TREES` trees
     fn host_router(data: &[f32], n: usize, dim: usize, depth: usize) -> ForestRouter<f32> {
-        use crate::utils::rp_forest::{forest_projections, partition_forest, N_ROUTER_TREES};
+        use crate::utils::rp_forest::{forest_projections, partition_trees, N_ROUTER_TREES};
         let (_, vecs) = forest_projections::<f32>(N_ROUTER_TREES, depth, dim, dim, 17);
         let mut dots = Vec::with_capacity(N_ROUTER_TREES * depth * n);
         for tree in &vecs {
@@ -1351,7 +1351,9 @@ mod tests {
                 dots.extend(data.chunks_exact(dim).map(|x| f32::dot_simd(x, v)));
             }
         }
-        partition_forest(&dots, vecs, n, depth, dim).1
+        let mut router = ForestRouter::empty(depth, dim);
+        partition_trees(&dots, vecs, 0, n, depth, &mut router);
+        router
     }
 
     /// Host routing and selection: the walk `find_entry_points` does, then

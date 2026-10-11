@@ -193,7 +193,8 @@ pub(crate) fn compute_partition_medians<T: AnnSearchFloat>(
 /// Every tree's random projections, generated up front.
 ///
 /// Each level's projection is a function of the tree seed and the level index
-/// alone, so the device can compute all dot products in one pass.
+/// alone, so a whole level block of any batch of trees is known before the
+/// first partition step.
 ///
 /// ### Params
 ///
@@ -244,48 +245,82 @@ pub(crate) fn forest_projections<T: AnnSearchFloat>(
     (projections_flat, tree_level_vecs)
 }
 
-/// Split every tree level by level against per-partition medians, then build
-/// the leaves and the query router.
+/// Trees per forest batch: projected, partitioned and merged together.
+pub(crate) const FOREST_TREES_PER_BATCH: usize = 5;
+
+/// Byte budget for one batch's projections, `trees * max_depth * n` floats.
+/// All trees at once is `n_trees * max_depth * n`, which at millions of
+/// points is several GB on the device and again on the host.
+pub(crate) const FOREST_DOTS_BUDGET_BYTES: usize = 1 << 30;
+
+/// Trees per forest batch whose projections fit the budget.
 ///
 /// ### Params
 ///
-/// * `all_dots` - `[n_trees * max_depth, n]` projections, level-major within
-///   each tree
-/// * `tree_level_vecs` - Projection vectors per tree and level, from
-///   [`forest_projections`]
 /// * `n` - Number of points
 /// * `max_depth` - Levels per tree
-/// * `dim` - Unpadded dimensionality
+/// * `elem_bytes` - Size of the float element type in bytes
+/// * `budget_bytes` - Byte budget for one batch's projections
 ///
 /// ### Returns
 ///
-/// `(leaves per tree, router over the first few trees)`
-pub(crate) fn partition_forest<T: AnnSearchFloat>(
-    all_dots: &[T],
-    tree_level_vecs: Vec<Vec<Vec<T>>>,
+/// Trees per batch, between 1 and [`FOREST_TREES_PER_BATCH`]. One tree is the
+/// floor even when it alone exceeds the budget.
+pub(crate) fn plan_forest_batch(
     n: usize,
     max_depth: usize,
-    dim: usize,
-) -> (Vec<LeafStructure>, ForestRouter<T>) {
-    let n_trees = tree_level_vecs.len();
-    let n_router_trees = n_trees.min(N_ROUTER_TREES);
+    elem_bytes: usize,
+    budget_bytes: usize,
+) -> usize {
+    let per_tree = n * max_depth * elem_bytes;
+    if per_tree == 0 {
+        return FOREST_TREES_PER_BATCH;
+    }
+    (budget_bytes / per_tree).clamp(1, FOREST_TREES_PER_BATCH)
+}
 
-    // (final partition per point, routing projections, routing medians);
-    // the routing data only for the router trees.
-    type TreeResult<T> = (Vec<u32>, Option<Vec<Vec<T>>>, Option<Vec<Vec<T>>>);
-    let all_tree_results: Vec<TreeResult<T>> = tree_level_vecs
+/// Split a batch of trees level by level against per-partition medians, then
+/// build their leaves and add the router trees among them to `router`.
+///
+/// ### Params
+///
+/// * `dots` - `[batch * max_depth, n]` projections, level-major within each
+///   tree
+/// * `level_vecs` - Projection vectors per tree and level of the batch, from
+///   [`forest_projections`]
+/// * `first_tree` - Forest index of the batch's first tree
+/// * `n` - Number of points
+/// * `max_depth` - Levels per tree
+/// * `router` - Router to extend with any of the first [`N_ROUTER_TREES`]
+///   trees in the batch
+///
+/// ### Returns
+///
+/// Leaves per tree of the batch
+pub(crate) fn partition_trees<T: AnnSearchFloat>(
+    dots: &[T],
+    level_vecs: Vec<Vec<Vec<T>>>,
+    first_tree: usize,
+    n: usize,
+    max_depth: usize,
+    router: &mut ForestRouter<T>,
+) -> Vec<LeafStructure> {
+    // (final partition per point, routing projections and medians for the
+    // router trees only)
+    type TreeResult<T> = (Vec<u32>, Option<(Vec<Vec<T>>, Vec<Vec<T>>)>);
+    let tree_results: Vec<TreeResult<T>> = level_vecs
         .into_par_iter()
         .enumerate()
-        .map(|(tree_idx, level_vecs)| {
-            let save_routing = tree_idx < n_router_trees;
+        .map(|(t, level_vecs)| {
+            let save_routing = first_tree + t < N_ROUTER_TREES;
             let mut partition_ids = vec![0u32; n];
             let mut routing_vecs = Vec::new();
             let mut routing_medians = Vec::new();
 
             for (level, random_vec) in level_vecs.into_iter().enumerate() {
                 // Level-major within the tree, so each level's block is contiguous.
-                let off = (tree_idx * max_depth + level) * n;
-                let dot_values = &all_dots[off..off + n];
+                let off = (t * max_depth + level) * n;
+                let dot_values = &dots[off..off + n];
                 let n_partitions = 1usize << level;
                 let medians = compute_partition_medians(&partition_ids, dot_values, n_partitions);
                 partition_ids
@@ -306,43 +341,31 @@ pub(crate) fn partition_forest<T: AnnSearchFloat>(
             }
             (
                 partition_ids,
-                save_routing.then_some(routing_vecs),
-                save_routing.then_some(routing_medians),
+                save_routing.then_some((routing_vecs, routing_medians)),
             )
         })
         .collect();
 
-    let leaf_structures: Vec<LeafStructure> = all_tree_results
+    let leaf_structures: Vec<LeafStructure> = tree_results
         .par_iter()
         .map(|tree| build_leaf_structure(&tree.0, n))
         .collect();
 
-    let mut router_rvecs = Vec::with_capacity(n_router_trees);
-    let mut router_medians = Vec::with_capacity(n_router_trees);
-    let mut router_leaves = Vec::with_capacity(n_router_trees);
-
-    for (partition_ids, rvecs_opt, medians_opt) in all_tree_results.into_iter().take(n_router_trees)
-    {
-        router_rvecs.push(rvecs_opt.unwrap_or_default());
-        router_medians.push(medians_opt.unwrap_or_default());
-
+    for (partition_ids, routing) in tree_results {
+        let Some((rvecs, medians)) = routing else {
+            continue;
+        };
         let max_pid = partition_ids.iter().copied().max().unwrap_or(0) as usize;
         let mut leaves = vec![Vec::new(); max_pid + 1];
         for (i, &pid) in partition_ids.iter().enumerate() {
             leaves[pid as usize].push(i as u32);
         }
-        router_leaves.push(leaves);
+        router.random_vecs.push(rvecs);
+        router.medians.push(medians);
+        router.leaves.push(leaves);
+        router.n_trees += 1;
     }
-
-    let router = ForestRouter {
-        random_vecs: router_rvecs,
-        medians: router_medians,
-        leaves: router_leaves,
-        max_depth,
-        dim,
-        n_trees: n_router_trees,
-    };
-    (leaf_structures, router)
+    leaf_structures
 }
 
 //////////////////
@@ -367,6 +390,27 @@ pub struct ForestRouter<T: AnnSearchFloat> {
 }
 
 impl<T: AnnSearchFloat> ForestRouter<T> {
+    /// A router with no trees, filled by [`partition_trees`].
+    ///
+    /// ### Params
+    ///
+    /// * `max_depth` - Levels per tree
+    /// * `dim` - Unpadded dimensionality
+    ///
+    /// ### Returns
+    ///
+    /// The empty router
+    pub(crate) fn empty(max_depth: usize, dim: usize) -> Self {
+        Self {
+            random_vecs: Vec::new(),
+            medians: Vec::new(),
+            leaves: Vec::new(),
+            max_depth,
+            dim,
+            n_trees: 0,
+        }
+    }
+
     /// Route a query through every stored tree using priority-queue
     /// traversal (same strategy as Annoy) to find entry point candidates.
     ///
@@ -454,5 +498,81 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
             &self.leaves,
             self.max_depth,
         )
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plan_forest_batch_fits_budget() {
+        // Small inputs keep the full batch.
+        assert_eq!(plan_forest_batch(10_000, 8, 4, FOREST_DOTS_BUDGET_BYTES), 5);
+        // 2.86M points at depth 16, f32: 183 MB per tree, five fit in 1 GiB.
+        assert_eq!(
+            plan_forest_batch(2_857_393, 16, 4, FOREST_DOTS_BUDGET_BYTES),
+            5
+        );
+        // f64 at the same shape: 366 MB per tree, two fit.
+        assert_eq!(
+            plan_forest_batch(2_857_393, 16, 8, FOREST_DOTS_BUDGET_BYTES),
+            2
+        );
+        for (n, depth, elem) in [(1_000_000, 14, 4), (5_000_000, 17, 4), (20_000_000, 19, 8)] {
+            let b = plan_forest_batch(n, depth, elem, FOREST_DOTS_BUDGET_BYTES);
+            assert!((1..=FOREST_TREES_PER_BATCH).contains(&b));
+            assert!(b == 1 || b * n * depth * elem <= FOREST_DOTS_BUDGET_BYTES);
+        }
+        // One tree over budget still gets a batch of one.
+        assert_eq!(
+            plan_forest_batch(100_000_000, 21, 8, FOREST_DOTS_BUDGET_BYTES),
+            1
+        );
+        // Depth 0 projects nothing.
+        assert_eq!(plan_forest_batch(50, 0, 4, 1), FOREST_TREES_PER_BATCH);
+    }
+
+    #[test]
+    fn test_partition_trees_batches_match_one_pass() {
+        let (n, dim, depth, n_trees) = (500usize, 8usize, 3usize, 7usize);
+        let data: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 37) % 101) as f32 / 101.0)
+            .collect();
+        let (_, vecs) = forest_projections::<f32>(n_trees, depth, dim, dim, 3);
+        let dots_for = |trees: &[Vec<Vec<f32>>]| -> Vec<f32> {
+            let mut d = Vec::new();
+            for tree in trees {
+                for v in tree {
+                    d.extend(data.chunks_exact(dim).map(|x| f32::dot_simd(x, v)));
+                }
+            }
+            d
+        };
+
+        let mut one = ForestRouter::empty(depth, dim);
+        let all = partition_trees(&dots_for(&vecs), vecs.clone(), 0, n, depth, &mut one);
+
+        let mut batched = ForestRouter::empty(depth, dim);
+        let mut leaves = Vec::new();
+        for (b, chunk) in vecs.chunks(2).enumerate() {
+            leaves.extend(partition_trees(
+                &dots_for(chunk),
+                chunk.to_vec(),
+                b * 2,
+                n,
+                depth,
+                &mut batched,
+            ));
+        }
+        assert_eq!(all, leaves);
+        assert_eq!(one.n_trees, N_ROUTER_TREES);
+        assert_eq!(batched.n_trees, N_ROUTER_TREES);
+        assert_eq!(one.leaves, batched.leaves);
+        assert_eq!(one.medians, batched.medians);
     }
 }
