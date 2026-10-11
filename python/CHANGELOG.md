@@ -7,6 +7,11 @@ Changes to the `ann-search` Python package. The Rust crate it wraps,
 
 Requires `ann-search-rs` 0.11.0
 
+- Experimental MLX estimators for Apple Silicon: `ExhaustiveMlxIndex`,
+  `IvfMlxIndex` and `CagraMlxIndex`, plus `mlx_available()`. Source builds only
+  (`brew install mlx-c`, then `maturin develop --release --features mlx`); the
+  published wheel does not carry them. Same constraints as the GPU estimators,
+  and a fitted index only works from the thread that built it.
 - `CagraGpuIndex` picks up the GPU NN-Descent fixes: no duplicate neighbour ids
   from the random initialisation, and mutual-neighbour duplicates dropped before
   the local join.

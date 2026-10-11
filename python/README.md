@@ -164,6 +164,22 @@ maturin develop --release --no-default-features
 `gpu_available()` then returns False on any machine, and `import ann_search.gpu`
 raises with an explanation. Everything on the CPU side is untouched.
 
+### MLX on Apple Silicon (experimental)
+
+`ExhaustiveMlxIndex`, `IvfMlxIndex` and `CagraMlxIndex` run on Metal through
+MLX instead of wgpu: on an M1 Max at 500k x 128, exhaustive self-kNN goes
+47.7 s to 15.4 s and the CAGRA build 6.2 s to 4.4 s. Not in the wheel, since
+MLX's C API isn't on PyPI. Build from source:
+
+```bash
+brew install mlx-c
+maturin develop --release --features mlx
+```
+
+`mlx_available()` says whether it made it in. Same constraints as the GPU
+estimators, and a fitted index only works from the thread that built it. See
+[GPU](docs/gpu.md#mlx-on-apple-silicon-experimental).
+
 ## Synthetic data
 
 Uniform Gaussian noise is a bad ANN benchmark. Past a few dozen dimensions every

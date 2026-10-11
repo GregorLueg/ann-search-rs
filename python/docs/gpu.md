@@ -126,3 +126,41 @@ maturin develop --release --no-default-features
 `gpu_available()` then returns False on any machine, and
 `import ann_search.gpu` raises with an explanation. Everything on the CPU side
 is untouched.
+
+## MLX on Apple Silicon (experimental)
+
+On a Mac, wgpu leaves speed on the table. The Rust crate has a second backend
+that drives Metal through [MLX](https://github.com/ml-explore/mlx) instead, and
+three estimators mirror the GPU ones: `ExhaustiveMlxIndex`, `IvfMlxIndex` and
+`CagraMlxIndex`. On an M1 Max at 500k points in 128 dimensions, the exhaustive
+self-kNN goes from 47.7 s to 15.4 s and the CAGRA build from 6.2 s to 4.4 s.
+
+They're not in the wheel. MLX's C API isn't on PyPI, so shipping it would mean
+bundling its dylibs and Metal library into every macOS wheel. Build from source
+instead:
+
+```bash
+brew install mlx-c
+maturin develop --release --features mlx
+```
+
+If mlx-c lives somewhere other than `/opt/homebrew`, point `MLX_C_PREFIX` at
+it. If it isn't found at all, the build warns and carries on without MLX, so
+check:
+
+```python
+if ann.mlx_available():
+    index = ann.CagraMlxIndex(n_neighbors=15).fit(X)
+    distances, indices = index.kneighbors()
+```
+
+Parameters match the GPU estimators, minus `quantise_to_f16` on IVF and
+`retain_gpu` on CAGRA. The same three backend constraints apply (float32, no
+persistence, no Manhattan), plus two of MLX's own:
+
+- **One thread per index.** MLX streams belong to the thread that made them,
+  so a fitted index raises if touched from any other Python thread. Build and
+  query in the same one.
+- **`set_num_threads` doesn't reach it.** The host-side work inside the MLX
+  paths runs on rayon's global pool. Set `RAYON_NUM_THREADS` before import if
+  you need to cap it.

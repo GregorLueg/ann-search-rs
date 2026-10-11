@@ -62,3 +62,14 @@ fn probe() -> bool {
 fn probe() -> bool {
     false
 }
+
+/// Whether the MLX indices were compiled in.
+///
+/// ### Returns
+///
+/// `True` only for a source build with the `mlx` feature that found mlx-c.
+/// MLX runs on any Apple Silicon Mac, so there is no runtime half to probe.
+#[pyfunction]
+pub fn mlx_available() -> bool {
+    cfg!(mlx_available)
+}

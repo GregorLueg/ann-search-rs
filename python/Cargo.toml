@@ -16,6 +16,9 @@ crate-type = ["cdylib"]
 [features]
 default = ["gpu"]
 gpu = ["ann-search-rs/gpu", "dep:cubecl"]
+# Source builds only, never the published wheel: links Homebrew's libmlxc by
+# absolute path. Without mlx-c installed the build warns and leaves it out.
+mlx = ["ann-search-rs/mlx"]
 
 [dependencies]
 ann-search-rs = { path = "..", default-features = false, features = ["accelerate", "binary", "quantised", "serialise", "synthetic"] }
