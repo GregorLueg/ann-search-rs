@@ -1,0 +1,3 @@
+library,method,param,build_s,self_s,total_s,peak_mib,recall
+pynndescent,nndescent,scanpy,30.172053000016604,0.0,30.172053000016604,10706.874969482422,0.98502
+pynndescent,nndescent,scanpy-deg30,48.470654500008095,0.0,48.470654500008095,10706.874969482422,0.99822

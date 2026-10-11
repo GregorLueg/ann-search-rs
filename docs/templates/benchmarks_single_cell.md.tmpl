@@ -31,7 +31,10 @@ included, computed in float64. `selfknn.py` downloads it on first use.
   included.
 - **NN-Descent** rows are the graph the build converged on, read back without
   a search pass (`extract_knn`), at graph degree 15 and 30. That is the
-  single-cell path, and what pynndescent's `neighbor_graph` is for scanpy.
+  single-cell path. pynndescent runs exactly as `sc.pp.neighbors` drives it by
+  default (UMAP's settings: degree 16 counting self, `n_trees = min(64, 5 +
+  round(sqrt(n) / 20))`, `n_iters = round(log2(n))`), reading its build graph
+  the same way, plus the same at degree 30.
 - **HNSW** at M = 16 and ef_construction = 100 (ann-search, hnswlib), self-query
   swept over `ef_search` 16 to 128.
 - **IVF** at `nlist = sqrt(n)` (ann-search CPU, wgpu and MLX, faiss

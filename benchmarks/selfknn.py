@@ -148,7 +148,7 @@ def pynndescent_graph(x: np.ndarray, threads: int) -> list[Point]:
 
     "scanpy" is what `sc.pp.neighbors` runs by default (UMAP's settings, see
     scanpy/neighbors/_common.py): degree K + 1 for self, 64 trees at this n,
-    log2(n) iterations. The degree-30 builds are the same with more room.
+    log2(n) iterations. The degree-30 build is the same with more room.
     """
     from pynndescent import NNDescent
 
@@ -161,7 +161,6 @@ def pynndescent_graph(x: np.ndarray, threads: int) -> list[Point]:
     for label, kw in (
         ("scanpy", dict(n_neighbors=K + 1, **scanpy)),
         ("scanpy-deg30", dict(n_neighbors=30, **scanpy)),
-        ("deg30-mc60", dict(n_neighbors=30, max_candidates=60, **scanpy)),
     ):
         build_s, index = timed(lambda kw=kw: NNDescent(x, n_jobs=threads, **kw))
         points.append((label, build_s, 0.0, index.neighbor_graph[0][:, :K]))
