@@ -144,11 +144,28 @@ def ann_search_extract(cls_name: str, degrees: list[int], degree_param: str):
 
 @beartype
 def pynndescent_graph(x: np.ndarray, threads: int) -> list[Point]:
-    """pynndescent's `neighbor_graph` at n_neighbors = K: what scanpy runs."""
+    """pynndescent's build graph, first K columns, no search.
+
+    "scanpy" is what `sc.pp.neighbors` runs by default (UMAP's settings, see
+    scanpy/neighbors/_common.py): degree K + 1 for self, 64 trees at this n,
+    log2(n) iterations. The degree-30 builds are the same with more room.
+    """
     from pynndescent import NNDescent
 
-    build_s, index = timed(lambda: NNDescent(x, n_neighbors=K, n_jobs=threads))
-    return [("-", build_s, 0.0, index.neighbor_graph[0])]
+    n = x.shape[0]
+    scanpy = dict(
+        n_trees=min(64, 5 + round(n**0.5 / 20.0)),
+        n_iters=max(5, round(np.log2(n))),
+    )
+    points = []
+    for label, kw in (
+        ("scanpy", dict(n_neighbors=K + 1, **scanpy)),
+        ("scanpy-deg30", dict(n_neighbors=30, **scanpy)),
+        ("deg30-mc60", dict(n_neighbors=30, max_candidates=60, **scanpy)),
+    ):
+        build_s, index = timed(lambda kw=kw: NNDescent(x, n_jobs=threads, **kw))
+        points.append((label, build_s, 0.0, index.neighbor_graph[0][:, :K]))
+    return points
 
 
 @beartype
