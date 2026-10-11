@@ -167,8 +167,10 @@ raises with an explanation. Everything on the CPU side is untouched.
 ### MLX on Apple Silicon (experimental)
 
 `ExhaustiveMlxIndex`, `IvfMlxIndex` and `CagraMlxIndex` run on Metal through
-MLX instead of wgpu: on an M1 Max at 500k x 128, exhaustive self-kNN goes
-47.7 s to 15.4 s and the CAGRA build 6.2 s to 4.4 s. Not in the wheel, since
+MLX instead of wgpu. Same recall, faster at every step: on an M1 Max with 150k
+cell embeddings in 128 dimensions, exhaustive self-kNN goes 4.5 s to 1.2 s and
+CAGRA queries 132 ms to 43 ms. Full table in
+[GPU](docs/gpu.md#mlx-on-apple-silicon-experimental). Not in the wheel, since
 MLX's C API isn't on PyPI. Build from source:
 
 ```bash

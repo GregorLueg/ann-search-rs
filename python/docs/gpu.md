@@ -132,8 +132,26 @@ is untouched.
 On a Mac, wgpu leaves speed on the table. The Rust crate has a second backend
 that drives Metal through [MLX](https://github.com/ml-explore/mlx) instead, and
 three estimators mirror the GPU ones: `ExhaustiveMlxIndex`, `IvfMlxIndex` and
-`CagraMlxIndex`. On an M1 Max at 500k points in 128 dimensions, the exhaustive
-self-kNN goes from 47.7 s to 15.4 s and the CAGRA build from 6.2 s to 4.4 s.
+`CagraMlxIndex`. Same recall, less time, on every step:
+
+| 150k cells, k = 15 | 32 dims, wgpu | 32 dims, MLX | 128 dims, wgpu | 128 dims, MLX |
+| --- | ---: | ---: | ---: | ---: |
+| Exhaustive, query | 178 ms | 65 ms | 458 ms | 122 ms |
+| Exhaustive, self-kNN | 1.74 s | 0.64 s | 4.53 s | 1.24 s |
+| IVF, fit | 123 ms | 63 ms | 395 ms | 149 ms |
+| IVF, query | 52 ms | 19 ms | 70 ms | 39 ms |
+| IVF, self-kNN | 330 ms | 171 ms | 561 ms | 369 ms |
+| CAGRA, fit | 651 ms | 582 ms | 1.51 s | 1.06 s |
+| CAGRA, query | 97 ms | 10 ms | 132 ms | 43 ms |
+| CAGRA, self-kNN | 784 ms | 87 ms | 935 ms | 354 ms |
+
+That's `make_cell_embeddings` with 15k queries from `subsample_queries`,
+default parameters, median of three warm calls on an M1 Max. Recall@15 is
+identical between the two backends: 1.0 for exhaustive and CAGRA, 0.9997 to
+0.9999 for IVF. CAGRA's beam search gains the most, about 9x at 32 dimensions,
+but its build barely moves, so that still dominates a one-off self-kNN. For
+scale, the CPU `ExhaustiveIndex` takes 590 ms for the same 128-dimensional query
+batch, so on this machine wgpu barely beats it and MLX is nearly 5x faster.
 
 They're not in the wheel. MLX's C API isn't on PyPI, so shipping it would mean
 bundling its dylibs and Metal library into every macOS wheel. Build from source

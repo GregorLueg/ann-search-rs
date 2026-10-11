@@ -1,11 +1,10 @@
 """MLX estimators, present only in a source build with the ``mlx`` feature.
 
 Experimental and Apple Silicon only. MLX drives Metal directly through mlx-c
-rather than going through wgpu. On an M1 Max at 500k x 128 that takes the
-exhaustive self-kNN from 47.7 s to 15.4 s and the CAGRA build from 6.2 s to
-4.4 s against their `ann_search.gpu` counterparts. The published
-wheel does not carry them, since it would have to bundle mlx-c. Build from
-source instead::
+rather than going through wgpu, and comes out faster than the `ann_search.gpu`
+counterparts at the same recall; the GPU page of the docs has the numbers. The
+published wheel does not carry them, since it would have to bundle mlx-c.
+Build from source instead::
 
     brew install mlx-c
     maturin develop --release --features mlx
@@ -65,8 +64,7 @@ class _BaseMlxIndex(BaseAnnIndex):
 class ExhaustiveMlxIndex(_BaseMlxIndex):
     """Brute-force exact search on MLX: its GEMM plus a Metal top-k kernel.
 
-    Recall is 1 by construction. At 500k x 128 on an M1 Max, the self-kNN graph
-    takes 15.4 s against 47.7 s for `ExhaustiveGpuIndex`.
+    Recall is 1 by construction.
 
     Args:
         n_neighbors: Neighbours per query, and the default ``k`` for
