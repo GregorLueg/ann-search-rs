@@ -81,6 +81,7 @@ LIBRARY_STYLE: dict[str, tuple[str, str]] = {
     "ann_search_sq8": ("#4a3aa7", "X"),
     "faiss_sq8": ("#e34948", "*"),
     "ann_search_gpu": ("#52514e", "h"),
+    "ann_search_mlx": ("#8a5a2b", "d"),
 }
 
 ########
@@ -305,7 +306,10 @@ def run(dataset: str, threads: int, only: tuple[str, ...]) -> None:
     stem = RESULTS / f"{dataset}_t{threads}"
     stem.mkdir(parents=True, exist_ok=True)
     dataset_path(dataset)
-    (stem / "run_info.json").write_text(json.dumps(run_info(), indent=2))
+    # A partial run records its own info, so summarise can flag the mix of
+    # commits instead of stamping old rows with the new one.
+    info = "run_info_partial.json" if only else "run_info.json"
+    (stem / info).write_text(json.dumps(run_info(), indent=2))
 
     # Pinned before any BLAS, OpenMP or numba runtime starts in the worker.
     env = os.environ | {
@@ -485,7 +489,7 @@ def summarise(template: Path, output: Path) -> None:
         sweep = pl.concat(
             [pl.read_csv(c, schema_overrides={"param": pl.String}) for c in csvs]
         )
-        infos.append(json.loads((stem / "run_info.json").read_text()))
+        infos += [json.loads(f.read_text()) for f in sorted(stem.glob("run_info*"))]
         dataset, threads = stem.name.rsplit("_t", 1)
         plot_sweep(
             sweep,

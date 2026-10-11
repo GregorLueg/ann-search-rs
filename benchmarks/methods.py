@@ -336,6 +336,13 @@ METHODS: dict[str, Callable[[np.ndarray, int, str], Built]] = {
         lambda b: {"beam_width": b, "max_beam_iters": 3 * b},
         BEAM_GRID,
     ),
+    "ann_search_mlx:exhaustive": ann_search_builder("ExhaustiveMlxIndex", None, [None]),
+    "ann_search_mlx:ivf": ann_search_builder("IvfMlxIndex", "nprobe", NPROBE_GRID),
+    "ann_search_mlx:cagra": ann_search_builder(
+        "CagraMlxIndex",
+        lambda b: {"beam_width": b, "max_beam_iters": 3 * b},
+        BEAM_GRID,
+    ),
     "faiss:exhaustive": faiss_exhaustive,
     "hnswlib:hnsw": hnswlib_hnsw,
     "faiss:hnsw": faiss_hnsw,

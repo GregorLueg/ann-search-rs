@@ -61,6 +61,11 @@ uv run bench.py summarise
   needed. Thread counts don't apply to them, so the 1-thread run leaves them
   out. Memory is unified here, so their footprint includes the device
   buffers.
+- `ann_search_mlx` rows are the same three indices on the experimental MLX
+  backend, which drives Metal directly. Apple Silicon only, and the binding has
+  to be built with the `mlx` feature and mlx-c installed (`brew install
+  mlx-c`); without it those entries fail to build. Same thread and memory
+  caveats as the wgpu rows.
 - Builds are a single run each. Read small gaps as ties.
 - "Best QPS at or above a target" depends on where the sweep grid steps fall.
   A library whose grid point lands at 0.909 counts at 0.90; one that lands at

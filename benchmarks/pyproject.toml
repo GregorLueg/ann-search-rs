@@ -28,6 +28,11 @@ package = false
 [tool.uv.sources]
 ann-search = { path = "../python" }
 
+# The MLX rows need the binding's `mlx` feature. Without mlx-c (or off macOS)
+# the build warns and leaves MLX out, and only those entries fail.
+[tool.uv.config-settings-package]
+ann-search = { "maturin.build-args" = "--features mlx" }
+
 # annoy 1.17.3 builds with -ffast-math, which recent clang reads as
 # finite-math-only. Its search queue starts at infinity, so every query then
 # returns a single wrong id. Same flags as its setup.py, plus the opt-out.
