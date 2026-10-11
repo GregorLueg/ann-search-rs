@@ -539,6 +539,9 @@ pub fn plan_beam_search_threadgroup(
 /// The array; rows past `n` are zero
 fn upload_rows(data: &[f32], n: usize, dim: usize, dim_padded: usize) -> Array {
     let rows = n.max(MLX_DEVICE_MIN_ELEMS.div_ceil(dim_padded));
+    if rows == n && dim == dim_padded && data.len() == n * dim {
+        return Array::from_f32(data, &[n as i32, dim as i32]);
+    }
     let mut out = vec![0.0f32; rows * dim_padded];
     for (dst, src) in out.chunks_exact_mut(dim_padded).zip(data.chunks_exact(dim)) {
         dst[..dim].copy_from_slice(src);

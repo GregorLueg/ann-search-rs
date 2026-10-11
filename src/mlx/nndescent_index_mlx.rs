@@ -145,17 +145,24 @@ impl NNDescentIndexMlx {
         };
         let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbose)?;
         let knn_graph = compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k);
+        let NndOutputMlx {
+            graph_idx,
+            converged,
+            router,
+            ..
+        } = out;
 
         let cagra_start = Instant::now();
         let (nav_graph, medoid) =
-            cagra_optimise_mlx(&out.graph_idx, &vectors_flat, n, dim, build_k, k, metric)?;
+            cagra_optimise_mlx(&graph_idx, &vectors_flat, n, dim, build_k, k, metric)?;
+        drop(graph_idx);
         if verbose {
             println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
         }
 
         let mut searcher =
             CagraSearchMlx::new(&vectors_flat, n, dim, metric, nav_graph, k, medoid)?;
-        searcher.attach_router(&out.router)?;
+        searcher.attach_router(&router)?;
         if verbose {
             println!("  Total build time: {:.2?}", start.elapsed());
         }
@@ -169,7 +176,7 @@ impl NNDescentIndexMlx {
             metric,
             medoid,
             knn_graph,
-            converged: out.converged,
+            converged,
             searcher,
         })
     }

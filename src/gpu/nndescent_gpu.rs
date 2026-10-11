@@ -38,6 +38,7 @@ use cubecl::frontend::{Atomic, CubePrimitive, Float, SharedMemory};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
@@ -1986,14 +1987,7 @@ where
 
         let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-        let mut vectors_padded = if dim_padded != dim {
-            pad_vectors(&vectors_flat, n, dim, dim_padded)
-        } else {
-            vectors_flat.clone()
-        };
-        if metric == Dist::Cosine {
-            normalise_rows(&mut vectors_padded, dim_padded);
-        }
+        let vectors_padded = device_rows(&vectors_flat, n, dim, dim_padded, metric);
 
         let norms = if metric == Dist::Cosine {
             (0..n)
@@ -2049,7 +2043,9 @@ where
             verbose,
         )?;
 
+        drop(vectors_padded);
         let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
+        drop((graph_idx, graph_dist));
 
         // ---- CAGRA graph optimisation: prune from build_k -> k ----
 
@@ -2664,14 +2660,7 @@ where
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-    let mut vectors_padded = if dim_padded != dim {
-        pad_vectors(&vectors_flat, n, dim, dim_padded)
-    } else {
-        vectors_flat.clone()
-    };
-    if metric == Dist::Cosine {
-        normalise_rows(&mut vectors_padded, dim_padded);
-    }
+    let vectors_padded = device_rows(&vectors_flat, n, dim, dim_padded, metric);
 
     let norms = if metric == Dist::Cosine {
         (0..n)
@@ -2725,6 +2714,7 @@ where
         verbose,
     )?;
 
+    drop(vectors_padded);
     let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
 
     if verbose {
@@ -2741,6 +2731,38 @@ where
         knn_graph,
         converged,
     })
+}
+
+/// The rows `nndescent_core` uploads: padded to `dim_padded` and
+/// unit-normalised under cosine, or the input itself when neither applies.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Row-major vectors, `n` rows of `dim`
+/// * `n` - Number of vectors
+/// * `dim` - Row length of `vectors_flat`
+/// * `dim_padded` - Padded row length, a multiple of `LINE_SIZE`
+/// * `metric` - Distance metric
+///
+/// ### Returns
+///
+/// The rows, borrowed when `dim == dim_padded` and the metric is not cosine
+fn device_rows<'a, T: AnnSearchFloat>(
+    vectors_flat: &'a [T],
+    n: usize,
+    dim: usize,
+    dim_padded: usize,
+    metric: Dist,
+) -> Cow<'a, [T]> {
+    let mut rows = if dim_padded != dim {
+        Cow::Owned(pad_vectors(vectors_flat, n, dim, dim_padded))
+    } else {
+        Cow::Borrowed(vectors_flat)
+    };
+    if metric == Dist::Cosine {
+        normalise_rows(rows.to_mut(), dim_padded);
+    }
+    rows
 }
 
 /// Output of [`nndescent_core`].

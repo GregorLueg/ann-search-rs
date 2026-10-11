@@ -22,6 +22,7 @@
 //! downloaded once per iteration: the only host sync in the loop.
 
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
@@ -859,17 +860,17 @@ pub(crate) fn outs<const N: usize>(v: Vec<Array>) -> [Array; N] {
 ///
 /// ### Returns
 ///
-/// `(padded, dim_padded)`
-fn pad_rows(data: &[f32], n: usize, dim: usize) -> (Vec<f32>, usize) {
+/// `(padded, dim_padded)`; `data` itself when `dim` is already aligned
+fn pad_rows(data: &[f32], n: usize, dim: usize) -> (Cow<'_, [f32]>, usize) {
     let dim_padded = dim.next_multiple_of(4);
     if dim_padded == dim {
-        return (data.to_vec(), dim);
+        return (Cow::Borrowed(data), dim);
     }
     let mut out = vec![0.0f32; n * dim_padded];
     out.par_chunks_exact_mut(dim_padded)
         .zip(data.par_chunks_exact(dim))
         .for_each(|(o, i)| o[..dim].copy_from_slice(i));
-    (out, dim_padded)
+    (Cow::Owned(out), dim_padded)
 }
 
 /////////////////
@@ -1260,6 +1261,7 @@ pub fn nndescent_core_mlx(
         build_k,
         cfg.use_cosine,
     );
+    drop(vectors_padded);
 
     if verbose {
         println!("  Random graph initialisation...");
