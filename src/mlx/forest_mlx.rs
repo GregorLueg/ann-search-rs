@@ -124,7 +124,7 @@ pub(crate) fn max_leaf_size_mlx(dim_padded: usize) -> Result<usize, AnnSearchErr
 ///
 /// ### Returns
 ///
-/// The lazy graph after every batch's proposals are merged, and the query
+/// The evaluated graph after every batch's proposals are merged, and the query
 /// router over the first trees
 pub(crate) fn forest_init_mlx(
     ctx: &NndMlx,
@@ -253,10 +253,12 @@ pub(crate) fn forest_init_mlx(
             &ctx.stream,
         )?);
         let (next, _) = ctx.merge(&g, &(pi, pd, pc), &merge_params)?;
+        // Evaluate per batch: left lazy, the graph keeps every batch's
+        // proposals and intermediate graphs alive until the first eval.
         g = next;
+        eval_all(&[&g.0, &g.1], false)?;
     }
     if verbose {
-        eval_all(&[&g.0, &g.1], false)?;
         println!("  MLX forest init: {:.2?}", start.elapsed());
     }
     Ok((g, router))

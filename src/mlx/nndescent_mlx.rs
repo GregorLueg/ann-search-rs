@@ -1268,6 +1268,9 @@ pub fn nndescent_core_mlx(
 
     let (forest_g, router) = forest_init_mlx(&ctx, g, dim, cfg.n_trees, cfg.seed, verbose)?;
     g = forest_g;
+    // The forest's projections and proposal buffers are dead; hand them back
+    // rather than letting MLX's cache hold them through the descent.
+    crate::mlx::clear_cache()?;
     // No mark-all-new pass: the random init flags every slot new and the
     // forest merges flag what they insert, so every entry is already new.
 
@@ -1304,12 +1307,14 @@ pub fn nndescent_core_mlx(
     if verbose {
         println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
     }
+    crate::mlx::clear_cache()?;
 
     for sweep in 0..cfg.refine_knn {
         let params = ctx.params(0, 0, false);
         let props = ctx.two_hop(&g, &params)?;
         let (next, changed) = ctx.merge(&g, &props, &params)?;
         g = next;
+        eval_all(&[&g.0, &g.1], false)?;
         if verbose {
             let total = changed.sum_axis(0, false, &ctx.stream)?;
             eval_all(&[&total], false)?;
