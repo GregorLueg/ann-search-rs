@@ -1314,7 +1314,7 @@ where
 /// * `max_candidates` - Cap on sampled candidates per node per iteration
 ///   (default `k.min(60)`).
 /// * `n_tree` - Random-projection trees seeding the graph (default
-///   `5 + n^0.25`, capped at 12).
+///   `5 + sqrt(n) / 20`, capped at 64).
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///

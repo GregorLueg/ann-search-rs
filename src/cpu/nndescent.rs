@@ -995,11 +995,10 @@ where
             Vec::new()
         };
 
-        // Capped at 12 following PyNNDescent
-        let n_trees = n_trees.unwrap_or_else(|| {
-            let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-            calculated.min(12)
-        });
+        // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
+        // trees well past where the old per-point query saturated.
+        let n_trees =
+            n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
 
         let max_iter = max_iter.unwrap_or_else(|| {
             let calculated = ((n as f64).log2().round()) as usize;

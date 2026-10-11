@@ -343,7 +343,8 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
             defaults to ``min(n_neighbors, 60)``. The main quality-versus-time
             knob on the build; 30 to 60 is the useful range.
         n_trees: Random projection trees used to seed the initial graph.
-            ``None`` defaults to ``min(5 + round(n ** 0.25), 12)``.
+            ``None`` defaults to ``min(5 + round(sqrt(n) / 20), 64)``, scanpy's
+            setting.
         ef_search: Beam width at query time. ``None`` defaults to
             ``clamp(2 * k, 50, 200)``, and any value is raised to ``k``.
             Search-time: override it per call as
