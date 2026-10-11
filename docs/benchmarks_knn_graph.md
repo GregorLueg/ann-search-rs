@@ -51,9 +51,9 @@ one.
 
 ### CPU NN-Descent
 
-A random-projection forest seeds the graph, then local joins over
-neighbours-of-neighbours refine it until the improving fraction drops below
-`delta`. Three rows per configuration: `(query)` against held-out data,
+A random-projection forest seeds the graph by joining every leaf exhaustively,
+then local joins over neighbours-of-neighbours refine it until the improving
+fraction drops below `delta`. Three rows per configuration: `(query)` against held-out data,
 `(self)` for the full self-kNN via beam search, and `(extract)` for the descent
 graph as-is. The gap between `(self)` and `(extract)` is exactly what the beam
 search buys on top of the graph.
@@ -76,28 +76,28 @@ Benchmark: 150k samples, 32D
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        11.30       670.68       681.98       1.0000          1.0000            1.0000        18.31
-Exhaustive (self)                                         11.30     6_873.26     6_884.56       1.0000          1.0000            1.0000        18.31
-NNDescent-k:auto-nt4-s:auto-dp0 (query)                2_832.59        42.43     2_875.01       0.9989          1.0002            1.0000       101.64
-NNDescent-k:auto-nt4-dp0 (self)                        2_832.59       386.21     3_218.80       0.9997          1.0000            1.0000       101.64
-NNDescent-k:auto-nt4-dp0 (extract)                     2_832.59         4.46     2_837.05       0.9997          1.0000            1.0000       101.64
-NNDescent-k:auto-nt8-s:auto-dp0 (query)                2_539.34        41.94     2_581.29       0.9988          1.0003            1.0000       114.01
-NNDescent-k:auto-nt8-dp0 (self)                        2_539.34       382.29     2_921.63       0.9997          1.0000            1.0000       114.01
-NNDescent-k:auto-nt8-dp0 (extract)                     2_539.34         3.56     2_542.91       0.9997          1.0000            1.0000       114.01
-NNDescent-k:auto-nt:auto-s75-dp0 (query)               2_421.36        56.61     2_477.97       0.9995          1.0001            1.0000       114.51
-NNDescent-k:auto-nt:auto-s100-dp0 (query)              2_421.36        74.42     2_495.78       0.9996          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            2_421.36        41.09     2_462.45       0.9988          1.0003            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0 (self)                    2_421.36       387.17     2_808.53       0.9998          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0 (extract)                 2_421.36         4.78     2_426.14       0.9997          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         2_617.32        52.35     2_669.67       0.9989          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0.25 (self)                 2_617.32       508.04     3_125.36       0.9991          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0.25 (extract)              2_617.32         3.25     2_620.57       0.9997          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          2_570.29        53.98     2_624.28       0.9992          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0.5 (self)                  2_570.29       514.48     3_084.78       0.9994          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp0.5 (extract)               2_570.29         3.64     2_573.93       0.9997          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            2_617.64        56.66     2_674.30       0.9992          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp1 (self)                    2_617.64       540.99     3_158.62       0.9993          1.0000            1.0000       114.51
-NNDescent-k:auto-nt:auto-dp1 (extract)                 2_617.64         3.72     2_621.36       0.9997          1.0000            1.0000       114.51
+Exhaustive (query)                                        11.84       641.38       653.22       1.0000          1.0000            1.0000        18.31
+Exhaustive (self)                                         11.84     6_242.25     6_254.09       1.0000          1.0000            1.0000        18.31
+NNDescent-k:auto-nt4-s:auto-dp0 (query)                2_681.24        41.69     2_722.93       0.9989          1.0002            1.0000       101.64
+NNDescent-k:auto-nt4-dp0 (self)                        2_681.24       382.54     3_063.78       0.9998          1.0000            1.0000       101.64
+NNDescent-k:auto-nt4-dp0 (extract)                     2_681.24         5.43     2_686.67       0.9997          1.0000            1.0000       101.64
+NNDescent-k:auto-nt8-s:auto-dp0 (query)                2_262.25        42.05     2_304.30       0.9988          1.0003            1.0000       114.01
+NNDescent-k:auto-nt8-dp0 (self)                        2_262.25       383.75     2_646.00       0.9997          1.0000            1.0000       114.01
+NNDescent-k:auto-nt8-dp0 (extract)                     2_262.25         4.04     2_266.29       0.9997          1.0000            1.0000       114.01
+NNDescent-k:auto-nt:auto-s75-dp0 (query)               2_307.90        57.19     2_365.09       0.9996          1.0001            1.0000       139.77
+NNDescent-k:auto-nt:auto-s100-dp0 (query)              2_307.90        73.78     2_381.68       0.9998          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            2_307.90        41.48     2_349.38       0.9988          1.0003            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0 (self)                    2_307.90       385.27     2_693.16       0.9998          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0 (extract)                 2_307.90         3.67     2_311.57       0.9998          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         2_471.78        66.80     2_538.58       0.9990          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0.25 (self)                 2_471.78       533.50     3_005.28       0.9992          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0.25 (extract)              2_471.78         3.50     2_475.28       0.9998          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          2_502.84        54.32     2_557.16       0.9992          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0.5 (self)                  2_502.84       521.67     3_024.51       0.9994          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp0.5 (extract)               2_502.84         3.58     2_506.42       0.9998          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            2_424.56        57.41     2_481.97       0.9992          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp1 (self)                    2_424.56       555.27     2_979.83       0.9994          1.0000            1.0000       139.77
+NNDescent-k:auto-nt:auto-dp1 (extract)                 2_424.56         3.83     2_428.39       0.9998          1.0000            1.0000       139.77
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -113,28 +113,28 @@ Benchmark: 150k samples, 32D
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        11.21       665.78       676.99       1.0000          1.0000            1.0000        18.31
-Exhaustive (self)                                         11.21     6_824.70     6_835.91       1.0000          1.0000            1.0000        18.31
-NNDescent-k:auto-nt4-s:auto-dp0 (query)                1_783.67        54.18     1_837.85       0.9989          1.0001            1.0000       101.88
-NNDescent-k:auto-nt4-dp0 (self)                        1_783.67       524.67     2_308.34       1.0000          1.0000            1.0000       101.88
-NNDescent-k:auto-nt4-dp0 (extract)                     1_783.67         4.34     1_788.01       1.0000          1.0000            1.0000       101.88
-NNDescent-k:auto-nt8-s:auto-dp0 (query)                1_558.43        53.79     1_612.22       0.9990          1.0001            1.0000       114.50
-NNDescent-k:auto-nt8-dp0 (self)                        1_558.43       505.51     2_063.95       1.0000          1.0000            1.0000       114.50
-NNDescent-k:auto-nt8-dp0 (extract)                     1_558.43         3.44     1_561.87       1.0000          1.0000            1.0000       114.50
-NNDescent-k:auto-nt:auto-s75-dp0 (query)               1_544.76        78.67     1_623.43       0.9994          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-s100-dp0 (query)              1_544.76       100.32     1_645.07       0.9997          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            1_544.76        55.86     1_600.62       0.9989          1.0001            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0 (self)                    1_544.76       523.54     2_068.30       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0 (extract)                 1_544.76         3.47     1_548.23       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         1_787.74        58.32     1_846.06       0.9998          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0.25 (self)                 1_787.74       566.70     2_354.45       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0.25 (extract)              1_787.74         3.29     1_791.03       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          1_729.72        63.17     1_792.90       0.9999          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0.5 (self)                  1_729.72       598.53     2_328.25       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp0.5 (extract)               1_729.72         4.85     1_734.57       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            1_723.31        57.89     1_781.20       0.9998          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp1 (self)                    1_723.31       570.55     2_293.86       1.0000          1.0000            1.0000       115.00
-NNDescent-k:auto-nt:auto-dp1 (extract)                 1_723.31         3.61     1_726.92       1.0000          1.0000            1.0000       115.00
+Exhaustive (query)                                        11.26       671.83       683.09       1.0000          1.0000            1.0000        18.31
+Exhaustive (self)                                         11.26     6_181.53     6_192.78       1.0000          1.0000            1.0000        18.31
+NNDescent-k:auto-nt4-s:auto-dp0 (query)                1_607.44        57.07     1_664.50       0.9989          1.0001            1.0000       101.88
+NNDescent-k:auto-nt4-dp0 (self)                        1_607.44       505.67     2_113.11       1.0000          1.0000            1.0000       101.88
+NNDescent-k:auto-nt4-dp0 (extract)                     1_607.44         4.20     1_611.64       1.0000          1.0000            1.0000       101.88
+NNDescent-k:auto-nt8-s:auto-dp0 (query)                1_416.75        55.26     1_472.00       0.9989          1.0001            1.0000       114.50
+NNDescent-k:auto-nt8-dp0 (self)                        1_416.75       497.98     1_914.73       1.0000          1.0000            1.0000       114.50
+NNDescent-k:auto-nt8-dp0 (extract)                     1_416.75         4.00     1_420.75       1.0000          1.0000            1.0000       114.50
+NNDescent-k:auto-nt:auto-s75-dp0 (query)               1_238.94        78.75     1_317.69       0.9994          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-s100-dp0 (query)              1_238.94        99.45     1_338.39       0.9997          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            1_238.94        54.86     1_293.80       0.9989          1.0001            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0 (self)                    1_238.94       529.46     1_768.40       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0 (extract)                 1_238.94         3.09     1_242.03       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         1_469.03        62.64     1_531.67       0.9998          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0.25 (self)                 1_469.03       580.24     2_049.27       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0.25 (extract)              1_469.03         3.63     1_472.65       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          1_449.91        62.76     1_512.67       0.9999          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0.5 (self)                  1_449.91       591.70     2_041.61       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp0.5 (extract)               1_449.91         4.29     1_454.20       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            1_421.11        64.96     1_486.07       0.9999          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp1 (self)                    1_421.11       581.74     2_002.85       1.0000          1.0000            1.0000       140.73
+NNDescent-k:auto-nt:auto-dp1 (extract)                 1_421.11         3.45     1_424.55       1.0000          1.0000            1.0000       140.73
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -150,28 +150,28 @@ Benchmark: 150k samples, 128D
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-Exhaustive (query)                                        49.81     1_271.94     1_321.75       1.0000          1.0000            1.0000        73.24
-Exhaustive (self)                                         49.81    12_747.97    12_797.78       1.0000          1.0000            1.0000        73.24
-NNDescent-k:auto-nt4-s:auto-dp0 (query)                2_413.91       113.26     2_527.17       1.0000          1.0000            1.0000       213.55
-NNDescent-k:auto-nt4-dp0 (self)                        2_413.91     1_056.89     3_470.80       1.0000          1.0000            1.0000       213.55
-NNDescent-k:auto-nt4-dp0 (extract)                     2_413.91         3.56     2_417.47       0.9999          1.0000            1.0000       213.55
-NNDescent-k:auto-nt8-s:auto-dp0 (query)                2_373.85       110.50     2_484.35       0.9999          1.0001            1.0000       227.97
-NNDescent-k:auto-nt8-dp0 (self)                        2_373.85     1_055.24     3_429.09       1.0000          1.0000            1.0000       227.97
-NNDescent-k:auto-nt8-dp0 (extract)                     2_373.85         3.67     2_377.52       1.0000          1.0000            1.0000       227.97
-NNDescent-k:auto-nt:auto-s75-dp0 (query)               2_545.34       149.62     2_694.96       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-s100-dp0 (query)              2_545.34       187.54     2_732.88       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            2_545.34       108.18     2_653.52       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0 (self)                    2_545.34     1_048.89     3_594.23       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0 (extract)                 2_545.34         4.13     2_549.47       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         2_843.32       113.56     2_956.88       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0.25 (self)                 2_843.32     1_102.19     3_945.52       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0.25 (extract)              2_843.32         3.29     2_846.61       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          2_839.19       113.10     2_952.29       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0.5 (self)                  2_839.19     1_092.63     3_931.82       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp0.5 (extract)               2_839.19         3.63     2_842.82       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            2_770.61       113.34     2_883.96       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp1 (self)                    2_770.61     1_062.94     3_833.56       1.0000          1.0000            1.0000       256.33
-NNDescent-k:auto-nt:auto-dp1 (extract)                 2_770.61         3.82     2_774.44       1.0000          1.0000            1.0000       256.33
+Exhaustive (query)                                        50.58     1_253.72     1_304.29       1.0000          1.0000            1.0000        73.24
+Exhaustive (self)                                         50.58    12_612.92    12_663.50       1.0000          1.0000            1.0000        73.24
+NNDescent-k:auto-nt4-s:auto-dp0 (query)                2_230.29       111.31     2_341.61       1.0000          1.0000            1.0000       213.55
+NNDescent-k:auto-nt4-dp0 (self)                        2_230.29     1_073.67     3_303.97       1.0000          1.0000            1.0000       213.55
+NNDescent-k:auto-nt4-dp0 (extract)                     2_230.29         5.10     2_235.39       0.9999          1.0000            1.0000       213.55
+NNDescent-k:auto-nt8-s:auto-dp0 (query)                1_970.86       111.66     2_082.52       0.9999          1.0001            1.0000       227.97
+NNDescent-k:auto-nt8-dp0 (self)                        1_970.86     1_056.29     3_027.14       1.0000          1.0000            1.0000       227.97
+NNDescent-k:auto-nt8-dp0 (extract)                     1_970.86         4.05     1_974.91       1.0000          1.0000            1.0000       227.97
+NNDescent-k:auto-nt:auto-s75-dp0 (query)               2_045.33       157.64     2_202.97       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-s100-dp0 (query)              2_045.33       188.74     2_234.06       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-s:auto-dp0 (query)            2_045.33       109.47     2_154.79       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0 (self)                    2_045.33     1_057.28     3_102.61       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0 (extract)                 2_045.33         3.16     2_048.48       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-s:auto-dp0.25 (query)         2_426.21       146.47     2_572.68       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0.25 (self)                 2_426.21     1_171.50     3_597.70       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0.25 (extract)              2_426.21         8.27     2_434.47       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-s:auto-dp0.5 (query)          2_323.82       112.06     2_435.88       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0.5 (self)                  2_323.82     1_084.31     3_408.13       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp0.5 (extract)               2_323.82         3.83     2_327.65       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-s:auto-dp1 (query)            2_297.53       113.68     2_411.21       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp1 (self)                    2_297.53     1_072.12     3_369.65       1.0000          1.0000            1.0000       313.53
+NNDescent-k:auto-nt:auto-dp1 (extract)                 2_297.53         4.88     2_302.41       1.0000          1.0000            1.0000       313.53
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -193,9 +193,9 @@ every row here would lose a flat `1/k` against the ground truth and the numbers
 would say nothing about the graph.
 
 Where the GPU descent does genuinely differ from the CPU one: the forest
-initialisation only proposes within leaves rather than running a full forest
-query per point, reverse edges are capped at `build_k` per node, and proposals
-past `MAX_PROPOSALS = 128` per node per iteration are dropped in arrival order.
+initialisation also joins leaves but runs fewer trees and keeps a capped number
+of leaf proposals per point, reverse edges are capped at `build_k` per node, and proposals past
+`MAX_PROPOSALS = 128` per node per iteration are dropped in arrival order.
 `refine_knn` is the knob that buys those back.
 
 **Tunable parameters:**
@@ -217,17 +217,17 @@ Benchmark: 250k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                             26.51     4_730.82     4_757.33       1.0000          1.0000            1.0000        61.04
-CPU-NNDescent (k=15)                                   2_684.13     1_102.69     3_786.82       1.0000          1.0000            1.0000       195.75
-GPU-kNN bk=1x refine=0                                   643.86         6.21       650.07       0.9813          1.0016            1.0000        87.74
-GPU-kNN bk=1x refine=1                                   483.34         5.11       488.45       0.9866          1.0011            1.0000        87.74
-GPU-kNN bk=1x refine=2                                   426.32         4.43       430.75       0.9870          1.0011            1.0000        87.74
-GPU-kNN bk=2x refine=0                                   718.47         7.01       725.48       0.9973          1.0002            1.0000        87.74
-GPU-kNN bk=2x refine=1                                   874.57         4.99       879.57       0.9991          1.0001            1.0000        87.74
-GPU-kNN bk=2x refine=2                                   828.49         5.52       834.01       0.9992          1.0001            1.0000        87.74
-GPU-kNN bk=3x refine=0                                 1_113.75         5.21     1_118.97       0.9984          1.0001            1.0000        87.74
-GPU-kNN bk=3x refine=1                                 1_329.51         5.36     1_334.87       0.9998          1.0000            1.0000        87.74
-GPU-kNN bk=3x refine=2                                 1_476.92         4.90     1_481.82       0.9998          1.0000            1.0000        87.74
+GPU-Exhaustive (ground truth)                             26.53     4_725.44     4_751.96       1.0000          1.0000            1.0000        61.04
+CPU-NNDescent (k=15)                                   2_167.87       997.60     3_165.46       1.0000          1.0000            1.0000       300.95
+GPU-kNN bk=1x refine=0                                   601.02         4.55       605.58       0.9814          1.0016            1.0000        59.13
+GPU-kNN bk=1x refine=1                                   434.30         4.25       438.55       0.9867          1.0011            1.0000        59.13
+GPU-kNN bk=1x refine=2                                   427.89         4.09       431.98       0.9870          1.0011            1.0000        59.13
+GPU-kNN bk=2x refine=0                                   760.23         4.38       764.62       0.9989          1.0001            1.0000        59.13
+GPU-kNN bk=2x refine=1                                   768.35         4.23       772.58       0.9995          1.0000            1.0000        59.13
+GPU-kNN bk=2x refine=2                                   825.20         4.71       829.91       0.9995          1.0000            1.0000        59.13
+GPU-kNN bk=3x refine=0                                 1_094.47         4.20     1_098.67       0.9995          1.0000            1.0000        59.13
+GPU-kNN bk=3x refine=1                                 1_212.13         4.06     1_216.19       0.9999          1.0000            1.0000        59.13
+GPU-kNN bk=3x refine=2                                 1_380.16         4.13     1_384.29       0.9999          1.0000            1.0000        59.13
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -243,17 +243,17 @@ Benchmark: 250k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                             61.86     7_363.21     7_425.06       1.0000          1.0000            1.0000       122.07
-CPU-NNDescent (k=15)                                   3_369.07     1_516.54     4_885.61       1.0000          1.0000            1.0000       274.03
-GPU-kNN bk=1x refine=0                                   820.17         5.26       825.44       0.9810          1.0016            1.0000       118.26
-GPU-kNN bk=1x refine=1                                   851.85         5.38       857.23       0.9864          1.0011            1.0000       118.26
-GPU-kNN bk=1x refine=2                                   987.92         4.68       992.60       0.9867          1.0011            1.0000       118.26
-GPU-kNN bk=2x refine=0                                 1_179.81         4.45     1_184.26       0.9972          1.0002            1.0000       118.26
-GPU-kNN bk=2x refine=1                                 1_945.50         4.30     1_949.80       0.9991          1.0001            1.0000       118.26
-GPU-kNN bk=2x refine=2                                 2_716.23         4.22     2_720.45       0.9992          1.0001            1.0000       118.26
-GPU-kNN bk=3x refine=0                                 1_922.21         4.40     1_926.61       0.9984          1.0001            1.0000       118.26
-GPU-kNN bk=3x refine=1                                 3_734.37         4.21     3_738.58       0.9998          1.0000            1.0000       118.26
-GPU-kNN bk=3x refine=2                                 5_585.09         4.20     5_589.29       0.9998          1.0000            1.0000       118.26
+GPU-Exhaustive (ground truth)                             58.55     7_329.00     7_387.54       1.0000          1.0000            1.0000       122.07
+CPU-NNDescent (k=15)                                   2_613.21     1_457.49     4_070.70       1.0000          1.0000            1.0000       339.49
+GPU-kNN bk=1x refine=0                                   800.29         4.50       804.78       0.9810          1.0016            1.0000        89.65
+GPU-kNN bk=1x refine=1                                   807.75         4.23       811.99       0.9864          1.0011            1.0000        89.65
+GPU-kNN bk=1x refine=2                                   958.44         4.73       963.16       0.9868          1.0011            1.0000        89.65
+GPU-kNN bk=2x refine=0                                 1_139.27         4.36     1_143.63       0.9989          1.0001            1.0000        89.65
+GPU-kNN bk=2x refine=1                                 1_858.40         4.23     1_862.63       0.9994          1.0000            1.0000        89.65
+GPU-kNN bk=2x refine=2                                 2_599.39         4.07     2_603.46       0.9995          1.0000            1.0000        89.65
+GPU-kNN bk=3x refine=0                                 1_735.09         4.11     1_739.20       0.9995          1.0000            1.0000        89.65
+GPU-kNN bk=3x refine=1                                 3_465.95         4.54     3_470.49       0.9999          1.0000            1.0000        89.65
+GPU-kNN bk=3x refine=2                                 5_152.09         4.09     5_156.18       0.9999          1.0000            1.0000        89.65
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -269,17 +269,17 @@ Benchmark: 500k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                             59.22    17_679.46    17_738.67       1.0000          1.0000            1.0000       122.07
-CPU-NNDescent (k=15)                                   5_483.96     2_528.32     8_012.28       0.9999          1.0000            1.0000       386.48
-GPU-kNN bk=1x refine=0                                 1_041.74        11.58     1_053.32       0.9721          1.0025            1.0000       175.48
-GPU-kNN bk=1x refine=1                                 1_102.60        12.29     1_114.89       0.9791          1.0018            1.0000       175.48
-GPU-kNN bk=1x refine=2                                 1_222.18        11.74     1_233.92       0.9797          1.0017            1.0000       175.48
-GPU-kNN bk=2x refine=0                                 1_575.34        10.47     1_585.81       0.9963          1.0003            1.0000       175.48
-GPU-kNN bk=2x refine=1                                 2_344.17        10.23     2_354.40       0.9985          1.0001            1.0000       175.48
-GPU-kNN bk=2x refine=2                                 3_103.75         9.67     3_113.42       0.9986          1.0001            1.0000       175.48
-GPU-kNN bk=3x refine=0                                 2_394.62         9.70     2_404.31       0.9980          1.0001            1.0000       175.48
-GPU-kNN bk=3x refine=1                                 4_153.45        12.32     4_165.78       0.9996          1.0000            1.0000       175.48
-GPU-kNN bk=3x refine=2                                 5_963.88        10.13     5_974.01       0.9997          1.0000            1.0000       175.48
+GPU-Exhaustive (ground truth)                             59.94    17_250.21    17_310.15       1.0000          1.0000            1.0000       122.07
+CPU-NNDescent (k=15)                                   4_567.22     2_448.12     7_015.34       1.0000          1.0000            1.0000       649.98
+GPU-kNN bk=1x refine=0                                   955.46         9.29       964.75       0.9721          1.0025            1.0000       118.26
+GPU-kNN bk=1x refine=1                                 1_027.17         9.05     1_036.22       0.9792          1.0018            1.0000       118.26
+GPU-kNN bk=1x refine=2                                 1_168.92         9.02     1_177.93       0.9797          1.0017            1.0000       118.26
+GPU-kNN bk=2x refine=0                                 1_462.80         9.07     1_471.87       0.9982          1.0001            1.0000       118.26
+GPU-kNN bk=2x refine=1                                 2_160.29         9.54     2_169.83       0.9990          1.0001            1.0000       118.26
+GPU-kNN bk=2x refine=2                                 2_903.92         9.86     2_913.78       0.9991          1.0001            1.0000       118.26
+GPU-kNN bk=3x refine=0                                 2_263.44         9.58     2_273.02       0.9993          1.0000            1.0000       118.26
+GPU-kNN bk=3x refine=1                                 3_854.37         9.27     3_863.64       0.9999          1.0000            1.0000       118.26
+GPU-kNN bk=3x refine=2                                 5_566.81         8.96     5_575.78       0.9999          1.0000            1.0000       118.26
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -295,17 +295,17 @@ Benchmark: 500k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                            151.87    28_360.44    28_512.31       1.0000          1.0000            1.0000       244.14
-CPU-NNDescent (k=15)                                   7_069.71     3_829.73    10_899.44       0.9999          1.0000            1.0000       540.55
-GPU-kNN bk=1x refine=0                                 1_603.38        11.33     1_614.72       0.9714          1.0025            1.0000       236.51
-GPU-kNN bk=1x refine=1                                 2_124.14        11.57     2_135.71       0.9785          1.0018            1.0000       236.51
-GPU-kNN bk=1x refine=2                                 2_689.96        11.96     2_701.92       0.9791          1.0018            1.0000       236.51
-GPU-kNN bk=2x refine=0                                 2_553.88        12.10     2_565.98       0.9962          1.0003            1.0000       236.51
-GPU-kNN bk=2x refine=1                                 5_493.09        11.13     5_504.22       0.9985          1.0001            1.0000       236.51
-GPU-kNN bk=2x refine=2                                 8_350.62        11.26     8_361.88       0.9986          1.0001            1.0000       236.51
-GPU-kNN bk=3x refine=0                                 4_111.83        12.44     4_124.27       0.9980          1.0001            1.0000       236.51
-GPU-kNN bk=3x refine=1                                10_763.00        10.35    10_773.36       0.9996          1.0000            1.0000       236.51
-GPU-kNN bk=3x refine=2                                17_479.68        12.47    17_492.15       0.9997          1.0000            1.0000       236.51
+GPU-Exhaustive (ground truth)                            149.65    27_725.58    27_875.22       1.0000          1.0000            1.0000       244.14
+CPU-NNDescent (k=15)                                   5_763.58     3_710.24     9_473.83       1.0000          1.0000            1.0000       900.05
+GPU-kNN bk=1x refine=0                                 1_488.88         8.98     1_497.86       0.9714          1.0025            1.0000       179.29
+GPU-kNN bk=1x refine=1                                 2_008.53         8.76     2_017.29       0.9786          1.0018            1.0000       179.29
+GPU-kNN bk=1x refine=2                                 2_644.87         8.99     2_653.86       0.9791          1.0018            1.0000       179.29
+GPU-kNN bk=2x refine=0                                 2_326.27         8.80     2_335.08       0.9982          1.0001            1.0000       179.29
+GPU-kNN bk=2x refine=1                                 5_105.18         9.25     5_114.43       0.9990          1.0001            1.0000       179.29
+GPU-kNN bk=2x refine=2                                 7_993.98         8.69     8_002.66       0.9990          1.0001            1.0000       179.29
+GPU-kNN bk=3x refine=0                                 3_695.28        10.09     3_705.38       0.9993          1.0000            1.0000       179.29
+GPU-kNN bk=3x refine=1                                10_116.95        10.76    10_127.71       0.9998          1.0000            1.0000       179.29
+GPU-kNN bk=3x refine=2                                16_579.06         9.13    16_588.20       0.9999          1.0000            1.0000       179.29
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -326,17 +326,17 @@ Benchmark: 1000k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                            125.84    67_378.27    67_504.11       1.0000          1.0000            1.0000       244.14
-CPU-NNDescent (k=15)                                  12_145.41     6_112.10    18_257.51       0.9998          1.0000            1.0000       768.94
-GPU-kNN bk=1x refine=0                                 2_145.41        24.46     2_169.87       0.9605          1.0037            1.0000       350.95
-GPU-kNN bk=1x refine=1                                 2_689.43        21.07     2_710.50       0.9691          1.0027            1.0000       350.95
-GPU-kNN bk=1x refine=2                                 3_118.07        21.26     3_139.34       0.9700          1.0027            1.0000       350.95
-GPU-kNN bk=2x refine=0                                 3_411.24        22.37     3_433.60       0.9951          1.0004            1.0000       350.95
-GPU-kNN bk=2x refine=1                                 6_216.94        22.51     6_239.45       0.9977          1.0002            1.0000       350.95
-GPU-kNN bk=2x refine=2                                 9_172.11        20.39     9_192.49       0.9979          1.0001            1.0000       350.95
-GPU-kNN bk=3x refine=0                                 5_476.98        18.67     5_495.65       0.9977          1.0002            1.0000       350.95
-GPU-kNN bk=3x refine=1                                11_881.41        20.75    11_902.16       0.9995          1.0000            1.0000       350.95
-GPU-kNN bk=3x refine=2                                18_498.32        21.84    18_520.16       0.9995          1.0000            1.0000       350.95
+GPU-Exhaustive (ground truth)                            121.36    66_271.39    66_392.76       1.0000          1.0000            1.0000       244.14
+CPU-NNDescent (k=15)                                  10_180.99     6_244.14    16_425.14       0.9999          1.0000            1.0000      1696.23
+GPU-kNN bk=1x refine=0                                 2_014.70        20.73     2_035.43       0.9605          1.0037            1.0000       236.51
+GPU-kNN bk=1x refine=1                                 2_515.86        24.36     2_540.22       0.9691          1.0027            1.0000       236.51
+GPU-kNN bk=1x refine=2                                 3_102.74        23.16     3_125.91       0.9700          1.0027            1.0000       236.51
+GPU-kNN bk=2x refine=0                                 3_155.52        20.74     3_176.26       0.9974          1.0002            1.0000       236.51
+GPU-kNN bk=2x refine=1                                 5_866.47        21.63     5_888.09       0.9984          1.0001            1.0000       236.51
+GPU-kNN bk=2x refine=2                                 8_618.78        20.57     8_639.35       0.9985          1.0001            1.0000       236.51
+GPU-kNN bk=3x refine=0                                 5_102.23        20.18     5_122.41       0.9992          1.0001            1.0000       236.51
+GPU-kNN bk=3x refine=1                                11_283.73        20.34    11_304.07       0.9998          1.0000            1.0000       236.51
+GPU-kNN bk=3x refine=2                                17_631.32        24.29    17_655.61       0.9998          1.0000            1.0000       236.51
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -352,17 +352,17 @@ Benchmark: 1000k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                            324.35   110_207.15   110_531.50       1.0000          1.0000            1.0000       488.28
-CPU-NNDescent (k=15)                                  15_526.05     9_216.81    24_742.85       0.9998          1.0000            1.0000      1113.09
-GPU-kNN bk=1x refine=0                                 3_260.68        24.29     3_284.97       0.9599          1.0037            1.0000       473.02
-GPU-kNN bk=1x refine=1                                 5_005.32        20.88     5_026.20       0.9687          1.0028            1.0000       473.02
-GPU-kNN bk=1x refine=2                                 6_798.79        22.15     6_820.94       0.9696          1.0027            1.0000       473.02
-GPU-kNN bk=2x refine=0                                 5_565.60        23.31     5_588.91       0.9951          1.0004            1.0000       473.02
-GPU-kNN bk=2x refine=1                                13_864.16        22.60    13_886.75       0.9977          1.0002            1.0000       473.02
-GPU-kNN bk=2x refine=2                                22_170.27        21.44    22_191.71       0.9978          1.0001            1.0000       473.02
-GPU-kNN bk=3x refine=0                                 9_202.03        21.53     9_223.56       0.9977          1.0002            1.0000       473.02
-GPU-kNN bk=3x refine=1                                28_702.76        21.36    28_724.12       0.9994          1.0000            1.0000       473.02
-GPU-kNN bk=3x refine=2                                48_477.45        16.79    48_494.24       0.9995          1.0000            1.0000       473.02
+GPU-Exhaustive (ground truth)                            319.94   110_441.37   110_761.31       1.0000          1.0000            1.0000       488.28
+CPU-NNDescent (k=15)                                  13_701.95     9_168.20    22_870.14       0.9999          1.0000            1.0000      1940.39
+GPU-kNN bk=1x refine=0                                 3_108.25        19.98     3_128.22       0.9599          1.0037            1.0000       358.58
+GPU-kNN bk=1x refine=1                                 4_781.92        20.14     4_802.05       0.9687          1.0028            1.0000       358.58
+GPU-kNN bk=1x refine=2                                 6_500.63        18.67     6_519.30       0.9696          1.0027            1.0000       358.58
+GPU-kNN bk=2x refine=0                                 4_952.15        18.63     4_970.78       0.9974          1.0002            1.0000       358.58
+GPU-kNN bk=2x refine=1                                12_745.20        18.49    12_763.69       0.9984          1.0001            1.0000       358.58
+GPU-kNN bk=2x refine=2                                20_856.54        18.57    20_875.11       0.9985          1.0001            1.0000       358.58
+GPU-kNN bk=3x refine=0                                 8_420.57        18.09     8_438.67       0.9992          1.0001            1.0000       358.58
+GPU-kNN bk=3x refine=1                                26_808.19        18.78    26_826.97       0.9998          1.0000            1.0000       358.58
+GPU-kNN bk=3x refine=2                                46_021.22        16.05    46_037.27       0.9998          1.0000            1.0000       358.58
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -378,17 +378,17 @@ Benchmark: 2500k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
 Method                                               Build (ms)   Query (ms)   Total (ms)     Recall@k Mean dist ratio Median dist ratio    Size (MB)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
-GPU-Exhaustive (ground truth)                            292.10   413_218.15   413_510.25       1.0000          1.0000            1.0000       610.35
-CPU-NNDescent (k=15)                                  32_124.75    18_449.03    50_573.78       0.9996          1.0000            1.0000      1952.33
-GPU-kNN bk=1x refine=0                                 6_022.26        70.54     6_092.80       0.9393          1.0060            1.0000       877.38
-GPU-kNN bk=1x refine=1                                 7_971.41        58.66     8_030.07       0.9505          1.0047            1.0000       877.38
-GPU-kNN bk=1x refine=2                                10_190.24        58.06    10_248.29       0.9520          1.0045            1.0000       877.38
-GPU-kNN bk=2x refine=0                                 9_990.03        45.97    10_036.00       0.9932          1.0005            1.0000       877.38
-GPU-kNN bk=2x refine=1                                20_378.26        54.55    20_432.80       0.9963          1.0003            1.0000       877.38
-GPU-kNN bk=2x refine=2                                30_634.21        45.28    30_679.50       0.9965          1.0002            1.0000       877.38
-GPU-kNN bk=3x refine=0                                15_046.38        58.08    15_104.46       0.9972          1.0002            1.0000       877.38
-GPU-kNN bk=3x refine=1                                38_632.18        56.14    38_688.32       0.9992          1.0001            1.0000       877.38
-GPU-kNN bk=3x refine=2                                62_545.72        57.36    62_603.08       0.9992          1.0001            1.0000       877.38
+GPU-Exhaustive (ground truth)                            300.01   413_128.83   413_428.85       1.0000          1.0000            1.0000       610.35
+CPU-NNDescent (k=15)                                  30_335.55    18_290.27    48_625.82       0.9999          1.0000            1.0000      3890.93
+GPU-kNN bk=1x refine=0                                 5_369.95        72.04     5_441.99       0.9393          1.0060            1.0000       591.28
+GPU-kNN bk=1x refine=1                                 7_536.37        57.18     7_593.55       0.9505          1.0047            1.0000       591.28
+GPU-kNN bk=1x refine=2                                 9_905.19        49.99     9_955.18       0.9520          1.0045            1.0000       591.28
+GPU-kNN bk=2x refine=0                                 9_028.88        48.59     9_077.47       0.9958          1.0003            1.0000       591.28
+GPU-kNN bk=2x refine=1                                19_457.06        50.72    19_507.78       0.9973          1.0002            1.0000       591.28
+GPU-kNN bk=2x refine=2                                29_950.37        47.24    29_997.62       0.9974          1.0002            1.0000       591.28
+GPU-kNN bk=3x refine=0                                13_772.30        46.54    13_818.84       0.9989          1.0001            1.0000       591.28
+GPU-kNN bk=3x refine=1                                37_631.64        52.23    37_683.86       0.9996          1.0000            1.0000       591.28
+GPU-kNN bk=3x refine=2                                61_592.87        51.69    61_644.55       0.9996          1.0000            1.0000       591.28
 -----------------------------------------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -431,12 +431,12 @@ Benchmark: 250k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -         663.59       0.9940        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=1)            1         504.16       0.9940        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=2)            2        1090.24       0.9992        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=4)            4        1119.55       0.9990        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=8)            8        1110.42       0.9992        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=16)          16        1215.27       0.9991        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (unbatched)                 -         668.98       0.9949        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=1)            1         486.42       0.9949        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=2)            2        1136.59       0.9993        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=4)            4        1150.63       0.9991        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=8)            8        1165.87       0.9993        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=16)          16        1348.03       0.9992        3_750_000 / 3_750_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -452,12 +452,12 @@ Benchmark: 250k samples, 64D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -         997.37       0.9938        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=1)            1         831.49       0.9938        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=2)            2        1727.47       0.9992        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=4)            4        1673.58       0.9991        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=8)            8        1685.14       0.9991        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=16)          16        1708.62       0.9991        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (unbatched)                 -         933.60       0.9947        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=1)            1         794.92       0.9947        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=2)            2        1709.42       0.9993        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=4)            4        1658.68       0.9992        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=8)            8        1691.43       0.9992        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=16)          16        1852.25       0.9993        3_750_000 / 3_750_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -473,18 +473,18 @@ Benchmark: 500k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -        1247.69       0.9909        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=1)            1        1162.88       0.9909        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=2)            2        2545.07       0.9986        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=4)            4        2442.04       0.9983        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=8)            8        2086.25       0.9984        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=16)          16        2150.78       0.9985        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (unbatched)                 -        1161.43       0.9919        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=1)            1        1095.01       0.9919        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=2)            2        2358.07       0.9987        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=4)            4        2197.58       0.9984        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=8)            8        2147.15       0.9986        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=16)          16        2251.41       0.9986        7_500_000 / 7_500_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
 
 ### Runtime info
 
-*ann-search-rs 0.10.1 (commit v0.10.1-18-g25372f1), run on 2026-10-09.*
+*ann-search-rs 0.11.0 (commit v0.10.1-78-gec8a881), run on 2026-10-11.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the `wgpu` backend.*

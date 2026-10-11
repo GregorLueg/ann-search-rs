@@ -41,6 +41,7 @@ fn time_cold_warm(mut f: impl FnMut() -> Vec<Vec<usize>>) -> (f64, f64, Vec<Vec<
 
 fn main() {
     let cli = Cli::parse();
+    println!("{:=>60}", "");
     println!(
         "{} samples, dim {}, k {}, {} distance",
         cli.n_samples.separate_with_underscores(),
