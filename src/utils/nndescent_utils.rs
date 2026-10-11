@@ -34,6 +34,9 @@ pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 pub trait GraphPid: Copy + Send + Sync {
     /// The id as an index.
     fn pid(self) -> usize;
+
+    /// The id from a 31-bit device id.
+    fn from_u32(pid: u32) -> Self;
 }
 
 impl GraphPid for usize {
@@ -41,12 +44,22 @@ impl GraphPid for usize {
     fn pid(self) -> usize {
         self
     }
+
+    #[inline(always)]
+    fn from_u32(pid: u32) -> Self {
+        pid as usize
+    }
 }
 
 impl GraphPid for u32 {
     #[inline(always)]
     fn pid(self) -> usize {
         self as usize
+    }
+
+    #[inline(always)]
+    fn from_u32(pid: u32) -> Self {
+        pid
     }
 }
 

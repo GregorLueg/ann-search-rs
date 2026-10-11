@@ -1571,7 +1571,7 @@ mod wgpu_tests {
             assert!((rw - rm).abs() < 0.01, "wgpu {rw} mlx {rm}");
         }
 
-        let knn_rows: Vec<u32> = index.knn_graph().iter().map(|&(p, _)| p as u32).collect();
+        let knn_rows: Vec<u32> = index.knn_graph().iter().map(|&(p, _)| p).collect();
         let self_entries = self_entry_points(&knn_rows, index.k, n, N_ENTRY_POINTS_MLX, 42);
         let (wgpu_self, _) = index.self_query_gpu(k, None, 42).unwrap();
         let (mlx_self, _) = s.self_search(k, None, Some(&self_entries), 42).unwrap();

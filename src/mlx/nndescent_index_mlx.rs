@@ -55,7 +55,7 @@ pub struct NNDescentIndexMlx {
     pub medoid: u32,
     /// True kNN graph of size `n * k`, sorted by distance per row, before
     /// CAGRA pruning
-    knn_graph: Vec<(usize, f32)>,
+    knn_graph: Vec<(u32, f32)>,
     /// Whether NN-Descent hit the delta threshold
     converged: bool,
     /// Beam search over the navigational graph, device resident
@@ -234,7 +234,7 @@ impl NNDescentIndexMlx {
         let query_params = query_params.unwrap_or_else(|| CagraMlxSearchParams::from_k(k));
         let n_entry = query_params.get_n_entry();
         // `SENTINEL_PID` narrows to the `0x7FFFFFFF` the helper skips.
-        let rows: Vec<u32> = self.knn_graph.iter().map(|&(p, _)| p as u32).collect();
+        let rows: Vec<u32> = self.knn_graph.iter().map(|&(p, _)| p).collect();
         let entries = self_entry_points(&rows, self.k, self.n, n_entry, seed);
         self.searcher
             .self_search(k, Some(query_params), Some(&entries), seed)
@@ -264,7 +264,7 @@ impl NNDescentIndexMlx {
     /// ### Returns
     ///
     /// The raw NN-Descent graph
-    pub fn knn_graph(&self) -> &[(usize, f32)] {
+    pub fn knn_graph(&self) -> &[(u32, f32)] {
         &self.knn_graph
     }
 
@@ -306,7 +306,7 @@ impl NNDescentIndexMlx {
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * size_of::<f32>()
             + self.norms.capacity() * size_of::<f32>()
-            + self.knn_graph.capacity() * size_of::<(usize, f32)>()
+            + self.knn_graph.capacity() * size_of::<(u32, f32)>()
             + self.searcher.memory_usage_bytes()
     }
 }

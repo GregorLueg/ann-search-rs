@@ -98,7 +98,7 @@ fn main() {
     )
     .unwrap();
     let mlx_upload = start.elapsed().as_secs_f64() * 1e3;
-    let knn_rows: Vec<u32> = wgpu.knn_graph().iter().map(|&(p, _)| p as u32).collect();
+    let knn_rows: Vec<u32> = wgpu.knn_graph().iter().map(|&(p, _)| p).collect();
     let n_entry = CagraMlxSearchParams::from_k(cli.k).get_n_entry();
 
     let (wq_cold, wq_warm, wq_nn) = time_cold_warm(|| {

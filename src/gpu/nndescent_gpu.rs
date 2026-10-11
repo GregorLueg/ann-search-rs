@@ -1827,7 +1827,7 @@ pub struct NNDescentGpu<T: AnnSearchFloat + CubeclFloat, R: Runtime> {
     pub medoid: u32,
     /// True kNN graph of size n * k, sorted by distance per row.
     /// Extracted from NNDescent output before CAGRA pruning.
-    knn_graph: Vec<(usize, T)>,
+    knn_graph: Vec<(u32, T)>,
     /// CAGRA navigational graph of size n * k, used for GPU beam search.
     /// Raw node IDs with `0x7FFFFFFF` sentinels in unfilled slots, in the
     /// order the CAGRA kernels emitted them. NOT a faithful kNN graph --
@@ -1913,7 +1913,7 @@ where
     /// ### Returns
     ///
     /// A slice view over the raw NN-Descent graph.
-    pub fn knn_graph(&self) -> &[(usize, T)] {
+    pub fn knn_graph(&self) -> &[(u32, T)] {
         &self.knn_graph
     }
 }
@@ -2393,8 +2393,8 @@ where
                 let row = &self.knn_graph[i * self.k..(i + 1) * self.k];
                 let valid: Vec<u32> = row
                     .iter()
-                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
-                    .map(|&(pid, _)| pid as u32)
+                    .filter(|&&(pid, _)| pid != SENTINEL_PID as u32)
+                    .map(|&(pid, _)| pid)
                     .collect();
                 // Slot 0 is the node itself: guarantees the beam lands on it
                 // (distance 0) and expands its own adjacency list immediately.
@@ -2583,7 +2583,7 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.knn_graph.capacity() * std::mem::size_of::<(usize, T)>()
+            + self.knn_graph.capacity() * std::mem::size_of::<(u32, T)>()
     }
 }
 
