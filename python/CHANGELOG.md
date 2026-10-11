@@ -12,6 +12,11 @@ Requires `ann-search-rs` 0.11.0
   (`brew install mlx-c`, then `maturin develop --release --features mlx`); the
   published wheel does not carry them. Same constraints as the GPU estimators,
   and a fitted index only works from the thread that built it.
+- `NNDescentIndex` seeds by joining every forest leaf and defaults to scanpy's
+  tree count, `min(5 + round(sqrt(n) / 20), 64)`. On 2.86M Tahoe PCA cells at
+  64 trees: build 50.3 s to 28.0 s, recall@15 0.976 to 0.990.
+- The GPU and MLX estimators build with lower peak memory, and the MLX ones
+  hand MLX's buffer cache back once fitted.
 - `CagraGpuIndex` picks up the GPU NN-Descent fixes: no duplicate neighbour ids
   from the random initialisation, and mutual-neighbour duplicates dropped before
   the local join.

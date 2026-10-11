@@ -21,10 +21,23 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   15.4 s, IVF build 1.1 s to 0.6 s, CAGRA build 6.2 s to 4.4 s, CAGRA self query
   (beam width 16) 1.27 s to 0.75 s. Full tables in
   [`docs/benchmarks_mlx.md`](docs/benchmarks_mlx.md).
+- CPU NN-Descent seeds its graph by joining every forest leaf exhaustively, as
+  PyNNDescent does, instead of one forest query per point. On 2.86M Tahoe PCA
+  cells (dim 32, degree 15) at 64 trees: build 50.3 s to 28.0 s, recall@15
+  0.976 to 0.990. Manhattan keeps the Kd forest and the per-point query.
+- CPU NN-Descent defaults to scanpy's tree count, `min(5 + round(sqrt(n) / 20),
+  64)`, up from `min(5 + round(n^0.25), 12)`.
 
 **Performance**
 
 - GPU NN-Descent drops mutual-neighbour duplicates before the local join.
+- MLX index builds release MLX's buffer cache once they finish. MLX CAGRA on
+  SIFT-1M held 9.7 GB resident after the build, now 3.9 GB.
+- Lower peak memory in the wgpu and MLX NN-Descent builds: the forest
+  projections run in batches instead of materialising every tree, MLX evaluates
+  each batch and drops its cache between phases, host graph buffers go once
+  consumed, and the MLX CAGRA searcher takes the build's device vectors instead
+  of uploading a second copy.
 - GPU forest leaves that filled the shared-memory budget exactly (dim 128 on a
   32 KiB device) ran far slower on Apple Silicon. Staging now keeps one point of
   headroom.
@@ -44,6 +57,17 @@ Only matters if you launch the GPU kernels yourself.
   so the norm arguments are gone.
 - `ForestRouter`, `default_forest_trees` and `compact_knn_rows` moved to
   `utils::rp_forest`, shared between wgpu and MLX.
+- `knn_graph()` on the wgpu and MLX NN-Descent indices returns `&[(u32, T)]`
+  instead of `usize` ids, halving the host graph. `extract_knn` is unchanged.
+
+**Docs**
+
+- New single-cell self-kNN benchmark on 2.86M Tahoe PCA cells against
+  pynndescent (scanpy settings), hnswlib and FAISS:
+  [`docs/benchmarks_single_cell.md`](docs/benchmarks_single_cell.md).
+- MLX rows in the cross-library comparison, and an MLX against wgpu kNN-graph
+  section in [`docs/benchmarks_mlx.md`](docs/benchmarks_mlx.md). Every
+  benchmark doc rerun.
 
 **Chore**
 
