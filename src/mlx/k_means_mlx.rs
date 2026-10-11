@@ -257,15 +257,23 @@ pub fn train_centroids_mlx(
     }
 
     let k = n_centroids as i32;
-    let tiles: Vec<(Array, usize, Array, Array)> =
-        upload_tiles(data, dim, score_tile_rows(n_centroids))
-            .into_iter()
-            .map(|(x, rows)| {
-                let upd = x.reshape(&[rows as i32, 1, dim as i32], s)?;
-                let ones = Array::ones(&[rows as i32, 1], MLX_FLOAT32, s)?;
-                Ok((x, rows, upd, ones))
-            })
-            .collect::<Result<_, AnnSearchErrors>>()?;
+    let d1 = dim as i32 + 1;
+    let tile = score_tile_rows(n_centroids);
+    // Each update row carries a trailing 1, so one scatter yields both the
+    // coordinate sums and the counts. A separate scalar scatter of ones
+    // contends on `n_centroids` bins and cost more than the assignment.
+    let tiles: Vec<(Array, usize, Array)> = upload_tiles(data, dim, tile)
+        .into_iter()
+        .zip(data.chunks(tile * dim))
+        .map(|((x, rows), chunk)| {
+            let mut aug = Vec::with_capacity(rows * (dim + 1));
+            for row in chunk.chunks_exact(dim) {
+                aug.extend_from_slice(row);
+                aug.push(1.0);
+            }
+            (x, rows, Array::from_f32(&aug, &[rows as i32, 1, d1]))
+        })
+        .collect();
     let argmin = argmin_kernel();
 
     let zero = Array::scalar_f32(0.0);
@@ -274,16 +282,15 @@ pub fn train_centroids_mlx(
 
     for iter in 0..params.iters {
         let ops = CentroidOperands::new(&c, n_centroids, metric, s)?;
-        let mut sums = Array::zeros(&[k, dim as i32], MLX_FLOAT32, s)?;
-        let mut counts = Array::zeros(&[k], MLX_FLOAT32, s)?;
+        let mut acc = Array::zeros(&[k, d1], MLX_FLOAT32, s)?;
         let mut assigns = Vec::with_capacity(tiles.len());
-        for (x, rows, upd, ones) in &tiles {
+        for (x, rows, upd) in &tiles {
             let a = ops.assign(x, *rows, n_centroids, &argmin, s)?;
-            sums = sums.scatter_add_rows(&a, upd, s)?;
-            counts = counts.scatter_add_rows(&a, ones, s)?;
+            acc = acc.scatter_add_rows(&a, upd, s)?;
             assigns.push(a);
         }
-        let counts = counts.reshape(&[k, 1], s)?;
+        let sums = acc.slice(&[0, 0], &[k, dim as i32], s)?;
+        let counts = acc.slice(&[0, dim as i32], &[k, d1], s)?;
         let mean = sums.divide(&counts.maximum(&one, s)?, s)?;
         // Empty clusters keep their previous centroid, as on the wgpu path.
         c = Array::select(&counts.greater(&zero, s)?, &mean, &c, s)?;
@@ -313,8 +320,11 @@ pub fn train_centroids_mlx(
             );
             c = Array::from_f32(&host, &[k, dim as i32]);
         } else {
-            // Bounds the lazy graph to one iteration without a host wait.
-            eval_all(&[&c], true)?;
+            // At most two iterations in flight. Fully async lets the host
+            // queue every iteration, and the first build at a new shape then
+            // pays fresh allocations for all of them; syncing every
+            // iteration costs the overlap.
+            eval_all(&[&c], iter % 2 == 0)?;
         }
     }
 
