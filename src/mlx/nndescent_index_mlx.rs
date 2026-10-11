@@ -149,6 +149,7 @@ impl NNDescentIndexMlx {
             graph_idx,
             converged,
             router,
+            vecs,
             ..
         } = out;
 
@@ -160,8 +161,16 @@ impl NNDescentIndexMlx {
             println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
         }
 
-        let mut searcher =
-            CagraSearchMlx::new(&vectors_flat, n, dim, metric, nav_graph, k, medoid)?;
+        let mut searcher = CagraSearchMlx::with_vectors(
+            vecs,
+            &vectors_flat,
+            n,
+            dim,
+            metric,
+            nav_graph,
+            k,
+            medoid,
+        )?;
         searcher.attach_router(&router)?;
         if verbose {
             println!("  Total build time: {:.2?}", start.elapsed());

@@ -701,10 +701,64 @@ impl CagraSearchMlx {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
         install_error_handler();
+        let vectors = upload_rows(vectors_flat, n, dim, dim.next_multiple_of(4));
+        Self::with_vectors(
+            vectors,
+            vectors_flat,
+            n,
+            dim,
+            metric,
+            nav_graph,
+            degree,
+            medoid,
+        )
+    }
+
+    /// [`Self::new`] over vectors already on the device, so a build that
+    /// uploaded them hands its copy over instead of a second one being made.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors` - Device vectors `[n, dim_padded]`, unnormalised, zero
+    ///   padded to a multiple of 4
+    /// * `vectors_flat` - The same vectors on the host, `n * dim`, for the
+    ///   cosine norms and the re-upload of a tiny input
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality
+    /// * `metric` - Distance metric. Manhattan is not supported.
+    /// * `nav_graph` - Flat `n * degree` neighbour ids, `0x7FFFFFFF` in empty
+    ///   slots
+    /// * `degree` - Graph degree
+    /// * `medoid` - Default entry point
+    ///
+    /// ### Returns
+    ///
+    /// The searcher, everything resident on the device
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_vectors(
+        vectors: Array,
+        vectors_flat: &[f32],
+        n: usize,
+        dim: usize,
+        metric: Dist,
+        nav_graph: Vec<u32>,
+        degree: usize,
+        medoid: u32,
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
+        install_error_handler();
 
         let dim_padded = dim.next_multiple_of(4);
         let stream = Stream::default_gpu();
-        let vectors = upload_rows(vectors_flat, n, dim, dim_padded);
+        // The kernel wants at least `MLX_DEVICE_MIN_ELEMS`, which only the
+        // padded upload guarantees.
+        let vectors = if n * dim_padded < MLX_DEVICE_MIN_ELEMS {
+            upload_rows(vectors_flat, n, dim, dim_padded)
+        } else {
+            vectors
+        };
         let norms = if metric == Dist::Cosine {
             let norms: Vec<f32> = vectors_flat
                 .chunks_exact(dim)

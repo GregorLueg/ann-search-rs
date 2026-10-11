@@ -1217,6 +1217,9 @@ pub struct NndOutputMlx {
     pub converged: bool,
     /// Query router over the forest's first trees
     pub router: ForestRouter<f32>,
+    /// The build's device vectors `[n, dim_padded]`, unnormalised, for a
+    /// searcher to take over rather than upload again
+    pub(crate) vecs: Array,
 }
 
 /// Run the device-resident NN-Descent loop on MLX and read the raw graph
@@ -1334,6 +1337,7 @@ pub fn nndescent_core_mlx(
         graph_dist: g.1.as_f32()?.to_vec(),
         converged,
         router,
+        vecs: ctx.vecs,
     })
 }
 
