@@ -207,6 +207,24 @@ fn check(code: c_int, op: &'static str) -> Result<(), AnnSearchErrors> {
     }
 }
 
+unsafe extern "C" {
+    fn mlx_clear_cache() -> c_int;
+}
+
+/// Hand MLX's cached free buffers back to the system.
+///
+/// MLX keeps freed device buffers for reuse, and on unified memory they count
+/// against the process. A build's transients (k-means tiles, staged uploads)
+/// would otherwise stay resident for the index's lifetime.
+///
+/// ### Returns
+///
+/// `Ok(())`, or `MlxError` if mlx-c reports a failure
+pub fn clear_cache() -> Result<(), AnnSearchErrors> {
+    // SAFETY: no arguments, no preconditions.
+    check(unsafe { mlx_clear_cache() }, "mlx_clear_cache")
+}
+
 /// Evaluate several arrays in one graph run.
 ///
 /// ### Params

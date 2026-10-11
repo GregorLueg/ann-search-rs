@@ -8,6 +8,8 @@
 pub mod cagra_mlx;
 pub mod exhaustive_mlx;
 mod ffi;
+
+pub(crate) use ffi::clear_cache;
 mod forest_mlx;
 pub mod ivf_mlx;
 pub mod k_means_mlx;

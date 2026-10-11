@@ -3318,7 +3318,9 @@ pub fn build_exhaustive_index_mlx(
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    ExhaustiveIndexMlx::new(mat.into_row_major(), metric)
+    let index = ExhaustiveIndexMlx::new(mat.into_row_major(), metric)?;
+    crate::mlx::clear_cache()?;
+    Ok(index)
 }
 
 #[cfg(mlx_available)]
@@ -3472,14 +3474,17 @@ pub fn build_ivf_index_mlx(
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    IvfIndexMlx::build(
+    let index = IvfIndexMlx::build(
         mat.into_row_major(),
         metric,
         nlist,
         k_means_params,
         seed,
         verbose,
-    )
+    )?;
+    // The k-means transients sit in MLX's buffer cache once dropped.
+    crate::mlx::clear_cache()?;
+    Ok(index)
 }
 
 #[cfg(mlx_available)]
@@ -3586,7 +3591,7 @@ pub fn build_knn_graph_mlx(
         Dist::default()
     });
 
-    crate::mlx::nndescent_mlx::build_knn_graph_mlx(
+    let graph = crate::mlx::nndescent_mlx::build_knn_graph_mlx(
         mat.into_row_major(),
         metric,
         k,
@@ -3598,7 +3603,9 @@ pub fn build_knn_graph_mlx(
         refine_knn,
         seed,
         verbose,
-    )
+    )?;
+    crate::mlx::clear_cache()?;
+    Ok(graph)
 }
 
 #[cfg(mlx_available)]
@@ -3646,7 +3653,7 @@ pub fn build_nndescent_index_mlx(
         Dist::default()
     });
 
-    NNDescentIndexMlx::build(
+    let index = NNDescentIndexMlx::build(
         mat.into_row_major(),
         metric,
         k,
@@ -3658,7 +3665,9 @@ pub fn build_nndescent_index_mlx(
         refine_knn,
         seed,
         verbose,
-    )
+    )?;
+    crate::mlx::clear_cache()?;
+    Ok(index)
 }
 
 #[cfg(mlx_available)]
