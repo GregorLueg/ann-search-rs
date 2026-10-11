@@ -503,7 +503,9 @@ def summarise(template: Path, output: Path) -> None:
     """
     doc = template.read_text()
     infos = []
-    for stem in sorted(p for p in RESULTS.iterdir() if p.is_dir()):
+    # Only `<dataset>_t<threads>` runs; selfknn.py keeps its own directory here.
+    stems = (p for p in RESULTS.iterdir() if p.name.rsplit("_t", 1)[0] in DATASETS)
+    for stem in sorted(stems):
         csvs = sorted(stem.glob("*.csv"))
         if not csvs:
             continue

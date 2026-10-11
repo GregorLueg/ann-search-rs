@@ -43,8 +43,9 @@ uv run bench.py summarise
   the kernel's `phys_footprint` (what Activity Monitor shows; RSS on Linux).
   *Build peak* is the peak above the baseline before the training data was
   loaded, so it includes the input data. *Index* is what stays once the
-  caller's copy of the data is freed: an index that copies the vectors and one
-  that keeps a reference both count them once. Freed memory the allocator
+  caller's copy of the data is freed and one 100-query batch has run, so
+  buffers an index allocates on first use count too: an index that copies the
+  vectors and one that keeps a reference both count them once. Freed memory the allocator
   holds on to still counts, as it does for any process that built the index.
 - **Threads:** pinned through each library's own argument plus
   `OMP_NUM_THREADS`, `NUMBA_NUM_THREADS` and friends. annoy's Python API
@@ -88,26 +89,26 @@ uv run bench.py summarise
 
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| annoy | **ann_search** | 1.6 | 905 | 547 | 23,900 | 23,900 | 11,787 |
-| annoy | annoy | 4.4 | 435 | 238 | 10,657 | 6,523 | 3,376 |
-| cagra | **ann_search_mlx** | 4.7 | 1,296 | 961 | 196,279 | 196,279 | 158,286 |
-| cagra | **ann_search_gpu** | 6.5 | 2,294 | 1,686 | 55,251 | 55,251 | 37,363 |
-| exhaustive | **ann_search_mlx** | 0.0 | 584 | 405 | 65,524 | 65,524 | 65,524 |
-| exhaustive | **ann_search** | 0.0 | 402 | 223 | 17,988 | 17,988 | 17,988 |
-| exhaustive | **ann_search_gpu** | 0.0 | 584 | 219 | 13,648 | 13,648 | 13,648 |
-| exhaustive | faiss | 0.0 | 359 | 180 | 12,769 | 12,769 | 12,769 |
-| hnsw | **ann_search_sq8** | 1.4 | 587 | 58 | 338,286 | 227,144 | 149,588 |
-| hnsw | faiss_sq8 | 3.2 | 234 | 54 | 187,017 | 126,388 | n/a |
-| hnsw | faiss | 3.6 | 369 | 189 | 119,029 | 78,431 | 49,341 |
-| hnsw | **ann_search** | 3.4 | 414 | 234 | 113,957 | 75,699 | 48,528 |
-| hnsw | usearch | 6.5 | 376 | 196 | 58,030 | 41,721 | 27,996 |
-| hnsw | hnswlib | 8.3 | 381 | 202 | 44,841 | 33,074 | 22,809 |
-| ivf | **ann_search_mlx** | 0.4 | 1,423 | 706 | 415,152 | 415,152 | 243,821 |
-| ivf | **ann_search_gpu** | 1.5 | 1,987 | 1,268 | 188,243 | 188,243 | 148,205 |
-| ivf | **ann_search** | 1.2 | 761 | 223 | 36,642 | 36,642 | 18,662 |
-| ivf | faiss | 0.5 | 424 | 243 | 35,808 | 18,615 | 18,615 |
-| nndescent | **ann_search** | 3.4 | 1,065 | 506 | 71,451 | 71,451 | 51,848 |
-| nndescent | pynndescent | 3.0 | 409 | 215 | 18,114 | 16,492 | 11,133 |
+| annoy | **ann_search** | 1.6 | 767 | 429 | 23,525 | 23,525 | 11,610 |
+| annoy | annoy | 4.6 | 502 | 308 | n/a | n/a | n/a |
+| cagra | **ann_search_mlx** | 4.6 | 762 | 454 | 179,972 | 179,972 | 156,966 |
+| cagra | **ann_search_gpu** | 6.4 | 1,945 | 1,634 | 55,274 | 55,274 | 37,455 |
+| exhaustive | **ann_search_mlx** | 0.0 | 585 | 428 | 66,472 | 66,472 | 66,472 |
+| exhaustive | **ann_search** | 0.0 | 405 | 226 | 17,727 | 17,727 | 17,727 |
+| exhaustive | **ann_search_gpu** | 0.0 | 578 | 1,324 | 13,467 | 13,467 | 13,467 |
+| exhaustive | faiss | 0.0 | 359 | 180 | 12,197 | 12,197 | 12,197 |
+| hnsw | **ann_search_sq8** | 1.2 | 587 | 60 | 329,891 | 228,853 | 147,520 |
+| hnsw | faiss_sq8 | 3.7 | 235 | 56 | 157,171 | 111,803 | n/a |
+| hnsw | faiss | 3.9 | 370 | 190 | 115,802 | 76,206 | 47,977 |
+| hnsw | **ann_search** | 3.5 | 414 | 235 | 113,141 | 75,086 | 48,207 |
+| hnsw | usearch | 7.4 | 371 | 191 | 50,137 | 37,434 | 24,833 |
+| hnsw | hnswlib | 8.3 | 376 | 196 | 46,893 | 33,786 | 22,752 |
+| ivf | **ann_search_mlx** | 0.4 | 1,424 | 229 | 384,284 | 384,284 | 239,831 |
+| ivf | **ann_search_gpu** | 1.5 | 1,989 | 1,085 | 198,456 | 198,456 | 147,956 |
+| ivf | **ann_search** | 1.2 | 761 | 223 | 36,332 | 36,332 | 18,557 |
+| ivf | faiss | 0.5 | 433 | 253 | 34,807 | 18,042 | 18,042 |
+| nndescent | **ann_search** | 2.6 | 1,116 | 480 | 64,701 | 64,701 | 50,263 |
+| nndescent | pynndescent | 3.2 | 388 | 210 | 17,121 | 15,577 | 10,693 |
 
 ### Fashion-MNIST, 1 thread
 
@@ -117,20 +118,20 @@ The ann-benchmarks convention.
 
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| annoy | **ann_search** | 5.6 | 802 | 443 | 4,677 | 4,677 | 2,286 |
-| annoy | annoy | 17.8 | 427 | 246 | 1,450 | 793 | 437 |
-| exhaustive | faiss | 0.0 | 360 | 180 | 8,632 | 8,632 | 8,632 |
-| exhaustive | **ann_search** | 0.0 | 404 | 224 | 5,171 | 5,171 | 5,171 |
-| hnsw | **ann_search_sq8** | 9.1 | 584 | 54 | 56,523 | 36,671 | 22,304 |
-| hnsw | faiss | 16.3 | 369 | 190 | 27,727 | 18,238 | 11,219 |
-| hnsw | **ann_search** | 16.6 | 414 | 235 | 25,362 | 17,045 | 10,735 |
-| hnsw | faiss_sq8 | 19.5 | 233 | 53 | 25,163 | 16,168 | n/a |
-| hnsw | usearch | 52.3 | 374 | 195 | 7,448 | 5,273 | 3,515 |
-| hnsw | hnswlib | 66.8 | 375 | 195 | 5,740 | 4,093 | 2,752 |
-| ivf | faiss | 0.6 | 444 | 265 | 12,671 | 6,567 | 6,567 |
-| ivf | **ann_search** | 1.9 | 763 | 224 | 8,861 | 8,861 | 4,758 |
-| nndescent | pynndescent | 12.9 | 361 | 184 | 15,236 | 14,060 | 9,900 |
-| nndescent | **ann_search** | 16.5 | 1,072 | 444 | 14,277 | 14,277 | 10,102 |
+| annoy | **ann_search** | 5.8 | 749 | 322 | 4,516 | 4,516 | 2,213 |
+| annoy | annoy | 17.8 | 431 | 251 | n/a | n/a | n/a |
+| exhaustive | faiss | 0.0 | 359 | 180 | 8,776 | 8,776 | 8,776 |
+| exhaustive | **ann_search** | 0.0 | 404 | 225 | 5,166 | 5,166 | 5,166 |
+| hnsw | **ann_search_sq8** | 8.7 | 583 | 53 | 50,327 | 32,368 | 19,967 |
+| hnsw | faiss | 16.7 | 369 | 190 | 27,003 | 17,762 | 10,863 |
+| hnsw | **ann_search** | 17.3 | 411 | 232 | 24,124 | 16,297 | 10,355 |
+| hnsw | faiss_sq8 | 20.7 | 234 | 54 | 23,663 | 16,050 | n/a |
+| hnsw | usearch | 53.3 | 375 | 196 | 7,290 | 5,155 | 3,432 |
+| hnsw | hnswlib | 66.9 | 380 | 201 | 5,731 | 4,102 | 2,754 |
+| ivf | faiss | 0.6 | 441 | 262 | 12,667 | 6,555 | 6,555 |
+| ivf | **ann_search** | 1.9 | 770 | 232 | 8,608 | 8,608 | 4,637 |
+| nndescent | pynndescent | 13.1 | 359 | 180 | 18,723 | 16,985 | 11,370 |
+| nndescent | **ann_search** | 13.2 | 949 | 466 | 13,593 | 13,593 | 9,648 |
 
 ### SIFT, 10 threads
 
@@ -138,26 +139,26 @@ The ann-benchmarks convention.
 
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| annoy | **ann_search** | 8.0 | 2,433 | 1,137 | 12,019 | 6,873 | 3,306 |
-| annoy | annoy | 19.3 | 1,792 | 1,240 | 7,959 | 4,456 | 1,284 |
-| cagra | **ann_search_mlx** | 13.2 | 11,034 | 9,690 | 83,538 | 52,761 | 15,042 |
-| cagra | **ann_search_gpu** | 18.6 | 9,528 | 8,338 | 62,905 | 29,758 | 3,621 |
-| exhaustive | **ann_search_mlx** | 0.1 | 1,470 | 982 | 12,159 | 12,159 | 12,159 |
-| exhaustive | **ann_search_gpu** | 0.1 | 1,465 | 489 | 4,762 | 4,762 | 4,762 |
-| exhaustive | **ann_search** | 0.1 | 978 | 490 | 3,648 | 3,648 | 3,648 |
-| exhaustive | faiss | 0.1 | 978 | 489 | 864 | 864 | 864 |
-| hnsw | **ann_search_sq8** | 22.9 | 1,038 | 195 | 191,845 | 108,377 | n/a |
-| hnsw | faiss_sq8 | 45.0 | 773 | 281 | 102,191 | 54,414 | n/a |
-| hnsw | **ann_search** | 43.9 | 1,136 | 636 | 86,835 | 49,210 | 27,349 |
-| hnsw | faiss | 51.1 | 1,143 | 640 | 74,621 | 40,739 | 23,708 |
-| hnsw | hnswlib | 84.6 | 1,256 | 768 | 42,436 | 24,582 | 12,691 |
-| hnsw | usearch | 111.5 | 1,229 | 725 | 29,667 | 16,799 | 9,594 |
-| ivf | **ann_search_mlx** | 0.9 | 5,282 | 3,813 | 231,446 | 119,196 | 65,763 |
-| ivf | **ann_search_gpu** | 2.9 | 4,036 | 1,602 | 91,291 | 56,254 | 27,268 |
-| ivf | **ann_search** | 1.7 | 1,485 | 493 | 13,778 | 7,039 | 3,593 |
-| ivf | faiss | 8.7 | 1,170 | 682 | 13,734 | 7,158 | 3,609 |
-| nndescent | **ann_search** | 27.4 | 3,582 | 1,388 | 66,570 | 37,006 | 20,227 |
-| nndescent | pynndescent | 26.6 | 1,487 | 814 | 14,586 | 9,617 | 4,104 |
+| annoy | **ann_search** | 8.0 | 2,422 | 1,186 | 11,885 | 6,720 | 3,180 |
+| annoy | annoy | 18.4 | 1,777 | 1,240 | n/a | n/a | n/a |
+| cagra | **ann_search_mlx** | 12.6 | 4,131 | 1,403 | 71,048 | 43,839 | 13,612 |
+| cagra | **ann_search_gpu** | 17.9 | 5,175 | 4,682 | 66,072 | 30,851 | 3,890 |
+| exhaustive | **ann_search_mlx** | 0.1 | 1,470 | 1,364 | 12,899 | 12,899 | 12,899 |
+| exhaustive | **ann_search_gpu** | 0.1 | 1,466 | 1,597 | 4,952 | 4,952 | 4,952 |
+| exhaustive | **ann_search** | 0.1 | 978 | 490 | 3,616 | 3,616 | 3,616 |
+| exhaustive | faiss | 0.0 | 975 | 487 | 910 | 910 | 910 |
+| hnsw | **ann_search_sq8** | 22.2 | 1,037 | 203 | 193,420 | 111,593 | n/a |
+| hnsw | faiss_sq8 | 40.7 | 770 | 278 | 111,622 | 60,902 | n/a |
+| hnsw | faiss | 45.9 | 1,143 | 648 | 85,752 | 46,523 | 24,439 |
+| hnsw | **ann_search** | 43.4 | 1,131 | 637 | 85,715 | 49,063 | 27,246 |
+| hnsw | hnswlib | 78.5 | 1,256 | 768 | 40,809 | 23,737 | 13,278 |
+| hnsw | usearch | 100.1 | 1,229 | 725 | 32,992 | 19,129 | 10,530 |
+| ivf | **ann_search_mlx** | 0.8 | 5,283 | 1,027 | 240,747 | 130,685 | 69,135 |
+| ivf | **ann_search_gpu** | 2.6 | 4,037 | 1,113 | 101,469 | 59,617 | 29,041 |
+| ivf | faiss | 9.3 | 1,187 | 698 | 14,010 | 7,132 | 3,549 |
+| ivf | **ann_search** | 1.8 | 1,486 | 494 | 13,815 | 7,079 | 3,610 |
+| nndescent | **ann_search** | 26.1 | 3,919 | 1,824 | 67,591 | 37,438 | 20,390 |
+| nndescent | pynndescent | 27.5 | 1,482 | 812 | 14,095 | 9,370 | 3,981 |
 
 ### GloVe, 10 threads
 
@@ -165,30 +166,30 @@ The ann-benchmarks convention.
 
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.70 | QPS @ 0.80 | QPS @ 0.90 |
 |---|---|---:|---:|---:|---:|---:|---:|
-| annoy | **ann_search** | 11.5 | 2,389 | 1,143 | 6,928 | 2,999 | 1,681 |
-| annoy | annoy | 24.8 | 2,127 | 1,608 | 3,445 | 1,588 | 886 |
-| cagra | **ann_search_mlx** | 17.5 | 12,916 | 12,004 | 61,501 | 34,851 | n/a |
-| cagra | **ann_search_gpu** | 22.2 | 10,209 | 9,306 | 28,337 | 9,863 | n/a |
-| exhaustive | **ann_search_mlx** | 0.1 | 1,356 | 905 | 6,927 | 6,927 | 6,927 |
-| exhaustive | **ann_search_gpu** | 0.1 | 1,359 | 456 | 5,175 | 5,175 | 5,175 |
-| exhaustive | faiss | 0.3 | 913 | 453 | 3,725 | 3,725 | 3,725 |
-| exhaustive | **ann_search** | 0.1 | 909 | 457 | 2,889 | 2,889 | 2,889 |
-| hnsw | **ann_search_sq8** | 52.0 | 1,412 | 229 | 111,992 | 35,319 | 9,784 |
-| hnsw | **ann_search** | 71.3 | 1,090 | 638 | 72,807 | 42,061 | 12,818 |
-| hnsw | faiss | 68.1 | 1,100 | 642 | 66,954 | 20,110 | 5,259 |
-| hnsw | hnswlib | 111.5 | 1,231 | 779 | 39,380 | 13,468 | 3,998 |
-| hnsw | usearch | 155.6 | 1,243 | 792 | 27,202 | 8,882 | 2,530 |
-| hnsw | faiss_sq8 | 116.2 | 913 | 302 | 23,973 | 13,318 | 3,596 |
-| ivf | **ann_search_mlx** | 0.9 | 4,728 | 3,378 | 404,154 | 247,413 | 73,062 |
-| ivf | **ann_search_gpu** | 2.5 | 3,824 | 1,580 | 165,933 | 99,181 | 28,747 |
-| ivf | faiss | 6.3 | 1,080 | 628 | 29,608 | 15,492 | 4,197 |
-| ivf | **ann_search** | 1.7 | 1,383 | 475 | 28,154 | 14,567 | 3,891 |
-| nndescent | **ann_search** | 39.3 | 3,651 | 1,357 | 63,062 | 36,625 | 10,440 |
-| nndescent | pynndescent | 46.7 | 1,625 | 809 | 7,547 | 4,887 | 1,921 |
+| annoy | **ann_search** | 11.6 | 2,388 | 1,182 | 6,844 | 3,065 | 1,648 |
+| annoy | annoy | 25.1 | 1,981 | 1,511 | n/a | n/a | n/a |
+| cagra | **ann_search_mlx** | 17.7 | 4,485 | 1,570 | 60,705 | 34,136 | n/a |
+| cagra | **ann_search_gpu** | 22.3 | 8,470 | 7,703 | 28,725 | 9,880 | n/a |
+| exhaustive | **ann_search_mlx** | 0.1 | 1,356 | 1,356 | 7,254 | 7,254 | 7,254 |
+| exhaustive | **ann_search_gpu** | 0.1 | 1,360 | 1,565 | 5,278 | 5,278 | 5,278 |
+| exhaustive | faiss | 0.2 | 913 | 453 | 3,831 | 3,831 | 3,831 |
+| exhaustive | **ann_search** | 0.1 | 908 | 457 | 2,873 | 2,873 | 2,873 |
+| hnsw | **ann_search_sq8** | 51.8 | 1,410 | 228 | 110,103 | 35,122 | 9,897 |
+| hnsw | **ann_search** | 72.7 | 1,090 | 640 | 70,483 | 40,947 | 12,470 |
+| hnsw | faiss | 66.3 | 1,104 | 644 | 68,336 | 20,873 | 5,339 |
+| hnsw | hnswlib | 109.5 | 1,231 | 780 | 39,660 | 13,584 | 4,015 |
+| hnsw | usearch | 152.2 | 1,244 | 793 | 26,702 | 8,998 | 2,550 |
+| hnsw | faiss_sq8 | 117.2 | 913 | 305 | 23,341 | 13,059 | 3,548 |
+| ivf | **ann_search_mlx** | 0.9 | 4,727 | 957 | 415,076 | 247,529 | 73,210 |
+| ivf | **ann_search_gpu** | 2.4 | 3,829 | 1,122 | 179,104 | 103,671 | 29,010 |
+| ivf | faiss | 6.3 | 1,084 | 632 | 29,743 | 15,645 | 4,173 |
+| ivf | **ann_search** | 1.7 | 1,386 | 476 | 28,553 | 14,719 | 3,897 |
+| nndescent | **ann_search** | 39.0 | 4,196 | 1,888 | 65,077 | 36,697 | 10,336 |
+| nndescent | pynndescent | 47.3 | 1,620 | 810 | 7,542 | 4,874 | 1,911 |
 
 ---
 
 ### Runtime info
 
-*ann-search-rs 0.10.1 (commit v0.10.1-17-g0393802), run on 2026-10-09 on Apple M1 Max. Runs span commits v0.10.1-17-g0393802, v0.10.1-63-g43dd9d8.*
+*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

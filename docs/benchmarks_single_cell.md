@@ -34,7 +34,9 @@ included, computed in float64. `selfknn.py` downloads it on first use.
   single-cell path. pynndescent runs exactly as `sc.pp.neighbors` drives it by
   default (UMAP's settings: degree 16 counting self, `n_trees = min(64, 5 +
   round(sqrt(n) / 20))`, `n_iters = round(log2(n))`), reading its build graph
-  the same way, plus the same at degree 30.
+  the same way, plus the same at degree 30. ann-search's CPU NN-Descent runs
+  its defaults, which use the same tree count (64 at this n) and seed the graph
+  by joining every leaf, as pynndescent does.
 - **HNSW** at M = 16 and ef_construction = 100 (ann-search, hnswlib), self-query
   swept over `ef_search` 16 to 128.
 - **IVF** at `nlist = sqrt(n)` (ann-search CPU, wgpu and MLX, faiss
@@ -55,17 +57,17 @@ recall target. `n/a` means no point on its sweep got there.
 
 | Method | Library | Peak (MiB) | Total (s) @ 0.90 | Total (s) @ 0.95 | Total (s) @ 0.99 |
 |---|---|---:|---:|---:|---:|
-| ivf | **ann_search_mlx** | 6,155 | 3.3 | 4.9 | 4.9 |
-| nndescent | **ann_search_gpu** | 20,773 | 9.3 | 9.3 | 19.4 |
-| ivf | **ann_search_gpu** | 7,119 | 9.3 | 15.5 | 15.5 |
-| nndescent | **ann_search_mlx** | 33,708 | 9.5 | 9.5 | 18.1 |
-| ivf | **ann_search** | 1,408 | 19.8 | 31.6 | 31.6 |
-| nndescent | **ann_search** | 6,946 | 26.5 | 26.5 | 50.8 |
-| nndescent | pynndescent | 10,707 | 30.2 | 30.2 | 48.5 |
-| hnsw | **ann_search** | 2,107 | 39.1 | 43.9 | 70.0 |
-| ivf | faiss | 2,480 | 52.9 | 73.1 | 115.8 |
-| hnsw | hnswlib | 2,398 | 56.7 | 64.7 | 100.0 |
-| exhaustive | **ann_search_mlx** | 6,837 | 1606.7 | 1606.7 | 1606.7 |
+| ivf | **ann_search_mlx** | 5,079 | 3.1 | 4.7 | 4.7 |
+| ivf | **ann_search_gpu** | 7,120 | 9.2 | 15.6 | 15.6 |
+| nndescent | **ann_search_gpu** | 12,979 | 9.3 | 9.3 | 19.3 |
+| nndescent | **ann_search_mlx** | 8,663 | 9.5 | 9.5 | 18.1 |
+| ivf | **ann_search** | 1,408 | 20.5 | 33.2 | 33.2 |
+| nndescent | **ann_search** | 9,580 | 28.4 | 28.4 | 28.4 |
+| nndescent | pynndescent | 10,670 | 31.1 | 31.1 | 50.2 |
+| hnsw | **ann_search** | 2,114 | 40.6 | 45.4 | 71.9 |
+| ivf | faiss | 2,462 | 52.9 | 73.0 | 116.6 |
+| hnsw | hnswlib | 2,398 | 56.9 | 64.1 | 100.1 |
+| exhaustive | **ann_search_mlx** | 6,239 | 1607.8 | 1607.8 | 1607.8 |
 
 ### Caveats
 
@@ -77,5 +79,5 @@ recall target. `n/a` means no point on its sweep got there.
 
 ### Runtime info
 
-*ann-search-rs 0.11.0 (commit v0.10.1-65-g0a48e98), run on 2026-10-11 on Apple M1 Max. Runs span commits v0.10.1-65-g0a48e98, v0.10.1-66-gc83e6d5.*
+*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
