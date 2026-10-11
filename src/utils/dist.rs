@@ -9,7 +9,7 @@ use std::fmt::Display;
 use std::iter::Sum;
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
-use wide::{f32x4, f64x2, CmpEq};
+use wide::{f32x4, f64x2};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -1624,7 +1624,7 @@ fn canberra_f32_sse(a: &[f32], b: &[f32]) -> f32 {
             let vb = f32x4::from(*(b_ptr.add(offset) as *const [f32; 4]));
             let num = (va - vb).abs();
             let denom = va.abs() + vb.abs();
-            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            let safe_denom = denom.simd_eq(zero).select(one, denom);
             acc += num / safe_denom;
         }
     }
@@ -1787,7 +1787,7 @@ fn canberra_f64_sse(a: &[f64], b: &[f64]) -> f64 {
             let vb = f64x2::from(*(b_ptr.add(offset) as *const [f64; 2]));
             let num = (va - vb).abs();
             let denom = va.abs() + vb.abs();
-            let safe_denom = denom.simd_eq(zero).blend(one, denom);
+            let safe_denom = denom.simd_eq(zero).select(one, denom);
             acc += num / safe_denom;
         }
     }
