@@ -1198,6 +1198,53 @@ where
         Ok(graph)
     }
 
+    /// Initialise the flat k-NN graph by joining every forest leaf exhaustively
+    ///
+    /// pynndescent's seeding: every pair inside a leaf is scored once and
+    /// offered to both rows. A per-point forest query sees one budget's worth
+    /// of candidates however many trees there are; the leaf join sees every
+    /// leaf it sits in, so recall keeps climbing with the tree count.
+    ///
+    /// ### Params
+    ///
+    /// * `forest` - The Annoy forest the leaves come from
+    /// * `k` - Neighbours per node
+    ///
+    /// ### Returns
+    ///
+    /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
+    fn init_with_leaf_join(&self, forest: &AnnoyIndex<T>, k: usize) -> Vec<Neighbour<T>> {
+        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let mut graph = vec![sentinel; self.n * k];
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
+
+        for tree in 0..forest.n_trees {
+            forest.tree_leaves(tree).par_iter().for_each(|leaf| {
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+                // SAFETY: the leaves of one tree partition the points and
+                // trees run one after another, so this leaf is the only
+                // writer of its members' rows.
+                let row = |p: u32| unsafe {
+                    std::slice::from_raw_parts_mut(graph_ptr.0.add(p as usize * k), k)
+                };
+                // A split that never balanced leaves an oversized leaf; join it
+                // in blocks rather than all pairs.
+                for block in leaf.chunks(LEAF_JOIN_BLOCK) {
+                    for (a, &p) in block.iter().enumerate() {
+                        for &q in &block[a + 1..] {
+                            let d = self.distance(p as usize, q as usize);
+                            insert_sorted(row(p), q as usize, d);
+                            insert_sorted(row(q), p as usize, d);
+                        }
+                    }
+                }
+            });
+        }
+
+        graph
+    }
+
     /// Run the main NN-Descent algorithm with chunked updates
     ///
     /// Alternates between building candidate lists (new and old, forward and
@@ -1247,7 +1294,10 @@ where
         };
 
         let start = Instant::now();
-        let mut graph = self.init_with_forest(k)?;
+        let mut graph = match &self.forest {
+            Forest::Annoy(forest) => self.init_with_leaf_join(forest, k),
+            Forest::Kd(_) => self.init_with_forest(k)?,
+        };
         timings.seed = start.elapsed();
 
         if verbose {
@@ -2000,6 +2050,51 @@ where
 // Trait implementations //
 ///////////////////////////
 
+/// Largest block of a leaf joined all-pairs, so a degenerate leaf (a split
+/// that never balanced) stays linear rather than quadratic in its size.
+const LEAF_JOIN_BLOCK: usize = 256;
+
+/// Insert `(src, d)` into a row sorted ascending by `(distance, id)`.
+///
+/// Rejects a duplicate id or anything no better than the row's worst entry.
+/// Inserted entries are flagged new.
+///
+/// ### Params
+///
+/// * `row` - One node's `k` neighbours, sentinel-padded
+/// * `src` - Candidate id
+/// * `d` - Its distance
+///
+/// ### Returns
+///
+/// Whether the row changed.
+#[inline(always)]
+fn insert_sorted<T: AnnSearchFloat>(row: &mut [Neighbour<T>], src: usize, d: T) -> bool {
+    let k = row.len();
+    if d > row[k - 1].dist {
+        return false;
+    }
+    // One pass finds both the duplicate and the insertion point. The scan must
+    // run to the end regardless, since a duplicate can sit past the insertion
+    // point.
+    let mut pos = k;
+    for (i, slot) in row.iter().enumerate() {
+        let pid = slot.pid();
+        if pid == src {
+            return false;
+        }
+        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
+            pos = i;
+        }
+    }
+    if pos == k {
+        return false;
+    }
+    row.copy_within(pos..k - 1, pos + 1);
+    row[pos] = Neighbour::new(src, d, true);
+    true
+}
+
 ////////////////////////
 // ApplySortedUpdates //
 ////////////////////////
@@ -2047,36 +2142,13 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
                 let mut edge_updates = 0usize;
 
                 for update in segment {
-                    let d = update.dist;
-                    if d > cutoff {
+                    if update.dist > cutoff {
                         continue;
                     }
-                    let src = update.source as usize;
-
-                    // One pass finds both the duplicate and the insertion
-                    // point. The scan must run to the end regardless, since a
-                    // duplicate can sit past the insertion point.
-                    let mut pos = k;
-                    let mut duplicate = false;
-                    for (i, slot) in row.iter().enumerate() {
-                        let pid = slot.pid();
-                        if pid == src {
-                            duplicate = true;
-                            break;
-                        }
-                        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
-                            pos = i;
-                        }
+                    if insert_sorted(row, update.source as usize, update.dist) {
+                        cutoff = row[k - 1].dist;
+                        edge_updates += 1;
                     }
-
-                    if duplicate || pos == k {
-                        continue;
-                    }
-
-                    row.copy_within(pos..k - 1, pos + 1);
-                    row[pos] = Neighbour::new(src, d, true);
-                    cutoff = row[k - 1].dist;
-                    edge_updates += 1;
                 }
 
                 if edge_updates > 0 {

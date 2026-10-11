@@ -613,6 +613,35 @@ where
             + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
+
+    /// Leaves of one tree, as original ids.
+    ///
+    /// The leaves of a tree partition the points, which is what lets a caller
+    /// process them in parallel while writing per-point state.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree index, below `n_trees`
+    ///
+    /// ### Returns
+    ///
+    /// One id list per leaf
+    pub(crate) fn tree_leaves(&self, tree: usize) -> Vec<Vec<u32>> {
+        let mut leaves = Vec::new();
+        let mut stack = vec![self.roots[tree]];
+        while let Some(idx) = stack.pop() {
+            let node = &self.nodes[idx as usize];
+            if node.n_descendants == 1 {
+                let start = node.child_a as usize;
+                let items = &self.leaf_indices[start..start + node.child_b as usize];
+                leaves.push(items.iter().map(|&i| self.original_ids[i] as u32).collect());
+            } else {
+                stack.push(node.child_a);
+                stack.push(node.child_b);
+            }
+        }
+        leaves
+    }
 }
 
 ///////////
