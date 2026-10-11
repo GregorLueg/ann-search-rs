@@ -169,6 +169,24 @@ def footprint() -> tuple[int, int]:
     return psutil.Process().memory_info().rss, peak
 
 
+@beartype
+def settled_footprint() -> int:
+    """Current footprint once it stops falling, for at most 10 s.
+
+    Metal hands freed buffers back to the OS asynchronously: an MLX index read
+    straight after its build still counted the k-means transients it had
+    already released, and dropped by gigabytes a few seconds later.
+    """
+    prev = footprint()[0]
+    for _ in range(20):
+        time.sleep(0.5)
+        cur = footprint()[0]
+        if prev - cur < 8 * MIB:
+            return cur
+        prev = cur
+    return prev
+
+
 ##########
 # Worker #
 ##########
@@ -208,7 +226,10 @@ def worker(dataset: str, threads: int, entry: str, out: Path) -> None:
     build_peak = footprint()[1] - baseline
     del train
     gc.collect()
-    resident = footprint()[0] - baseline
+    # After one query, not straight after the build: some indices (the wgpu
+    # exhaustive one, the wgpu IVF scratch) allocate on first use.
+    query(test[:N_WARMUP], grid[0])
+    resident = settled_footprint() - baseline
 
     rows = []
     for p in grid:

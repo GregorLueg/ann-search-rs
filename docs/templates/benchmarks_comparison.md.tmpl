@@ -43,8 +43,9 @@ uv run bench.py summarise
   the kernel's `phys_footprint` (what Activity Monitor shows; RSS on Linux).
   *Build peak* is the peak above the baseline before the training data was
   loaded, so it includes the input data. *Index* is what stays once the
-  caller's copy of the data is freed: an index that copies the vectors and one
-  that keeps a reference both count them once. Freed memory the allocator
+  caller's copy of the data is freed and one 100-query batch has run, so
+  buffers an index allocates on first use count too: an index that copies the
+  vectors and one that keeps a reference both count them once. Freed memory the allocator
   holds on to still counts, as it does for any process that built the index.
 - **Threads:** pinned through each library's own argument plus
   `OMP_NUM_THREADS`, `NUMBA_NUM_THREADS` and friends. annoy's Python API
