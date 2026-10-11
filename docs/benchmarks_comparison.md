@@ -61,6 +61,11 @@ uv run bench.py summarise
   needed. Thread counts don't apply to them, so the 1-thread run leaves them
   out. Memory is unified here, so their footprint includes the device
   buffers.
+- `ann_search_mlx` rows are the same three indices on the experimental MLX
+  backend, which drives Metal directly. Apple Silicon only, and the binding has
+  to be built with the `mlx` feature and mlx-c installed (`brew install
+  mlx-c`); without it those entries fail to build. Same thread and memory
+  caveats as the wgpu rows.
 - Builds are a single run each. Read small gaps as ties.
 - "Best QPS at or above a target" depends on where the sweep grid steps fall.
   A library whose grid point lands at 0.909 counts at 0.90; one that lands at
@@ -85,9 +90,11 @@ uv run bench.py summarise
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 1.6 | 905 | 547 | 23,900 | 23,900 | 11,787 |
 | annoy | annoy | 4.4 | 435 | 238 | 10,657 | 6,523 | 3,376 |
-| cagra | **ann_search_gpu** | 8.6 | 2,290 | 1,690 | 60,202 | 60,202 | 40,005 |
+| cagra | **ann_search_mlx** | 4.7 | 1,296 | 961 | 196,279 | 196,279 | 158,286 |
+| cagra | **ann_search_gpu** | 6.5 | 2,294 | 1,686 | 55,251 | 55,251 | 37,363 |
+| exhaustive | **ann_search_mlx** | 0.0 | 584 | 405 | 65,524 | 65,524 | 65,524 |
 | exhaustive | **ann_search** | 0.0 | 402 | 223 | 17,988 | 17,988 | 17,988 |
-| exhaustive | **ann_search_gpu** | 0.0 | 584 | 225 | 13,964 | 13,964 | 13,964 |
+| exhaustive | **ann_search_gpu** | 0.0 | 584 | 219 | 13,648 | 13,648 | 13,648 |
 | exhaustive | faiss | 0.0 | 359 | 180 | 12,769 | 12,769 | 12,769 |
 | hnsw | **ann_search_sq8** | 1.4 | 587 | 58 | 338,286 | 227,144 | 149,588 |
 | hnsw | faiss_sq8 | 3.2 | 234 | 54 | 187,017 | 126,388 | n/a |
@@ -95,7 +102,8 @@ uv run bench.py summarise
 | hnsw | **ann_search** | 3.4 | 414 | 234 | 113,957 | 75,699 | 48,528 |
 | hnsw | usearch | 6.5 | 376 | 196 | 58,030 | 41,721 | 27,996 |
 | hnsw | hnswlib | 8.3 | 381 | 202 | 44,841 | 33,074 | 22,809 |
-| ivf | **ann_search_gpu** | 1.4 | 2,166 | 1,449 | 198,148 | 198,148 | 153,022 |
+| ivf | **ann_search_mlx** | 0.4 | 1,423 | 706 | 415,152 | 415,152 | 243,821 |
+| ivf | **ann_search_gpu** | 1.5 | 1,987 | 1,268 | 188,243 | 188,243 | 148,205 |
 | ivf | **ann_search** | 1.2 | 761 | 223 | 36,642 | 36,642 | 18,662 |
 | ivf | faiss | 0.5 | 424 | 243 | 35,808 | 18,615 | 18,615 |
 | nndescent | **ann_search** | 3.4 | 1,065 | 506 | 71,451 | 71,451 | 51,848 |
@@ -132,8 +140,10 @@ The ann-benchmarks convention.
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 8.0 | 2,433 | 1,137 | 12,019 | 6,873 | 3,306 |
 | annoy | annoy | 19.3 | 1,792 | 1,240 | 7,959 | 4,456 | 1,284 |
-| cagra | **ann_search_gpu** | 21.7 | 10,337 | 9,361 | 66,477 | 30,949 | 3,852 |
-| exhaustive | **ann_search_gpu** | 0.1 | 1,465 | 488 | 4,958 | 4,958 | 4,958 |
+| cagra | **ann_search_mlx** | 13.2 | 11,034 | 9,690 | 83,538 | 52,761 | 15,042 |
+| cagra | **ann_search_gpu** | 18.6 | 9,528 | 8,338 | 62,905 | 29,758 | 3,621 |
+| exhaustive | **ann_search_mlx** | 0.1 | 1,470 | 982 | 12,159 | 12,159 | 12,159 |
+| exhaustive | **ann_search_gpu** | 0.1 | 1,465 | 489 | 4,762 | 4,762 | 4,762 |
 | exhaustive | **ann_search** | 0.1 | 978 | 490 | 3,648 | 3,648 | 3,648 |
 | exhaustive | faiss | 0.1 | 978 | 489 | 864 | 864 | 864 |
 | hnsw | **ann_search_sq8** | 22.9 | 1,038 | 195 | 191,845 | 108,377 | n/a |
@@ -142,7 +152,8 @@ The ann-benchmarks convention.
 | hnsw | faiss | 51.1 | 1,143 | 640 | 74,621 | 40,739 | 23,708 |
 | hnsw | hnswlib | 84.6 | 1,256 | 768 | 42,436 | 24,582 | 12,691 |
 | hnsw | usearch | 111.5 | 1,229 | 725 | 29,667 | 16,799 | 9,594 |
-| ivf | **ann_search_gpu** | 2.9 | 4,033 | 1,600 | 98,749 | 59,046 | 28,676 |
+| ivf | **ann_search_mlx** | 0.9 | 5,282 | 3,813 | 231,446 | 119,196 | 65,763 |
+| ivf | **ann_search_gpu** | 2.9 | 4,036 | 1,602 | 91,291 | 56,254 | 27,268 |
 | ivf | **ann_search** | 1.7 | 1,485 | 493 | 13,778 | 7,039 | 3,593 |
 | ivf | faiss | 8.7 | 1,170 | 682 | 13,734 | 7,158 | 3,609 |
 | nndescent | **ann_search** | 27.4 | 3,582 | 1,388 | 66,570 | 37,006 | 20,227 |
@@ -156,8 +167,10 @@ The ann-benchmarks convention.
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 11.5 | 2,389 | 1,143 | 6,928 | 2,999 | 1,681 |
 | annoy | annoy | 24.8 | 2,127 | 1,608 | 3,445 | 1,588 | 886 |
-| cagra | **ann_search_gpu** | 25.1 | 10,201 | 9,298 | 28,637 | 9,820 | n/a |
-| exhaustive | **ann_search_gpu** | 0.1 | 1,360 | 457 | 5,218 | 5,218 | 5,218 |
+| cagra | **ann_search_mlx** | 17.5 | 12,916 | 12,004 | 61,501 | 34,851 | n/a |
+| cagra | **ann_search_gpu** | 22.2 | 10,209 | 9,306 | 28,337 | 9,863 | n/a |
+| exhaustive | **ann_search_mlx** | 0.1 | 1,356 | 905 | 6,927 | 6,927 | 6,927 |
+| exhaustive | **ann_search_gpu** | 0.1 | 1,359 | 456 | 5,175 | 5,175 | 5,175 |
 | exhaustive | faiss | 0.3 | 913 | 453 | 3,725 | 3,725 | 3,725 |
 | exhaustive | **ann_search** | 0.1 | 909 | 457 | 2,889 | 2,889 | 2,889 |
 | hnsw | **ann_search_sq8** | 52.0 | 1,412 | 229 | 111,992 | 35,319 | 9,784 |
@@ -166,7 +179,8 @@ The ann-benchmarks convention.
 | hnsw | hnswlib | 111.5 | 1,231 | 779 | 39,380 | 13,468 | 3,998 |
 | hnsw | usearch | 155.6 | 1,243 | 792 | 27,202 | 8,882 | 2,530 |
 | hnsw | faiss_sq8 | 116.2 | 913 | 302 | 23,973 | 13,318 | 3,596 |
-| ivf | **ann_search_gpu** | 2.4 | 3,828 | 1,579 | 174,133 | 101,204 | 29,008 |
+| ivf | **ann_search_mlx** | 0.9 | 4,728 | 3,378 | 404,154 | 247,413 | 73,062 |
+| ivf | **ann_search_gpu** | 2.5 | 3,824 | 1,580 | 165,933 | 99,181 | 28,747 |
 | ivf | faiss | 6.3 | 1,080 | 628 | 29,608 | 15,492 | 4,197 |
 | ivf | **ann_search** | 1.7 | 1,383 | 475 | 28,154 | 14,567 | 3,891 |
 | nndescent | **ann_search** | 39.3 | 3,651 | 1,357 | 63,062 | 36,625 | 10,440 |
@@ -176,5 +190,5 @@ The ann-benchmarks convention.
 
 ### Runtime info
 
-*ann-search-rs 0.10.1 (commit v0.10.1-17-g0393802), run on 2026-10-09 on Apple M1 Max.*
+*ann-search-rs 0.10.1 (commit v0.10.1-17-g0393802), run on 2026-10-09 on Apple M1 Max. Runs span commits v0.10.1-17-g0393802, v0.10.1-63-g43dd9d8.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

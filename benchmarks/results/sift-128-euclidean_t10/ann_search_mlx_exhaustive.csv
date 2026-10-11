@@ -1,0 +1,2 @@
+dataset,threads,library,method,param,build_s,build_peak_mib,resident_mib,query_s,qps,recall
+sift-128-euclidean,10,ann_search_mlx,exhaustive,-,0.11827183299465105,1470.3293151855469,982.0480651855469,0.8224104170221835,12159.379055786281,0.99935
