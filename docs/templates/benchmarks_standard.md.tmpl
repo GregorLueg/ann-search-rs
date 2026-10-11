@@ -537,8 +537,10 @@ decided by the offset and nearly everything lands in one bucket.
 
 NN-Descent, heavily inspired by the excellent
 [PyNNDescent](https://github.com/lmcinnes/pynndescent). A random-projection
-forest seeds a kNN graph, then local joins over neighbours-of-neighbours refine
-it until the improvement rate falls below `delta`. Good all-rounder, and the
+forest seeds a kNN graph by joining every leaf exhaustively, as PyNNDescent
+does, then local joins over neighbours-of-neighbours refine it until the
+improvement rate falls below `delta`. Manhattan runs on a Kd forest instead and
+seeds with one forest query per point. Good all-rounder, and the
 only CPU index here that hands back a self-kNN graph without a search pass. See
 [the kNN-graph benchmarks](benchmarks_knn_graph.md) for that path.
 
@@ -552,7 +554,7 @@ is exactly what the beam search buys on top of the graph.
 - *Graph degree (k)*: Neighbours per node in the built graph. Defaults to `30`.
   Also the ceiling on what `(extract)` can return.
 - *Number of trees (nt)*: Trees used for the initialisation. Auto defaults to
-  `min(5 + round(n^0.25), 12)`.
+  `min(5 + round(sqrt(n) / 20), 64)`, the scanpy setting.
 - *Search budget (s)*: Budget for the graph exploration at query time. Defaults
   to `k * n_trees`.
 - *Delta*: Early-stop threshold on the fraction of edges still improving.

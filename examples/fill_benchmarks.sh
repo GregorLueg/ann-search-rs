@@ -271,6 +271,12 @@ case "$KIND" in
             "cagra_mlx:euclidean:cell:128:250000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 250000 --dim 128"
             "cagra_mlx:euclidean:cell:64:500000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 64"
             "cagra_mlx:euclidean:cell:128:500000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 128"
+            "mlx_knn:euclidean:lowrank:32:250000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 250000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:250000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
+            "mlx_knn:euclidean:lowrank:32:500000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 500000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:500000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
+            "mlx_knn:euclidean:lowrank:32:1000000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 1000000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:1000000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
         )
         ;;
     binary)

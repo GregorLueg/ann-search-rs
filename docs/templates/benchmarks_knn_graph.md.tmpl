@@ -51,9 +51,9 @@ one.
 
 ### CPU NN-Descent
 
-A random-projection forest seeds the graph, then local joins over
-neighbours-of-neighbours refine it until the improving fraction drops below
-`delta`. Three rows per configuration: `(query)` against held-out data,
+A random-projection forest seeds the graph by joining every leaf exhaustively,
+then local joins over neighbours-of-neighbours refine it until the improving
+fraction drops below `delta`. Three rows per configuration: `(query)` against held-out data,
 `(self)` for the full self-kNN via beam search, and `(extract)` for the descent
 graph as-is. The gap between `(self)` and `(extract)` is exactly what the beam
 search buys on top of the graph.
@@ -112,9 +112,9 @@ every row here would lose a flat `1/k` against the ground truth and the numbers
 would say nothing about the graph.
 
 Where the GPU descent does genuinely differ from the CPU one: the forest
-initialisation only proposes within leaves rather than running a full forest
-query per point, reverse edges are capped at `build_k` per node, and proposals
-past `MAX_PROPOSALS = 128` per node per iteration are dropped in arrival order.
+initialisation also joins leaves but runs fewer trees and keeps a capped number
+of leaf proposals per point, reverse edges are capped at `build_k` per node, and proposals past
+`MAX_PROPOSALS = 128` per node per iteration are dropped in arrival order.
 `refine_knn` is the knob that buys those back.
 
 **Tunable parameters:**

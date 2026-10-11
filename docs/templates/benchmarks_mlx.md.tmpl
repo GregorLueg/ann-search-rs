@@ -19,12 +19,19 @@ The parameters and data match the wgpu runs one to one, so the tables can be
 read side by side with [the GPU benchmarks](benchmarks_gpu.md). There is no MLX
 NSG path.
 
+For the bare kNN graph, MLX against wgpu on the same data:
+
+```bash
+cargo run --example bench_mlx_nndescent --features gpu,mlx --release
+```
+
 ## Table of Contents
 
 - [MLX exhaustive and IVF](#mlx-exhaustive-and-ivf-vs-cpu-exhaustive)
 - [MLX exhaustive and IVF on larger data](#larger-data-sets)
 - [CAGRA style index](#cagra-type-querying)
 - [CAGRA index on larger data](#cagra-on-larger-data-sets)
+- [kNN graph generation](#knn-graph-generation)
 
 ### MLX exhaustive and IVF vs CPU exhaustive
 
@@ -197,3 +204,63 @@ The parameters match [the wgpu CAGRA section](benchmarks_gpu.md#cagra-type-query
 <!-- RUNINFO -->
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was MLX (mlx-c 0.7.0).*
+
+### kNN graph generation
+
+`build_knn_graph_mlx` against `build_knn_graph_gpu`: the descent only, no CAGRA
+prune and no search. Both run at their defaults, `k = 15`, on the same low-rank
+data as [the wgpu kNN-graph tables](benchmarks_knn_graph.md). Cold is the first
+build in the process, warm the best of three after it. Recall is against a CPU
+exhaustive self-kNN.
+
+<details>
+<summary><b>kNN generation (250k samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:32:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kNN generation (250k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:64:250000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kNN generation (500k samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:32:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kNN generation (500k samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:64:500000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kNN generation (1m samples; 32 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:32:1000000 -->
+</code></pre>
+</details>
+
+---
+
+<details>
+<summary><b>kNN generation (1m samples; 64 dimensions)</b>:</summary>
+<pre><code>
+<!-- BENCH:mlx_knn:euclidean:lowrank:64:1000000 -->
+</code></pre>
+</details>
