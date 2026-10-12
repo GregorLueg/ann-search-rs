@@ -829,8 +829,8 @@ pub fn score_query_topk_scalar(
     heap.into_sorted(query_norm, metric)
 }
 
-/// Score all blocks for up to 4 queries at once (AVX2 + FMA), returning
-/// per-query top-k.
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
+/// (AVX2 + FMA).
 ///
 /// Loads each block's codes once and scores all `batch_nq` queries against
 /// them, amortising the code load and nibble split across queries — the core
@@ -840,75 +840,11 @@ pub fn score_query_topk_scalar(
 /// to [`score_query_topk_scalar`] per query. Surplus slots beyond `batch_nq`
 /// are scored and discarded; pad them with any valid LUT.
 ///
-/// ### Params
-///
-/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for
-///   `batch_nq < 4`
-/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
-/// * `n_vectors` - Number of real (non-padding) vectors
-/// * `n_blocks` - Number of blocks in `blocked`
-/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
-/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
-///   `n_vectors`)
-/// * `query_norms` - L2 norms of the 4 queries
-/// * `metric` - Distance metric
-/// * `k` - Number of neighbours to return per query
-/// * `batch_nq` - Number of active queries (`1..=4`)
-///
-/// ### Returns
-///
-/// One `(indices, distances)` pair per active query, sorted nearest-first,
-/// length `min(k, n_vectors)`.
-///
-/// ### Safety
-///
-/// Requires AVX2 + FMA. `blocked`, `norms_f32`, and each `luts[qi]` must be
-/// sized consistently with `n_vectors` / `n_byte_groups` as in the scalar path.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fused4_avx2(
-    luts: &[&QueryLut; 4],
-    blocked: &[u8],
-    n_vectors: usize,
-    n_blocks: usize,
-    norms_f32: &[f32],
-    corrections_f32: &[f32],
-    query_norms: [f32; 4],
-    metric: Dist,
-    k: usize,
-    batch_nq: usize,
-) -> Vec<(Vec<u32>, Vec<f32>)> {
-    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
-    score_into_heaps_avx2(
-        luts,
-        blocked,
-        n_vectors,
-        n_blocks,
-        norms_f32,
-        corrections_f32,
-        query_norms,
-        metric,
-        batch_nq,
-        0,
-        &mut heaps,
-    );
-    heaps
-        .into_iter()
-        .enumerate()
-        .take(batch_nq)
-        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
-        .collect()
-}
-
-/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
-/// (AVX2 + FMA).
-///
-/// Reusable scoring core behind both [`fused4_avx2`] (exhaustive, one segment,
-/// `base_index = 0`) and the IVF path (one call per probed cluster,
-/// `base_index` set to the cluster's global slot offset so pushed indices are
-/// global). Heaps are persistent across calls, so the in-register prune sees
-/// the running minimum across all segments scored so far.
+/// Driven by [`topk_blocked`] (exhaustive, one segment, `base_index = 0`) and
+/// the IVF path (one call per probed cluster, `base_index` set to the
+/// cluster's global slot offset so pushed indices are global). Heaps are
+/// persistent across calls, so the in-register prune sees the running minimum
+/// across all segments scored so far.
 ///
 /// ### Params
 ///
@@ -1001,8 +937,8 @@ pub(crate) unsafe fn score_into_heaps_avx2(
 /// Per-query block epilogue (AVX2): combine accumulators, convert to f32,
 /// apply the metric key transform, prune, and update one query's heap.
 ///
-/// Shared by [`fused4_avx2`] and the AVX-512BW driver (which extracts each
-/// block's 256-bit accumulator half and calls this once per block). `acc` holds
+/// Shared by [`score_into_heaps_avx2`] and the AVX-512BW driver (which extracts
+/// each block's 256-bit accumulator half and calls this once per block). `acc` holds
 /// the four interleaved u16 accumulators for a single query over a single
 /// 32-vector block. When the heap is full and no lane exceeds the current
 /// minimum, the function returns early without touching the heap.
@@ -1188,89 +1124,18 @@ unsafe fn epilogue_one_query_avx2(
     }
 }
 
-/// Score all blocks for up to 4 queries at once (AVX-512BW), returning
-/// per-query top-k.
+/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
+/// (AVX-512BW).
 ///
 /// Processes two 32-vector blocks per inner iteration (64 vectors) via
 /// `_mm512_inserti64x4` and a broadcast LUT shuffle, then runs
 /// [`epilogue_one_query_avx2`] on each block's extracted 256-bit accumulator
 /// half. An odd trailing block is handled by an inlined AVX2 accumulation pass.
-/// Results are identical to [`fused4_avx2`]. Surplus slots beyond `batch_nq`
-/// are scored and discarded; pad them with any valid LUT.
-///
-/// ### Params
-///
-/// * `luts` - Array of exactly 4 query LUTs; pad unused slots for `batch_nq < 4`
-/// * `blocked` - Blocked code layout (`BlockedCodes::data`)
-/// * `n_vectors` - Number of real (non-padding) vectors
-/// * `n_blocks` - Number of blocks in `blocked`
-/// * `norms_f32` - Per-vector L2 norms (length `n_vectors`)
-/// * `corrections_f32` - Per-vector debias factors `1 / <u, x̂>` (length
-///   `n_vectors`)
-/// * `query_norms` - L2 norms of the 4 queries
-/// * `metric` - Distance metric
-/// * `k` - Number of neighbours to return per query
-/// * `batch_nq` - Number of active queries (`1..=4`)
-///
-/// ### Returns
-///
-/// One `(indices, distances)` pair per active query, sorted nearest-first,
-/// length `min(k, n_vectors)`.
-///
-/// ### Safety
-///
-/// Requires AVX2 + FMA + AVX-512F + AVX-512BW. Same buffer-sizing contract
-/// as [`fused4_avx2`].
-#[cfg(target_arch = "x86_64")]
-#[target_feature(
-    enable = "avx2",
-    enable = "fma",
-    enable = "avx512f",
-    enable = "avx512bw"
-)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fused4_avx512bw(
-    luts: &[&QueryLut; 4],
-    blocked: &[u8],
-    n_vectors: usize,
-    n_blocks: usize,
-    norms_f32: &[f32],
-    corrections_f32: &[f32],
-    query_norms: [f32; 4],
-    metric: Dist,
-    k: usize,
-    batch_nq: usize,
-) -> Vec<(Vec<u32>, Vec<f32>)> {
-    let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
-    score_into_heaps_avx512bw(
-        luts,
-        blocked,
-        n_vectors,
-        n_blocks,
-        norms_f32,
-        corrections_f32,
-        query_norms,
-        metric,
-        batch_nq,
-        0,
-        &mut heaps,
-    );
-    heaps
-        .into_iter()
-        .enumerate()
-        .take(batch_nq)
-        .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
-        .collect()
-}
-
-/// Score `n_blocks` blocks for up to 4 queries into caller-owned heaps
-/// (AVX-512BW).
-///
-/// Block-pair counterpart to [`score_into_heaps_avx2`]; see
-/// [`fused4_avx512bw`] for the algorithm. Shares the same persistent-heap /
-/// `base_index` contract as [`score_into_heaps_avx2`]: heaps accumulate across
-/// calls, so IVF can call this once per probed cluster with the cluster's
-/// global slot offset as `base_index`.
+/// Results are identical to [`score_into_heaps_avx2`], and so is the
+/// persistent-heap / `base_index` contract: heaps accumulate across calls, so
+/// IVF can call this once per probed cluster with the cluster's global slot
+/// offset as `base_index`. Surplus slots beyond `batch_nq` are scored and
+/// discarded; pad them with any valid LUT.
 ///
 /// ### Params
 ///
@@ -2284,6 +2149,87 @@ mod tests {
     #[test]
     fn test_oracle_k_one() {
         assert_oracle_matches_brute(4, 128, BLOCK * 2, 1, Dist::SquaredEuclidean);
+    }
+
+    /// [`topk_blocked`] pinned to the AVX2 kernel, whatever the runner supports.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fused4_avx2(
+        luts: &[&QueryLut; 4],
+        blocked: &[u8],
+        n_vectors: usize,
+        n_blocks: usize,
+        norms_f32: &[f32],
+        corrections_f32: &[f32],
+        query_norms: [f32; 4],
+        metric: Dist,
+        k: usize,
+        batch_nq: usize,
+    ) -> Vec<(Vec<u32>, Vec<f32>)> {
+        let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
+        score_into_heaps_avx2(
+            luts,
+            blocked,
+            n_vectors,
+            n_blocks,
+            norms_f32,
+            corrections_f32,
+            query_norms,
+            metric,
+            batch_nq,
+            0,
+            &mut heaps,
+        );
+        heaps
+            .into_iter()
+            .enumerate()
+            .take(batch_nq)
+            .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
+            .collect()
+    }
+
+    /// [`topk_blocked`] pinned to the AVX-512BW kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(
+        enable = "avx2",
+        enable = "fma",
+        enable = "avx512f",
+        enable = "avx512bw"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fused4_avx512bw(
+        luts: &[&QueryLut; 4],
+        blocked: &[u8],
+        n_vectors: usize,
+        n_blocks: usize,
+        norms_f32: &[f32],
+        corrections_f32: &[f32],
+        query_norms: [f32; 4],
+        metric: Dist,
+        k: usize,
+        batch_nq: usize,
+    ) -> Vec<(Vec<u32>, Vec<f32>)> {
+        let mut heaps: Vec<TopK> = (0..4).map(|_| TopK::new(k.min(n_vectors).max(1))).collect();
+        score_into_heaps_avx512bw(
+            luts,
+            blocked,
+            n_vectors,
+            n_blocks,
+            norms_f32,
+            corrections_f32,
+            query_norms,
+            metric,
+            batch_nq,
+            0,
+            &mut heaps,
+        );
+        heaps
+            .into_iter()
+            .enumerate()
+            .take(batch_nq)
+            .map(|(qi, h)| h.into_sorted(query_norms[qi], metric))
+            .collect()
     }
 
     #[cfg(target_arch = "x86_64")]
