@@ -2462,7 +2462,7 @@ where
             &client,
         )?);
 
-        self.nav_graph_gpu = Some(GpuTensor::< u32>::from_slice(
+        self.nav_graph_gpu = Some(GpuTensor::<u32>::from_slice(
             &self.nav_graph,
             vec![self.n, self.k],
             &client,
@@ -2834,11 +2834,8 @@ where
 
     let vectors_gpu = GpuTensor::<T>::from_slice(vectors_padded, vec![n, dim_padded], client)?;
 
-    let graph_idx_gpu = GpuTensor::< u32>::from_slice(
-        &vec![0x7FFFFFFFu32; n * build_k],
-        vec![n, build_k],
-        client,
-    )?;
+    let graph_idx_gpu =
+        GpuTensor::<u32>::from_slice(&vec![0x7FFFFFFFu32; n * build_k], vec![n, build_k], client)?;
     let graph_dist_gpu = GpuTensor::<T>::from_slice(
         &vec![<T as num_traits::Float>::max_value(); n * build_k],
         vec![n, build_k],
@@ -3797,20 +3794,11 @@ mod kernel_tests {
 
         let n_pairs = n * (n - 1) / 2; // 6
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let out_euclid = GpuTensor::< f32>::from_slice(
-            &vec![0.0f32; n_pairs],
-            vec![n_pairs],
-            &client,
-        )
-        .unwrap();
-        let out_cosine = GpuTensor::< f32>::from_slice(
-            &vec![0.0f32; n_pairs],
-            vec![n_pairs],
-            &client,
-        )
-        .unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let out_euclid =
+            GpuTensor::<f32>::from_slice(&vec![0.0f32; n_pairs], vec![n_pairs], &client).unwrap();
+        let out_cosine =
+            GpuTensor::<f32>::from_slice(&vec![0.0f32; n_pairs], vec![n_pairs], &client).unwrap();
 
         unsafe {
             compute_pairwise_dist::launch_unchecked::<f32>(
@@ -3883,20 +3871,11 @@ mod kernel_tests {
         crate::gpu::normalise_rows(&mut unit, dim);
 
         let n_pairs = n * (n - 1) / 2;
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
-        let out_euclid = GpuTensor::< f32>::from_slice(
-            &vec![0.0f32; n_pairs],
-            vec![n_pairs],
-            &client,
-        )
-        .unwrap();
-        let out_cosine = GpuTensor::< f32>::from_slice(
-            &vec![0.0f32; n_pairs],
-            vec![n_pairs],
-            &client,
-        )
-        .unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
+        let out_euclid =
+            GpuTensor::<f32>::from_slice(&vec![0.0f32; n_pairs], vec![n_pairs], &client).unwrap();
+        let out_cosine =
+            GpuTensor::<f32>::from_slice(&vec![0.0f32; n_pairs], vec![n_pairs], &client).unwrap();
 
         unsafe {
             compute_pairwise_dist::launch_unchecked::<f32>(
@@ -4003,8 +3982,7 @@ mod kernel_tests {
             }
         }
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_idx_gpu =
             GpuTensor::<u32>::from_slice(&graph_idx, vec![n, build_k], &client).unwrap();
         let graph_dist_gpu =
@@ -4421,8 +4399,7 @@ mod kernel_tests {
             .map(|i| ((i % 7) as f32) * 0.1 + (i / dim) as f32)
             .collect();
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
 
         // Compute dist(0, 1) on GPU via dist_sq_euclidean
         // We need a tiny wrapper kernel:
@@ -4780,8 +4757,7 @@ mod kernel_tests {
         // what makes this a coverage test of the index mapping.
         let graph_dist = vec![f32::MAX; n * build_k];
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_idx_gpu =
             GpuTensor::<u32>::from_slice(&graph_idx, vec![n, build_k], &client).unwrap();
         let graph_dist_gpu =

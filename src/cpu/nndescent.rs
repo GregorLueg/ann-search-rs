@@ -2899,7 +2899,10 @@ mod tests {
         .unwrap();
 
         let (ids, _) = index.extract_knn(None, false, false);
-        assert!(ids.iter().all(|row| row.len() == k), "extraction lost edges");
+        assert!(
+            ids.iter().all(|row| row.len() == k),
+            "extraction lost edges"
+        );
         // Diversification prunes over the forward+reverse pool and tops rows
         // back up, so the query graph differs in content, not in fill.
         let changed = index
@@ -2908,7 +2911,10 @@ mod tests {
             .zip(&index.graph)
             .filter(|(&q, &(g, _))| q != g)
             .count();
-        assert!(changed > 0, "diversify_prob = 1.0 left the query graph unchanged");
+        assert!(
+            changed > 0,
+            "diversify_prob = 1.0 left the query graph unchanged"
+        );
     }
     ///////////////////////
     // Candidate sets    //

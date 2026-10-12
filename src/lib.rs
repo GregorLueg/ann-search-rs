@@ -94,13 +94,13 @@ use crate::binary::{
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
 #[cfg(mlx_available)]
-use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
-#[cfg(mlx_available)]
 use crate::mlx::ivf_mlx::*;
+#[cfg(mlx_available)]
+use crate::mlx::nndescent_index_mlx::NNDescentIndexMlx;
 #[cfg(mlx_available)]
 use crate::mlx::nndescent_mlx::KnnGraphMlx;
 #[cfg(mlx_available)]
-use crate::mlx::nndescent_index_mlx::NNDescentIndexMlx;
+use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,

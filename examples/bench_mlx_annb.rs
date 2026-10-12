@@ -143,9 +143,8 @@ fn main() {
 
     // Exhaustive
     let t = Instant::now();
-    let ex_g =
-        build_exhaustive_index_gpu::<f32>((&train[..], n, dim), metric, dev.clone().into())
-            .unwrap();
+    let ex_g = build_exhaustive_index_gpu::<f32>((&train[..], n, dim), metric, dev.clone().into())
+        .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
         query_exhaustive_index_gpu((&test[..], nq, dim), &ex_g, k, false, false)

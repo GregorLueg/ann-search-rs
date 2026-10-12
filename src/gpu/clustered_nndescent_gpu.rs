@@ -1183,8 +1183,7 @@ mod device_tests {
             graph_idx,
             graph_dist,
             ..
-        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false)
-            .unwrap();
+        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false).unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
         let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];

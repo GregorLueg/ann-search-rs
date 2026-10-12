@@ -73,11 +73,7 @@ fn main() {
     println!("Building MLX exhaustive index (MLX)...");
 
     let start = Instant::now();
-    let mlx_exhaustive_idx = build_exhaustive_index_mlx(
-        data.as_ref(),
-        &cli.distance,
-    )
-    .unwrap();
+    let mlx_exhaustive_idx = build_exhaustive_index_mlx(data.as_ref(), &cli.distance).unwrap();
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = mlx_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 

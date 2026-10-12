@@ -10,8 +10,8 @@
 
 mod commons;
 
-use ann_search_rs::prelude::*;
 use ann_search_rs::mlx::ivf_mlx::IvfScanMlx;
+use ann_search_rs::prelude::*;
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;

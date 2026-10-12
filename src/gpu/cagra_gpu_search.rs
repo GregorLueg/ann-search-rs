@@ -801,8 +801,7 @@ mod tests {
 
         let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
             GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
@@ -876,8 +875,7 @@ mod tests {
             }
         }
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
             GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
@@ -951,22 +949,16 @@ mod tests {
             .map(|_| rng.random_range(0..n as u32))
             .collect();
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::< u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
-                .unwrap();
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
         let queries_gpu =
-            GpuTensor::< f32>::from_slice(&queries, vec![n_queries, dim], &client)
-                .unwrap();
+            GpuTensor::<f32>::from_slice(&queries, vec![n_queries, dim], &client).unwrap();
         let entry_gpu =
-            GpuTensor::< u32>::from_slice(&entries, vec![n_queries, n_entry], &client)
-                .unwrap();
-        let out_idx =
-            GpuTensor::< u32>::empty(vec![n_queries, k_out], &client).unwrap();
-        let out_dist =
-            GpuTensor::< f32>::empty(vec![n_queries, k_out], &client).unwrap();
-        let out_iters = GpuTensor::< u32>::empty(vec![n_queries], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&entries, vec![n_queries, n_entry], &client).unwrap();
+        let out_idx = GpuTensor::<u32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_dist = GpuTensor::<f32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_iters = GpuTensor::<u32>::empty(vec![n_queries], &client).unwrap();
 
         unsafe {
             cagra_beam_search::launch_unchecked::<f32>(

@@ -85,12 +85,9 @@ fn main() {
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
     let start = Instant::now();
-    let wgpu = build_exhaustive_index_gpu::<f32>(
-        data.as_ref(),
-        &cli.distance,
-        device.clone().into(),
-    )
-    .unwrap();
+    let wgpu =
+        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
+            .unwrap();
     let wgpu_build = start.elapsed().as_secs_f64() * 1e3;
     let (wgpu_cold, wgpu_warm, wgpu_nn) = time_cold_warm(|| {
         query_exhaustive_index_gpu_self(&wgpu, cli.k, false, false)

@@ -146,7 +146,7 @@ fn make_clustered(n: usize, dim: usize) -> Vec<f32> {
 /// Device-resident state one local-join launch reads and writes.
 struct LocalJoinInput {
     /// Padded vectors `[n, dim_padded]`, unit-normalised on the cosine path
-    vectors: GpuTensor< f32>,
+    vectors: GpuTensor<f32>,
     /// kNN graph indices `[n, build_k]` with the IS_NEW flag in the MSB
     graph_idx: GpuTensor<u32>,
     /// kNN graph distances `[n, build_k]`
@@ -239,7 +239,7 @@ impl Benchmark for LocalJoinBench {
         let vectors = GpuTensor::<f32>::from_slice(&padded, vec![n, dim_padded], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
 
-        let graph_idx = GpuTensor::< u32>::from_slice(
+        let graph_idx = GpuTensor::<u32>::from_slice(
             &vec![0x7FFF_FFFFu32; n * build_k],
             vec![n, build_k],
             &self.client,

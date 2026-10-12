@@ -990,12 +990,9 @@ mod tests {
         let leaf_offsets: Vec<u32> = vec![0, 4];
         let graph_dist = vec![f32::MAX; n * build_k];
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
             GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
         let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
@@ -1085,12 +1082,9 @@ mod tests {
         // The kernel takes unit rows; the reference below keeps the raw ones.
         let mut unit = data.clone();
         crate::gpu::normalise_rows(&mut unit, dim);
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
             GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
         let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
@@ -1174,12 +1168,9 @@ mod tests {
         let leaf_offsets: Vec<u32> = vec![0, 16];
         let graph_dist = vec![f32::MAX; n * build_k];
 
-        let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::< u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
             GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
         let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
@@ -1256,8 +1247,8 @@ mod tests {
             .collect();
 
         let vectors_gpu =
-            GpuTensor::< f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
-        let graph_idx_gpu = GpuTensor::< u32>::from_slice(
+            GpuTensor::<f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
+        let graph_idx_gpu = GpuTensor::<u32>::from_slice(
             &vec![0x7FFFFFFFu32; n * build_k],
             vec![n, build_k],
             &client,

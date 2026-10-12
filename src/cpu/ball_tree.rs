@@ -9,8 +9,8 @@ use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
-use crate::utils::tree_utils::*;
 use crate::utils::dist::cosine_from_dot;
+use crate::utils::tree_utils::*;
 use crate::utils::*;
 
 /// Sequential Lloyd passes on a small node's two-way split (an in-place

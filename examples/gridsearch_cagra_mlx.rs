@@ -72,11 +72,7 @@ fn main() {
     // MLX exhaustive
     println!("Building MLX exhaustive index...");
     let start = Instant::now();
-    let mlx_exhaustive_idx = build_exhaustive_index_mlx(
-        data.as_ref(),
-        &cli.distance,
-    )
-    .unwrap();
+    let mlx_exhaustive_idx = build_exhaustive_index_mlx(data.as_ref(), &cli.distance).unwrap();
     let mlx_ex_build = start.elapsed().as_secs_f64() * 1000.0;
     let mlx_ex_size = mlx_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -279,8 +275,7 @@ fn main() {
         println!("Self-querying CAGRA (beam_width={})...", bw);
         let start = Instant::now();
         let (cagra_self_neighbors, cagra_self_distances) =
-            query_nndescent_index_mlx_self(&mlx_nndescent_idx, cli.k, Some(params), true)
-                .unwrap();
+            query_nndescent_index_mlx_self(&mlx_nndescent_idx, cli.k, Some(params), true).unwrap();
         let cagra_self = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &cagra_self_neighbors, cli.k);

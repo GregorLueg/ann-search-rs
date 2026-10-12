@@ -181,9 +181,9 @@ struct DistanceBench {
 }
 
 struct DistanceInput {
-    query_gpu: GpuTensor< f32>,
-    db_gpu: GpuTensor< f32>,
-    distances_gpu: GpuTensor< f32>,
+    query_gpu: GpuTensor<f32>,
+    db_gpu: GpuTensor<f32>,
+    distances_gpu: GpuTensor<f32>,
 }
 
 impl Clone for DistanceInput {
