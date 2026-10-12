@@ -74,12 +74,9 @@ fn main() {
     // GPU exhaustive
     println!("Building GPU exhaustive index...");
     let start = Instant::now();
-    let gpu_exhaustive_idx = build_exhaustive_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
-        data.as_ref(),
-        &cli.distance,
-        device.clone(),
-    )
-    .unwrap();
+    let gpu_exhaustive_idx =
+        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
+            .unwrap();
     let gpu_ex_build = start.elapsed().as_secs_f64() * 1000.0;
     let gpu_ex_size = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -147,7 +144,7 @@ fn main() {
     // CAGRA beam search at different beam widths
     println!("Building GPU NNDescent/CAGRA index...");
     let start = Instant::now();
-    let mut gpu_nndescent_idx = build_nndescent_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+    let mut gpu_nndescent_idx = build_nndescent_index_gpu::<f32>(
         data.as_ref(),
         &cli.distance,
         Some(cli.k),
@@ -160,7 +157,7 @@ fn main() {
         cli.seed as usize,
         false,
         true,
-        device.clone(),
+        device.clone().into(),
     )
     .unwrap();
     let cagra_build = start.elapsed().as_secs_f64() * 1000.0;

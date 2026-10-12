@@ -50,7 +50,7 @@ class ExhaustiveIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Exhaustive
+    _HANDLE = _core.Exhaustive
 
     @beartype
     def __init__(
@@ -91,7 +91,7 @@ class KmknnIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Kmknn
+    _HANDLE = _core.Kmknn
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
 
     @beartype
@@ -145,7 +145,7 @@ class AnnoyIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Annoy
+    _HANDLE = _core.Annoy
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
@@ -203,7 +203,7 @@ class HnswIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Hnsw
+    _HANDLE = _core.Hnsw
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -266,7 +266,7 @@ class IvfIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Ivf
+    _HANDLE = _core.Ivf
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
@@ -316,13 +316,15 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
     dimensions `KmknnIndex` and `IvfIndex` get there first, exactly. Measure
     both on your data.
 
-    `diversify_prob` prunes redundant edges after descent: ``0.0`` disables it,
-    ``1.0`` prunes whenever the rule fires.
+    `diversify_prob` prunes redundant edges from the graph queries walk:
+    ``0.0`` disables it, ``1.0`` prunes whenever the rule fires. On the
+    ann-benchmarks runs ``1.0`` gives 2.7x the queries per second at equal
+    recall on SIFT and GloVe; on easy low-dimensional data it buys nothing and
+    costs ~15% more build time.
 
     `extract_knn` hands back the converged graph instead of searching for it
-    again, which is far cheaper than ``kneighbors(None)``. It reads the
-    post-pruning graph, so leave ``diversify_prob`` at 0 if extraction is the
-    point.
+    again, which is far cheaper than ``kneighbors(None)``. It reads the full
+    kNN graph whatever `diversify_prob` is.
 
     Args:
         n_neighbors: Neighbours per node in the graph being built, and the
@@ -333,15 +335,16 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
         delta: Convergence threshold. Descent stops once the fraction of
             updated edges falls below it.
         diversify_prob: Probability of pruning an edge the occlusion rule
-            fires on, after descent. ``0.0`` disables pruning, ``1.0`` prunes
-            every time.
+            fires on, in the query graph only. ``0.0`` disables pruning,
+            ``1.0`` prunes every time.
         max_iter: Descent iteration cap. ``None`` defaults to
             ``max(round(log2(n)), 5)``.
         max_candidates: Neighbours sampled per node per local join. ``None``
             defaults to ``min(n_neighbors, 60)``. The main quality-versus-time
             knob on the build; 30 to 60 is the useful range.
         n_trees: Random projection trees used to seed the initial graph.
-            ``None`` defaults to ``min(5 + round(n ** 0.25), 12)``.
+            ``None`` defaults to ``min(5 + round(sqrt(n) / 20), 64)``, scanpy's
+            setting.
         ef_search: Beam width at query time. ``None`` defaults to
             ``clamp(2 * k, 50, 200)``, and any value is raised to ``k``.
             Search-time: override it per call as
@@ -352,7 +355,7 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.NnDescent
+    _HANDLE = _core.NnDescent
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -361,7 +364,7 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
         n_neighbors: int = 15,
         metric: str = "euclidean",
         delta: float = 0.001,
-        diversify_prob: float = 0.0,
+        diversify_prob: float = 1.0,
         max_iter: int | None = None,
         max_candidates: int | None = None,
         n_trees: int | None = None,
@@ -424,7 +427,7 @@ class VamanaIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Vamana
+    _HANDLE = _core.Vamana
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -488,7 +491,7 @@ class NsgIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Nsg
+    _HANDLE = _core.Nsg
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -551,7 +554,7 @@ class BallTreeIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.BallTree
+    _HANDLE = _core.BallTree
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
@@ -602,7 +605,7 @@ class KdTreeIndex(BaseAnnIndex):
         not exposed here.
     """
 
-    _HANDLE: ClassVar[type] = _core.KdTree
+    _HANDLE = _core.KdTree
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
     @beartype
@@ -662,7 +665,7 @@ class LshIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Lsh
+    _HANDLE = _core.Lsh
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("n_probe", "max_candidates")
 
@@ -745,7 +748,7 @@ class SoarIndex(BaseAnnIndex):
         ValueError: On `fit`, if `rule` is not one of the three names.
     """
 
-    _HANDLE: ClassVar[type] = _core.Soar
+    _HANDLE = _core.Soar
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
@@ -825,7 +828,7 @@ class RnnDescentIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.RnnDescent
+    _HANDLE = _core.RnnDescent
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search", "k_search")
 
     @beartype

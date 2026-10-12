@@ -74,7 +74,7 @@ fn main() {
 
     println!("Building GPU kNN graph (k={})...", knn_k);
     let knn_start = Instant::now();
-    let knn_gpu = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+    let knn_gpu = build_knn_graph_gpu::<f32>(
         data.as_ref(),
         &cli.distance,
         Some(knn_k),
@@ -86,7 +86,7 @@ fn main() {
         None,
         cli.seed as usize,
         false,
-        device,
+        device.clone().into(),
     )
     .unwrap();
     let knn_build_ms = knn_start.elapsed().as_secs_f64() * 1000.0;

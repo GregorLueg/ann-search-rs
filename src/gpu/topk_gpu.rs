@@ -34,7 +34,7 @@
 
 use cubecl::frontend::Atomic;
 use cubecl::ir::features::AtomicUsage;
-use cubecl::ir::{ElemType, StorageType, Type, UIntKind};
+use cubecl::ir::{ElemType, Type, UIntKind};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::GpuLimits;
 
@@ -52,30 +52,20 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// Smallest `k` at which radix select beats `extract_topk` on the *chunked*
 /// exhaustive path.
 ///
-/// Measured end to end on an M1 Max, 50k x 50k, dim 32, four DB chunks:
-///
-/// | k | `extract_topk` | radix | |
-/// |---|---|---|---|
-/// | 15 | 383 ms | 555 ms | 0.69x |
-/// | 50 | 520 | 559 | 0.93x |
-/// | 75 | 719 | 731 | 0.98x |
-/// | 100 | 985 | 747 | 1.32x |
-/// | 150 | 1743 | 755 | 2.31x |
-///
 /// The threshold exists because of chunking, and it cannot be read off the
 /// isolated reducer benchmark, which reports radix winning at every `k`. The
 /// isolated bench always measures a *cold* chunk, where the running top-k is all
 /// sentinels. In the real pipeline only the first of `n_db / DB_CHUNK_SIZE`
 /// chunks is cold: after that the running top-k is tight and `extract_topk`'s
-/// `dist < local[k - 1]` test rejects almost every candidate, so its later
+/// `dist <local[k - 1]` test rejects almost every candidate, so its later
 /// chunks cost little more than a scan. Radix select has no such early-out and
 /// pays the same four-plus passes on every chunk.
 ///
-/// So this is a property of `k` *and* the chunk count. 80 is taken from the
-/// four-chunk shape above, which is the conservative direction: single-chunk
-/// workloads would tolerate a much lower threshold (radix wins there from
-/// `k = 10`), so this leaves some gain unclaimed rather than risking a
-/// regression. Re-measure if `DB_CHUNK_SIZE` changes.
+/// So this is a property of `k` *and* the chunk count. 80 is taken from a
+/// multi-chunk shape, which is the conservative direction: single-chunk
+/// workloads would tolerate a much lower threshold, so this leaves some gain
+/// unclaimed rather than risking a regression. Re-measure if `DB_CHUNK_SIZE`
+/// changes.
 ///
 /// ### Portability
 ///
@@ -86,7 +76,7 @@ pub const RADIX_BINS: usize = 1 << RADIX_BITS;
 /// on Vulkan or DX12 hardware, where nothing here has been measured.
 ///
 /// Being conservative is the mitigation. At 80 the radix path is only taken where
-/// the measured margin is 2.3x, so a device where radix does noticeably worse than
+/// its margin is wide, so a device where radix does noticeably worse than
 /// Apple Silicon still has headroom before it regresses, and the failure mode is a
 /// slower arm rather than a wrong answer.
 ///
@@ -131,9 +121,8 @@ pub const SURV_ARRAYS_DENSE: usize = 3;
 /// Whether the runtime implements the `u32` shared-memory atomics the histogram
 /// needs.
 ///
-/// The CubeCL CPU runtime does not: it raises `not yet implemented: atomic<u32>`
-/// while compiling the kernel, on a background thread, so the launch quietly
-/// does nothing and the caller reads back whatever was in the buffer. That is
+/// A runtime without them fails the kernel compile on a background thread,
+/// so the launch quietly does nothing and the caller reads back whatever was in the buffer. That is
 /// the same silent-failure shape as busting a device limit, and it is why this
 /// is a capability query rather than an assumption. Metal and Vulkan both
 /// register `AtomicUsage::Add` for `u32`.
@@ -145,8 +134,8 @@ pub const SURV_ARRAYS_DENSE: usize = 3;
 /// ### Returns
 ///
 /// `true` when `u32` atomic add is available.
-pub fn atomic_u32_add_supported<R: Runtime>(client: &ComputeClient<R>) -> bool {
-    let ty = Type::new(StorageType::Atomic(ElemType::UInt(UIntKind::U32)));
+pub fn atomic_u32_add_supported(client: &Client) -> bool {
+    let ty = Type::atomic(ElemType::UInt(UIntKind::U32));
     client
         .properties()
         .features
@@ -163,8 +152,8 @@ pub fn atomic_u32_add_supported<R: Runtime>(client: &ComputeClient<R>) -> bool {
 /// - **32-bit elements only.** The key transform goes through
 ///   `u32::reinterpret`, whose size check is an *expand-time* assert, not a
 ///   compile error, so an `f64` instantiation panics while the kernel is being
-///   compiled rather than failing to build. WGSL has no `f64` at all, but the
-///   crate also enables the CPU runtime, so the guard has to be a runtime one.
+///   compiled rather than failing to build. WGSL has no `f64` at all, so this
+///   guards the backends that do.
 /// - **The workgroup must divide the bin count**, since each lane owns a
 ///   contiguous slice of the histogram.
 /// - **The footprint must fit**, checked against the device rather than a
@@ -222,8 +211,8 @@ pub fn radix_select_fits(k: usize, elem_bytes: usize, wg: usize, limits: &GpuLim
 /// ### Returns
 ///
 /// `true` when the radix path is safe to launch.
-pub fn radix_select_usable<R: Runtime>(
-    client: &ComputeClient<R>,
+pub fn radix_select_usable(
+    client: &Client,
     k: usize,
     elem_bytes: usize,
     wg: usize,
@@ -330,7 +319,7 @@ pub fn cmp_prefix(key: u32, pos: u32, pk: u32, mk: u32, pp: u32, mp: u32) -> u32
 
     // Statement-form assignments only: an `if` expression selecting a value
     // miscompiles on cubecl 0.10, per rule 1.
-    let mut res: u32 = 2u32;
+    let mut res = 2u32;
     if key_bits < pk {
         res = 0u32;
     }
@@ -374,7 +363,7 @@ pub fn digit_at(key: u32, pos: u32, #[comptime] use_pos: bool, #[comptime] shift
 /// * `tx` - Lane index
 /// * `bins_per_lane` - Bins each lane owns, `RADIX_BINS / workgroup width`
 #[cube]
-pub fn hist_clear(hist: &SharedMemory<Atomic<u32>>, tx: u32, #[comptime] bins_per_lane: usize) {
+pub fn hist_clear(hist: &Shared<[Atomic<u32>]>, tx: u32, #[comptime] bins_per_lane: usize) {
     let base = tx * comptime!(bins_per_lane as u32);
     for j in 0..bins_per_lane {
         hist[(base + j as u32) as usize].store(0u32);
@@ -401,9 +390,9 @@ pub fn hist_clear(hist: &SharedMemory<Atomic<u32>>, tx: u32, #[comptime] bins_pe
 /// * `bins_per_lane` - Bins each lane owns
 #[cube]
 pub fn find_bucket(
-    hist: &SharedMemory<Atomic<u32>>,
-    partials: &mut SharedMemory<u32>,
-    bcast: &mut SharedMemory<u32>,
+    hist: &Shared<[Atomic<u32>]>,
+    partials: &mut Shared<[u32]>,
+    bcast: &mut Shared<[u32]>,
     tx: u32,
     remaining: u32,
     #[comptime] wg: usize,
@@ -411,7 +400,7 @@ pub fn find_bucket(
 ) {
     let base = tx * comptime!(bins_per_lane as u32);
 
-    let mut lane_total: u32 = 0u32;
+    let mut lane_total = 0u32;
     for j in 0..bins_per_lane {
         lane_total += hist[(base + j as u32) as usize].load();
     }
@@ -421,7 +410,7 @@ pub fn find_bucket(
     // Exclusive scan over the lane totals, recomputed per lane so the result
     // needs no second barrier. Comptime-unrolled rather than a `while` over a
     // u32 counter, per rule 3.
-    let mut below: u32 = 0u32;
+    let mut below = 0u32;
     for i in 0..wg {
         if (i as u32) < tx {
             below += partials[i];
@@ -432,8 +421,8 @@ pub fn find_bucket(
     if below < remaining {
         if below + lane_total >= remaining {
             let mut cum = below;
-            let mut chosen: u32 = 0u32;
-            let mut settled: u32 = 0u32;
+            let mut chosen = 0u32;
+            let mut settled = 0u32;
             for j in 0..bins_per_lane {
                 let c = hist[(base + j as u32) as usize].load();
                 if settled == 0u32 {
@@ -504,10 +493,10 @@ pub fn radix_pass_ivf<F: Float>(
     in_base: u32,
     count: u32,
     kr: u32,
-    hist: &SharedMemory<Atomic<u32>>,
-    partials: &mut SharedMemory<u32>,
-    bcast: &mut SharedMemory<u32>,
-    st: &mut SharedMemory<u32>,
+    hist: &Shared<[Atomic<u32>]>,
+    partials: &mut Shared<[u32]>,
+    bcast: &mut Shared<[u32]>,
+    st: &mut Shared<[u32]>,
     tx: u32,
     #[comptime] use_pos: bool,
     #[comptime] shift: u32,
@@ -556,7 +545,7 @@ pub fn radix_pass_ivf<F: Float>(
                 st[ST_PK] = pk | (chosen << shift);
                 st[ST_MK] = mk | (0xFFu32 << shift);
             }
-            st[ST_N_LESS] = st[ST_N_LESS] + cum;
+            st[ST_N_LESS] += cum;
 
             // The chosen bucket holds the rank being chased, so `n_less +
             // bucket` is at least `k`. Once it is exactly `k` the boundary is
@@ -620,13 +609,13 @@ pub fn radix_select_ivf_topk<F: Float>(
     let out_base = q_idx * out_dists.stride(0);
 
     // All shared allocations at kernel scope, never inside a branch (rule 4).
-    let hist = SharedMemory::<Atomic<u32>>::new(RADIX_BINS);
-    let mut partials = SharedMemory::<u32>::new(wg);
-    let mut bcast = SharedMemory::<u32>::new(2usize);
-    let mut st = SharedMemory::<u32>::new(ST_SLOTS);
-    let mut surv_key = SharedMemory::<u32>::new(k);
-    let mut surv_pos = SharedMemory::<u32>::new(k);
-    let found = SharedMemory::<Atomic<u32>>::new(1usize);
+    let hist = Shared::<[Atomic<u32>]>::new_slice(RADIX_BINS);
+    let mut partials = Shared::<[u32]>::new_slice(wg);
+    let mut bcast = Shared::<[u32]>::new_slice(2usize);
+    let mut st = Shared::<[u32]>::new_slice(ST_SLOTS);
+    let mut surv_key = Shared::<[u32]>::new_slice(k);
+    let mut surv_pos = Shared::<[u32]>::new_slice(k);
+    let found = Shared::<[Atomic<u32>]>::new_slice(1usize);
 
     if tx == 0u32 {
         st[ST_PK] = 0u32;
@@ -800,10 +789,10 @@ pub fn radix_select_ivf_topk<F: Float>(
         let my_key = surv_key[s as usize];
         let my_pos = surv_pos[s as usize];
 
-        let mut rank: u32 = 0u32;
+        let mut rank = 0u32;
         let mut t = 0u32;
         while t < n_found {
-            let mut smaller: u32 = 0u32;
+            let mut smaller = 0u32;
             if surv_key[t as usize] < my_key {
                 smaller = 1u32;
             }
@@ -911,10 +900,10 @@ pub fn radix_pass_dense<F: Float>(
     out_base: u32,
     chunk: u32,
     kr: u32,
-    hist: &SharedMemory<Atomic<u32>>,
-    partials: &mut SharedMemory<u32>,
-    bcast: &mut SharedMemory<u32>,
-    st: &mut SharedMemory<u32>,
+    hist: &Shared<[Atomic<u32>]>,
+    partials: &mut Shared<[u32]>,
+    bcast: &mut Shared<[u32]>,
+    st: &mut Shared<[u32]>,
     tx: u32,
     #[comptime] use_pos: bool,
     #[comptime] shift: u32,
@@ -963,7 +952,7 @@ pub fn radix_pass_dense<F: Float>(
                 st[ST_PK] = pk | (chosen << shift);
                 st[ST_MK] = mk | (0xFFu32 << shift);
             }
-            st[ST_N_LESS] = st[ST_N_LESS] + cum;
+            st[ST_N_LESS] += cum;
             if st[ST_N_LESS] + bucket == kr {
                 st[ST_DONE] = 1u32;
             }
@@ -1013,14 +1002,14 @@ pub fn radix_select_topk<F: Float>(
     let out_base = (q_idx * out_dists.stride(0)) as u32;
     let total = kr + actual_chunk_size;
 
-    let hist = SharedMemory::<Atomic<u32>>::new(RADIX_BINS);
-    let mut partials = SharedMemory::<u32>::new(wg);
-    let mut bcast = SharedMemory::<u32>::new(2usize);
-    let mut st = SharedMemory::<u32>::new(ST_SLOTS);
-    let mut surv_key = SharedMemory::<u32>::new(k);
-    let mut surv_pos = SharedMemory::<u32>::new(k);
-    let mut surv_idx = SharedMemory::<u32>::new(k);
-    let found = SharedMemory::<Atomic<u32>>::new(1usize);
+    let hist = Shared::<[Atomic<u32>]>::new_slice(RADIX_BINS);
+    let mut partials = Shared::<[u32]>::new_slice(wg);
+    let mut bcast = Shared::<[u32]>::new_slice(2usize);
+    let mut st = Shared::<[u32]>::new_slice(ST_SLOTS);
+    let mut surv_key = Shared::<[u32]>::new_slice(k);
+    let mut surv_pos = Shared::<[u32]>::new_slice(k);
+    let mut surv_idx = Shared::<[u32]>::new_slice(k);
+    let found = Shared::<[Atomic<u32>]>::new_slice(1usize);
 
     if tx == 0u32 {
         st[ST_PK] = 0u32;
@@ -1038,7 +1027,7 @@ pub fn radix_select_topk<F: Float>(
 
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1054,7 +1043,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1070,7 +1059,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1086,7 +1075,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1102,7 +1091,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1118,7 +1107,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1134,7 +1123,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1150,7 +1139,7 @@ pub fn radix_select_topk<F: Float>(
     );
     radix_pass_dense::<F>(
         distances,
-        out_dists,
+        &*out_dists,
         in_base,
         out_base,
         actual_chunk_size,
@@ -1175,7 +1164,7 @@ pub fn radix_select_topk<F: Float>(
 
     let mut p = tx;
     while p < total {
-        let key = dense_key::<F>(distances, out_dists, in_base, out_base, p, kr);
+        let key = dense_key::<F>(distances, &*out_dists, in_base, out_base, p, kr);
         if cmp_prefix(key, p, pk, mk, pp, mp) < 2u32 {
             let slot = found[0usize].fetch_add(1u32);
             if slot < kr {
@@ -1214,10 +1203,10 @@ pub fn radix_select_topk<F: Float>(
         let my_key = surv_key[s as usize];
         let my_pos = surv_pos[s as usize];
 
-        let mut rank: u32 = 0u32;
+        let mut rank = 0u32;
         let mut t = 0u32;
         while t < n_found {
-            let mut smaller: u32 = 0u32;
+            let mut smaller = 0u32;
             if surv_key[t as usize] < my_key {
                 smaller = 1u32;
             }
@@ -1252,7 +1241,7 @@ pub fn radix_select_topk<F: Float>(
 /// * `value` - Value to store
 #[cfg(all(test, feature = "gpu-tests"))]
 #[cube]
-fn shared_set(mem: &mut SharedMemory<u32>, idx: u32, value: u32) {
+fn shared_set(mem: &mut Shared<[u32]>, idx: u32, value: u32) {
     mem[idx as usize] = value;
 }
 
@@ -1268,11 +1257,11 @@ fn shared_set(mem: &mut SharedMemory<u32>, idx: u32, value: u32) {
 /// The stored value.
 #[cfg(all(test, feature = "gpu-tests"))]
 #[cube]
-fn shared_get(mem: &SharedMemory<u32>, idx: u32) -> u32 {
+fn shared_get(mem: &Shared<[u32]>, idx: u32) -> u32 {
     mem[idx as usize]
 }
 
-/// S1: does `SharedMemory<Atomic<u32>>` work on the wgpu backend?
+/// S1: does `Shared<[Atomic<u32>]>` work on the wgpu backend?
 ///
 /// Nothing in this crate, and nothing in cubecl's own runtime tests, allocates
 /// an atomic in shared memory: every existing use is `&Tensor<Atomic<u32>>` in
@@ -1288,7 +1277,7 @@ fn shared_get(mem: &SharedMemory<u32>, idx: u32) -> u32 {
 #[cfg(all(test, feature = "gpu-tests"))]
 #[cube(launch_unchecked)]
 fn smoke_atomic_hist(out: &mut Tensor<u32>) {
-    let hist = SharedMemory::<Atomic<u32>>::new(256usize);
+    let hist = Shared::<[Atomic<u32>]>::new_slice(256usize);
     let tx = UNIT_POS_X;
 
     for j in 0..8u32 {
@@ -1347,7 +1336,7 @@ fn smoke_radix_key<F: Float>(input: &Tensor<F>, out: &mut Tensor<u32>) {
 #[cfg(all(test, feature = "gpu-tests"))]
 #[cube(launch_unchecked)]
 fn smoke_shared_helper(out: &mut Tensor<u32>) {
-    let mut scratch = SharedMemory::<u32>::new(32usize);
+    let mut scratch = Shared::<[u32]>::new_slice(32usize);
     let tx = UNIT_POS_X;
 
     shared_set(&mut scratch, tx, tx * 7u32 + 1u32);
@@ -1536,7 +1525,7 @@ mod host_tests {
     /// The two kernels' footprints must match what they actually allocate.
     ///
     /// Over-allocating shared memory fails silently on this backend, so a
-    /// formula that drifts from the `SharedMemory::new` calls is the worst kind
+    /// formula that drifts from the `Shared::new_slice` calls is the worst kind
     /// of bug available here.
     #[test]
     fn test_smem_formula_matches_allocations() {
@@ -1579,40 +1568,15 @@ mod gpu_smoke {
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use cubecl_utils_rs::prelude::*;
 
-    /// The capability query must agree with what each runtime actually does.
-    ///
-    /// The CubeCL CPU runtime raises `not yet implemented: atomic<u32>` while
-    /// compiling the kernel, on a background thread, so the launch silently does
-    /// nothing and the caller reads back stale memory. That is why the guard is
-    /// a capability query and not an assumption, and why it is asserted here
-    /// rather than trusted: this test failing is the difference between the
-    /// exhaustive path falling back correctly and returning garbage.
-    // Compares the capability query across runtimes, so it needs the CubeCL
-    // software CPU backend. The rest of this module is host-only and stays on
-    // the plain `gpu` feature.
-    #[cfg(feature = "gpu-cpu")]
+    /// The capability query must report what wgpu does. A launch without u32
+    /// atomics silently does nothing and reads back stale memory, so the
+    /// reducers trust this query to fall back.
     #[test]
-    fn test_atomic_capability_query_matches_runtimes() {
-        use cubecl::cpu::{CpuDevice, CpuRuntime};
-
-        let wgpu_client = WgpuRuntime::client(&WgpuDevice::default());
+    fn test_atomic_capability_query_reports_wgpu() {
+        let wgpu_client = <WgpuRuntime>::client(&WgpuDevice::default());
         assert!(
-            atomic_u32_add_supported::<WgpuRuntime>(&wgpu_client),
+            atomic_u32_add_supported(&wgpu_client),
             "wgpu should report u32 atomic add"
-        );
-
-        let cpu_client = CpuRuntime::client(&CpuDevice);
-        assert!(
-            !atomic_u32_add_supported::<CpuRuntime>(&cpu_client),
-            "the CPU runtime does not implement atomic<u32>; if this now passes, \
-             the fallback in radix_select_usable can be relaxed"
-        );
-
-        // And the composite guard must follow it, so the reducers fall back.
-        let cpu_limits = GpuLimits::from_client(&cpu_client);
-        assert!(
-            !radix_select_usable::<CpuRuntime>(&cpu_client, 15, 4, 32, &cpu_limits),
-            "radix select must not be selected on a runtime without u32 atomics"
         );
     }
 
@@ -1620,12 +1584,12 @@ mod gpu_smoke {
     #[test]
     fn test_shared_memory_atomics_count_exactly() {
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
 
-        let out = GpuTensor::<WgpuRuntime, u32>::empty(vec![256], &client).unwrap();
+        let out = GpuTensor::<u32>::empty(vec![256], &client).unwrap();
 
         unsafe {
-            smoke_atomic_hist::launch_unchecked::<WgpuRuntime>(
+            smoke_atomic_hist::launch_unchecked(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(32, 1),
@@ -1651,7 +1615,7 @@ mod gpu_smoke {
     #[test]
     fn test_radix_key_matches_host() {
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
 
         let values: Vec<f32> = vec![
             0.0,
@@ -1672,11 +1636,11 @@ mod gpu_smoke {
         ];
         let n = values.len();
 
-        let input = GpuTensor::<WgpuRuntime, f32>::from_slice(&values, vec![n], &client).unwrap();
-        let out = GpuTensor::<WgpuRuntime, u32>::empty(vec![n], &client).unwrap();
+        let input = GpuTensor::<f32>::from_slice(&values, vec![n], &client).unwrap();
+        let out = GpuTensor::<u32>::empty(vec![n], &client).unwrap();
 
         unsafe {
-            smoke_radix_key::launch_unchecked::<f32, WgpuRuntime>(
+            smoke_radix_key::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static((n as u32).div_ceil(32), 1, 1),
                 CubeDim::new_2d(32, 1),
@@ -1757,35 +1721,28 @@ mod gpu_smoke {
         k: usize,
     ) -> (Vec<f32>, Vec<u32>) {
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
         let limits = GpuLimits::from_client(&client);
 
-        let cd = GpuTensor::<WgpuRuntime, f32>::from_slice(
-            candidate_dists,
-            vec![n_queries, max_candidates],
-            &client,
-        )
-        .unwrap();
-        let ci = GpuTensor::<WgpuRuntime, u32>::from_slice(
+        let cd =
+            GpuTensor::<f32>::from_slice(candidate_dists, vec![n_queries, max_candidates], &client)
+                .unwrap();
+        let ci = GpuTensor::<u32>::from_slice(
             candidate_indices,
             vec![n_queries, max_candidates],
             &client,
         )
         .unwrap();
-        let cpq = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            candidates_per_query,
-            vec![n_queries],
-            &client,
-        )
-        .unwrap();
+        let cpq =
+            GpuTensor::<u32>::from_slice(candidates_per_query, vec![n_queries], &client).unwrap();
 
-        let od = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_queries, k], &client).unwrap();
-        let oi = GpuTensor::<WgpuRuntime, u32>::empty(vec![n_queries, k], &client).unwrap();
+        let od = GpuTensor::<f32>::empty(vec![n_queries, k], &client).unwrap();
+        let oi = GpuTensor::<u32>::empty(vec![n_queries, k], &client).unwrap();
 
         let wg = WORKGROUP_SIZE_X as usize;
         let (gx, gy) = grid_2d(n_queries as u32, &limits).unwrap();
         unsafe {
-            radix_select_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
+            radix_select_ivf_topk::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1869,19 +1826,18 @@ mod gpu_smoke {
         let counts = vec![mc as u32; nq];
 
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
         let limits = GpuLimits::from_client(&client);
 
-        let cd = GpuTensor::<WgpuRuntime, f32>::from_slice(&dists, vec![nq, mc], &client).unwrap();
-        let ci =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&indices, vec![nq, mc], &client).unwrap();
-        let cpq = GpuTensor::<WgpuRuntime, u32>::from_slice(&counts, vec![nq], &client).unwrap();
-        let od = GpuTensor::<WgpuRuntime, f32>::empty(vec![nq, k], &client).unwrap();
-        let oi = GpuTensor::<WgpuRuntime, u32>::empty(vec![nq, k], &client).unwrap();
+        let cd = GpuTensor::<f32>::from_slice(&dists, vec![nq, mc], &client).unwrap();
+        let ci = GpuTensor::<u32>::from_slice(&indices, vec![nq, mc], &client).unwrap();
+        let cpq = GpuTensor::<u32>::from_slice(&counts, vec![nq], &client).unwrap();
+        let od = GpuTensor::<f32>::empty(vec![nq, k], &client).unwrap();
+        let oi = GpuTensor::<u32>::empty(vec![nq, k], &client).unwrap();
 
         let (init_gy, init_gz) = grid_2d((nq as u32).div_ceil(4), &limits).unwrap();
         unsafe {
-            init_topk::launch_unchecked::<f32, WgpuRuntime>(
+            init_topk::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static((k as u32).div_ceil(WORKGROUP_SIZE_X), init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -1893,7 +1849,7 @@ mod gpu_smoke {
 
         let (gx, gy) = grid_2d((nq as u32).div_ceil(WORKGROUP_SIZE_X), &limits).unwrap();
         unsafe {
-            reduce_ivf_topk::launch_unchecked::<f32, WgpuRuntime>(
+            reduce_ivf_topk::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2058,15 +2014,15 @@ mod gpu_smoke {
         radix: bool,
     ) -> (Vec<f32>, Vec<u32>) {
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
         let limits = GpuLimits::from_client(&client);
 
-        let od = GpuTensor::<WgpuRuntime, f32>::empty(vec![nq, k], &client).unwrap();
-        let oi = GpuTensor::<WgpuRuntime, u32>::empty(vec![nq, k], &client).unwrap();
+        let od = GpuTensor::<f32>::empty(vec![nq, k], &client).unwrap();
+        let oi = GpuTensor::<u32>::empty(vec![nq, k], &client).unwrap();
 
         let (init_gy, init_gz) = grid_2d((nq as u32).div_ceil(4), &limits).unwrap();
         unsafe {
-            init_topk::launch_unchecked::<f32, WgpuRuntime>(
+            init_topk::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static((k as u32).div_ceil(WORKGROUP_SIZE_X), init_gy, init_gz),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -2088,13 +2044,12 @@ mod gpu_smoke {
                 block[q * this..(q + 1) * this]
                     .copy_from_slice(&full[q * ndb + start..q * ndb + start + this]);
             }
-            let blk =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&block, vec![nq, this], &client).unwrap();
+            let blk = GpuTensor::<f32>::from_slice(&block, vec![nq, this], &client).unwrap();
 
             if radix {
                 let (gx, gy) = grid_2d(nq as u32, &limits).unwrap();
                 unsafe {
-                    radix_select_topk::launch_unchecked::<f32, WgpuRuntime>(
+                    radix_select_topk::launch_unchecked::<f32>(
                         &client,
                         CubeCount::Static(gx, gy, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2111,7 +2066,7 @@ mod gpu_smoke {
             } else {
                 let (gx, gy) = grid_2d((nq as u32).div_ceil(WORKGROUP_SIZE_X), &limits).unwrap();
                 unsafe {
-                    extract_topk::launch_unchecked::<f32, WgpuRuntime>(
+                    extract_topk::launch_unchecked::<f32>(
                         &client,
                         CubeCount::Static(gx, gy, 1),
                         CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2281,10 +2236,10 @@ mod gpu_smoke {
             h as f32 * 1e-3
         });
 
-        let index = ExhaustiveIndexGpu::<f32, WgpuRuntime>::new(
+        let index = ExhaustiveIndexGpu::<f32>::new(
             data.as_ref(),
             Dist::SquaredEuclidean,
-            WgpuDevice::default(),
+            WgpuDevice::default().clone().into(),
         )
         .unwrap();
 
@@ -2341,12 +2296,12 @@ mod gpu_smoke {
     #[test]
     fn test_shared_memory_helper_round_trips() {
         let device = WgpuDevice::default();
-        let client = WgpuRuntime::client(&device);
+        let client = <WgpuRuntime>::client(&device);
 
-        let out = GpuTensor::<WgpuRuntime, u32>::empty(vec![32], &client).unwrap();
+        let out = GpuTensor::<u32>::empty(vec![32], &client).unwrap();
 
         unsafe {
-            smoke_shared_helper::launch_unchecked::<WgpuRuntime>(
+            smoke_shared_helper::launch_unchecked(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(32, 1),

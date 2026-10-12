@@ -12,15 +12,11 @@
 //! - **`n` and `dim` are not uniformly public.** `IvfIndexGpu` keeps them
 //!   private, so every handle carries its own copy, recorded at build time.
 //!
-//! The runtime is pinned to `WgpuRuntime`. `R` is a type parameter in the
-//! library so the kernels can be tested against the CPU backend, but a generic
-//! cannot cross into Python: the device type is `R::Device`, and there is
-//! nothing on the Python side to choose it with.
+//! The device is pinned to wgpu: there is nothing on the Python side to
+//! choose a backend with.
 
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-
-/// The only runtime the bindings expose.
-pub(crate) type Rt = WgpuRuntime;
+use cubecl::wgpu::WgpuDevice;
+use cubecl::Device;
 
 /// Fetch the default wgpu device.
 ///
@@ -28,8 +24,8 @@ pub(crate) type Rt = WgpuRuntime;
 ///
 /// The adapter wgpu picks for this machine: Metal on macOS, Vulkan or DX12
 /// elsewhere, falling back to whatever `WgpuDevice::default()` resolves to.
-pub(crate) fn default_device() -> WgpuDevice {
-    WgpuDevice::default()
+pub(crate) fn default_device() -> Device {
+    WgpuDevice::default().into()
 }
 
 /// Borrow a numpy array as `f32`, or explain why it cannot be.
@@ -54,7 +50,7 @@ macro_rules! f32_array {
 /// ### Params
 ///
 /// * `$cls` - Name of the generated `#[pyclass]` struct.
-/// * `$index` - The library's index type, generic over float and runtime.
+/// * `$index` - The library's index type, generic over float.
 /// * `$name` - Name Python sees, also used in reprs and error messages.
 /// * `$extra` - The per-algorithm `build`, `query` and `query_self`, spliced
 ///   into the same `#[pymethods]` block because only one such block per class
@@ -63,8 +59,8 @@ macro_rules! gpu_handle {
     ($cls:ident, $index:ident, $name:literal, { $($extra:tt)* }) => {
         #[::pyo3::pyclass(name = $name, module = "ann_search._ann_search")]
         pub struct $cls {
-            /// The built index. Always `f32`, always on `WgpuRuntime`.
-            pub(crate) inner: $index<f32, crate::gpu_handle::Rt>,
+            /// The built index. Always `f32`, always on wgpu.
+            pub(crate) inner: $index<f32>,
             /// Rows the index was built from, recorded here because not every
             /// GPU index exposes its own.
             pub(crate) n: usize,

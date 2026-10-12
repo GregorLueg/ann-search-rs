@@ -1,7 +1,9 @@
 [package]
 name = "ann-search-rs"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
+# Exposes `DEP_MLXC_AVAILABLE` to dependants' build scripts, see build.rs.
+links = "mlxc"
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
@@ -34,8 +36,6 @@ binary = ["memmap2", "bytemuck", "statrs"]
 gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
 gpu-tests = ["gpu"]
-## CubeCL's software CPU runtime, for tests only.
-gpu-cpu = ["gpu", "cubecl/cpu"]
 ## Enables quantised indices with different quantisations (BF16, SQ8, PQ, OPQ)
 quantised = ["half"]
 ## Enables mimalloc as the global allocator for improved performance
@@ -48,6 +48,11 @@ accelerate = []
 ndarray = ["dep:ndarray"]
 ## Enables saving indices to disk and loading them back in
 serialise = ["dep:serde", "dep:bincode", "half?/serde"]
+## Experimental, Apple Silicon only: MLX backend via mlx-c (exhaustive, IVF,
+## NN-Descent/CAGRA). Needs `brew install mlx-c` (or MLX_C_PREFIX pointing at
+## an install). Without the library the build warns and the MLX code is left
+## out; check `MLX_AVAILABLE`. f32 only.
+mlx = []
 ## Synthetic dataset generators with realistic single-cell structure, used by
 ## the gridsearch examples and the published benchmark tables.
 synthetic = []
@@ -65,19 +70,18 @@ bytemuck = {
     optional = true
 }
 cubecl = {
-    version = "0.10.0",
+    version = "0.11.0",
     # branch = "main",
-    # `cpu` is deliberately absent: see the `gpu-cpu` feature.
     features = ["wgpu"],
     optional = true
 }
 cubecl-utils-rs = {
-    version = "0.1.0",
+    version = "0.2.0",
     optional = true
 }
 document-features = "0.2.12"
-faer = "0.23.2"
-faer-traits = "0.23.2"
+faer = "0.24.4"
+faer-traits = "0.24.0"
 fixedbitset = "0.5.7"
 half = {
     version = "2.7.1",
@@ -112,7 +116,7 @@ statrs = {
 }
 thiserror = "2.0.18"
 thousands = "0.2.0"
-wide = "1.4.0"
+wide = "1.6.0"
 
 
 [dev-dependencies]
@@ -134,6 +138,30 @@ features = ["binary", "quantised", "mimalloc", "ndarray", "serialise", "syntheti
 [[example]]
 name = "gridsearch_gpu"
 required-features = ["gpu"]
+
+[[example]]
+name = "bench_mlx_annb"
+required-features = ["gpu", "mlx"]
+
+[[example]]
+name = "bench_mlx_exhaustive"
+required-features = ["gpu", "mlx", "synthetic"]
+
+[[example]]
+name = "bench_mlx_ivf"
+required-features = ["gpu", "mlx", "synthetic"]
+
+[[example]]
+name = "bench_mlx_cagra"
+required-features = ["gpu", "mlx", "synthetic"]
+
+[[example]]
+name = "bench_mlx_nndescent"
+required-features = ["gpu", "mlx", "synthetic"]
+
+[[example]]
+name = "bench_mlx_nndescent_index"
+required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "gridsearch_cagra"
@@ -221,3 +249,11 @@ required-features = ["gpu"]
 name = "gpu_nndescent_kernels"
 harness = false
 required-features = ["gpu"]
+
+[[example]]
+name = "gridsearch_mlx"
+required-features = ["mlx"]
+
+[[example]]
+name = "gridsearch_cagra_mlx"
+required-features = ["mlx"]

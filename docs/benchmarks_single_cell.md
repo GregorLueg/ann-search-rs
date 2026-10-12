@@ -1,0 +1,83 @@
+## Self-kNN on single-cell PCA
+
+What this crate was written for: you have a PCA embedding of a few million
+cells and need its kNN graph for clustering, UMAP and friends, as fast as
+possible. So the clock covers the whole job, build plus every cell queried
+against all cells, and the question is how long it takes to reach a given
+recall.
+
+Run via the Python bindings (from `benchmarks/`):
+
+```bash
+uv run selfknn.py run --threads 10
+uv run selfknn.py summarise
+```
+
+### Data
+
+The first 32 principal components of one plate of Tahoe-100M: 2,857,393
+cells, Euclidean. Real data, so the cluster structure and density variation are
+what a pipeline actually sees, not a synthetic stand-in.
+
+The file `tahoe-pca-32-euclidean.hdf5` (349 MB) carries the PCs as `train`,
+plus exact ground truth for 10,000 randomly drawn cells (`test_ids`): their
+100 nearest neighbours by squared Euclidean distance against all cells, self
+included, computed in float64. `selfknn.py` downloads it on first use.
+
+### Setup
+
+- **k = 15**, the usual single-cell default. Recall@15 is the overlap of
+  neighbour ids on the 10,000 ground-truth rows of the self-kNN graph, self
+  included.
+- **NN-Descent** rows are the graph the build converged on, read back without
+  a search pass (`extract_knn`), at graph degree 15 and 30. That is the
+  single-cell path. pynndescent runs exactly as `sc.pp.neighbors` drives it by
+  default (UMAP's settings: degree 16 counting self, `n_trees = min(64, 5 +
+  round(sqrt(n) / 20))`, `n_iters = round(log2(n))`), reading its build graph
+  the same way, plus the same at degree 30. ann-search's CPU NN-Descent runs
+  its defaults, which use the same tree count (64 at this n) and seed the graph
+  by joining every leaf, as pynndescent does.
+- **HNSW** at M = 16 and ef_construction = 100 (ann-search, hnswlib), self-query
+  swept over `ef_search` 16 to 128.
+- **IVF** at `nlist = sqrt(n)` (ann-search CPU, wgpu and MLX, faiss
+  `IndexIVFFlat`), self-query swept over `nprobe` 4 to 32.
+- **Exact** is the MLX exhaustive index, as the floor every approximate method
+  has to beat on time.
+- **Timing:** one untimed warm-up on 5,000 random points per method (imports,
+  numba JIT, kernel compilation), then a single timed build and a single timed
+  self-query per sweep point. Each method runs in its own process. *Peak* is
+  the process's peak memory above the baseline taken after the data loaded.
+
+### Results
+
+The fastest build plus self-kNN, in seconds, at which each method reaches the
+recall target. `n/a` means no point on its sweep got there.
+
+![](figures/single_cell_self_knn.png)
+
+| Method | Library | Peak (MiB) | Total (s) @ 0.90 | Total (s) @ 0.95 | Total (s) @ 0.99 |
+|---|---|---:|---:|---:|---:|
+| ivf | **ann_search_mlx** | 5,079 | 3.1 | 4.7 | 4.7 |
+| ivf | **ann_search_gpu** | 7,120 | 9.2 | 15.6 | 15.6 |
+| nndescent | **ann_search_gpu** | 12,979 | 9.3 | 9.3 | 19.3 |
+| nndescent | **ann_search_mlx** | 8,663 | 9.5 | 9.5 | 18.1 |
+| ivf | **ann_search** | 1,408 | 20.5 | 33.2 | 33.2 |
+| nndescent | **ann_search** | 9,580 | 28.4 | 28.4 | 28.4 |
+| nndescent | pynndescent | 10,670 | 31.1 | 31.1 | 50.2 |
+| hnsw | **ann_search** | 2,114 | 40.6 | 45.4 | 71.9 |
+| ivf | faiss | 2,462 | 52.9 | 73.0 | 116.6 |
+| hnsw | hnswlib | 2,398 | 56.9 | 64.1 | 100.1 |
+| exhaustive | **ann_search_mlx** | 6,239 | 1607.8 | 1607.8 | 1607.8 |
+
+### Caveats
+
+- `ann_search_gpu` and `ann_search_mlx` run on the M1 Max's integrated GPU.
+  Memory is unified, so their peak includes the device buffers.
+- One timed run per point. Read small gaps as ties.
+
+---
+
+### Runtime info
+
+*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max.*
+*All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

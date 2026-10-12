@@ -34,6 +34,8 @@ mod state;
 
 #[cfg(feature = "gpu")]
 mod gpu_handle;
+#[cfg(mlx_available)]
+mod mlx_handle;
 
 /////////////
 // Indices //
@@ -92,6 +94,20 @@ mod exhaustive_gpu;
 #[cfg(feature = "gpu")]
 mod ivf_gpu;
 
+/////////////////
+// MLX indices //
+/////////////////
+
+// `mlx_available`, not `feature = "mlx"`: the feature builds without mlx-c
+// installed, it just leaves the backend out. See `build.rs`.
+
+#[cfg(mlx_available)]
+mod cagra_mlx;
+#[cfg(mlx_available)]
+mod exhaustive_mlx;
+#[cfg(mlx_available)]
+mod ivf_mlx;
+
 ////////////
 // Module //
 ////////////
@@ -120,6 +136,7 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pool::set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(pool::num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_probe::gpu_available, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_probe::mlx_available, m)?)?;
 
     m.add_function(wrap_pyfunction!(datasets::make_clustered, m)?)?;
     m.add_function(wrap_pyfunction!(datasets::make_correlated, m)?)?;
@@ -161,6 +178,13 @@ fn _ann_search(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<cagra_gpu::PyCagraGpu>()?;
         m.add_class::<exhaustive_gpu::PyExhaustiveGpu>()?;
         m.add_class::<ivf_gpu::PyIvfGpu>()?;
+    }
+
+    #[cfg(mlx_available)]
+    {
+        m.add_class::<cagra_mlx::PyCagraMlx>()?;
+        m.add_class::<exhaustive_mlx::PyExhaustiveMlx>()?;
+        m.add_class::<ivf_mlx::PyIvfMlx>()?;
     }
 
     Ok(())

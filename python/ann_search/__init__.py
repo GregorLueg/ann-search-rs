@@ -23,6 +23,7 @@ from ._ann_search import (
     __core_version__,
     __version__,
     gpu_available,
+    mlx_available,
     num_threads,
     set_num_threads,
 )
@@ -93,6 +94,7 @@ __all__ = [
     "__version__",
     "datasets",
     "gpu_available",
+    "mlx_available",
     "num_threads",
     "quantised",
     "set_num_threads",
@@ -106,3 +108,9 @@ if hasattr(_ann_search, "ExhaustiveGpu"):  # pragma: no cover - build-dependent
     from .gpu import CagraGpuIndex, ExhaustiveGpuIndex, IvfGpuIndex
 
     __all__ += ["CagraGpuIndex", "ExhaustiveGpuIndex", "IvfGpuIndex"]
+
+# Same for MLX, which only a source build with the `mlx` feature carries.
+if hasattr(_ann_search, "ExhaustiveMlx"):  # pragma: no cover - build-dependent
+    from .mlx import CagraMlxIndex, ExhaustiveMlxIndex, IvfMlxIndex
+
+    __all__ += ["CagraMlxIndex", "ExhaustiveMlxIndex", "IvfMlxIndex"]

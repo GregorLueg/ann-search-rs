@@ -161,9 +161,8 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     /// Read the descent graph back without searching it.
     ///
     /// `query_self` beam-searches every point and so refines the graph; this
-    /// reshapes what the descent already built. An index with
-    /// `diversify_prob > 0` has lost the pruned edges here, so it wants
-    /// `query_self` instead.
+    /// reshapes what the descent already built. `diversify_prob` does not
+    /// touch it: diversification shapes only the graph queries walk.
     ///
     /// ### Params
     ///

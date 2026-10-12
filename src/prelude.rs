@@ -19,6 +19,8 @@ pub use crate::utils::FlattenData;
 
 #[cfg(feature = "gpu")]
 pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
+#[cfg(mlx_available)]
+pub use crate::mlx::cagra_mlx::CagraMlxSearchParams;
 // The GPU builders take their own parameter structs. Without these the prelude
 // hands a caller `KMeansTrainingParams` and silently not the GPU one that
 // `build_ivf_index_gpu` and the batched kNN build actually want.

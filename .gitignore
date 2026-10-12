@@ -14,6 +14,7 @@ target
 
 # Python bindings
 python/.venv
+benchmarks/.venv
 python/ann_search/*.so
 python/ann_search/*.pyd
 __pycache__/

@@ -41,6 +41,14 @@ pub mod binary;
 #[cfg(feature = "serialise")]
 pub mod serialise;
 
+#[cfg(mlx_available)]
+pub mod mlx;
+
+/// Whether the MLX backend was compiled in: the `mlx` feature is on and
+/// mlx-c was found at build time. Dependants that pick a backend at build
+/// time read `DEP_MLXC_AVAILABLE` in their build script instead.
+pub const MLX_AVAILABLE: bool = cfg!(mlx_available);
+
 #[cfg(feature = "synthetic")]
 pub mod synthetic;
 
@@ -53,7 +61,7 @@ use std::sync::{
 use thousands::*;
 
 #[cfg(feature = "gpu")]
-use cubecl::prelude::*;
+use cubecl::Device;
 #[cfg(feature = "quantised")]
 use std::ops::AddAssign;
 
@@ -85,6 +93,14 @@ use crate::binary::{
 };
 #[cfg(feature = "gpu")]
 use crate::gpu::{exhaustive_gpu::*, ivf_gpu::*};
+#[cfg(mlx_available)]
+use crate::mlx::ivf_mlx::*;
+#[cfg(mlx_available)]
+use crate::mlx::nndescent_index_mlx::NNDescentIndexMlx;
+#[cfg(mlx_available)]
+use crate::mlx::nndescent_mlx::KnnGraphMlx;
+#[cfg(mlx_available)]
+use crate::mlx::{cagra_mlx::*, exhaustive_mlx::*};
 #[cfg(feature = "quantised")]
 use crate::quantised::{
     exhaustive_bf16::*, exhaustive_opq::*, exhaustive_pq::*, exhaustive_sq8::*,
@@ -1289,14 +1305,16 @@ where
 ///   per candidate/kept pair, applied post-descent to the forward+reverse
 ///   candidate pool per node. `0.0` disables pruning; `1.0` always prunes
 ///   when the RNG rule fires. Rows shorter than `k` after pruning are
-///   topped up from the pruned tail so out-degree is preserved.
+///   topped up from the pruned tail so out-degree is preserved. Shapes only
+///   the graph the query walks; `extract_knn` and NSG read the full kNN
+///   graph either way.
 /// * `k` - Number of neighbours for the k-NN graph (default 30).
 /// * `max_iter` - Maximum iterations for the algorithm (default
 ///   `log2(n).round().max(5)`).
 /// * `max_candidates` - Cap on sampled candidates per node per iteration
 ///   (default `k.min(60)`).
 /// * `n_tree` - Random-projection trees seeding the graph (default
-///   `5 + n^0.25`, capped at 12).
+///   `5 + sqrt(n) / 20`, capped at 64).
 /// * `seed` - Random seed for reproducibility
 /// * `verbose` - Controls verbosity of the algorithm
 ///
@@ -3191,14 +3209,13 @@ where
 /// ### Returns
 ///
 /// The initialised `ExhaustiveIndexGpu`
-pub fn build_exhaustive_index_gpu<T, R>(
+pub fn build_exhaustive_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
-    device: R::Device,
-) -> Result<ExhaustiveIndexGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<ExhaustiveIndexGpu<T>, AnnSearchErrors>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
@@ -3222,16 +3239,15 @@ where
 /// ### Returns
 ///
 /// A tuple of `(knn_indices, optional distances)`
-pub fn query_exhaustive_index_gpu<T, R>(
+pub fn query_exhaustive_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &ExhaustiveIndexGpu<T, R>,
+    index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
 
@@ -3259,19 +3275,452 @@ where
 /// ### Returns
 ///
 /// A tuple of `(knn_indices, optional distances)`
-pub fn query_exhaustive_index_gpu_self<T, R>(
-    index: &ExhaustiveIndexGpu<T, R>,
+pub fn query_exhaustive_index_gpu_self<T>(
+    index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
-    R: Runtime,
 {
     let res = index.generate_knn(k, return_dist, verbose)?;
 
     Ok(res)
+}
+
+////////////////////
+// Exhaustive MLX //
+////////////////////
+
+#[cfg(mlx_available)]
+/// Build an exhaustive index on MLX (experimental, Apple Silicon, f32 only)
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+///
+/// ### Returns
+///
+/// The initialised `ExhaustiveIndexMlx`, database resident on the device
+pub fn build_exhaustive_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+) -> Result<ExhaustiveIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    let index = ExhaustiveIndexMlx::new(mat.into_row_major(), metric)?;
+    crate::mlx::clear_cache()?;
+    Ok(index)
+}
+
+#[cfg(mlx_available)]
+/// Query the exhaustive MLX index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - The exhaustive MLX index
+/// * `k` - Number of neighbours to return
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print the device versus host time split
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &ExhaustiveIndexMlx,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.query_batch(query_mat.into_row_major(), k, verbose)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(mlx_available)]
+/// Query the exhaustive MLX index against itself (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - The exhaustive MLX index
+/// * `k` - Number of neighbours to return, self included
+/// * `return_dist` - Shall the distances be returned
+/// * `verbose` - Print the device versus host time split
+///
+/// ### Returns
+///
+/// A tuple of `(knn_indices, optional distances)`
+pub fn query_exhaustive_index_mlx_self(
+    index: &ExhaustiveIndexMlx,
+    k: usize,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    index.generate_knn(k, return_dist, verbose)
+}
+
+//////////////////////
+// CAGRA search MLX //
+//////////////////////
+
+#[cfg(mlx_available)]
+/// Query a CAGRA navigational graph on MLX (experimental, Apple Silicon, f32
+/// only)
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - The MLX searcher holding vectors and graph
+/// * `k` - Number of neighbours
+/// * `query_params` - Optional beam search parameters; `None` scales the beam
+///   to `k`
+/// * `entry_points` - Optional `[n_queries * n_entry]` entry node ids; `None`
+///   uses the medoid plus random nodes
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_cagra_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &CagraSearchMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    entry_points: Option<&[u32]>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (queries_flat, n_queries, _) = query_mat.into_row_major();
+    let (indices, distances) =
+        index.search(&queries_flat, n_queries, k, query_params, entry_points, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(mlx_available)]
+/// Self-query a CAGRA navigational graph on MLX (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - The MLX searcher holding vectors and graph
+/// * `k` - Number of neighbours, self included
+/// * `query_params` - Optional beam search parameters
+/// * `entry_points` - Optional `[n * n_entry]` entry node ids, see
+///   [`crate::mlx::cagra_mlx::self_entry_points`]; `None` derives them from
+///   the navigational graph
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_cagra_index_mlx_self(
+    index: &CagraSearchMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    entry_points: Option<&[u32]>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.self_search(k, query_params, entry_points, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+/////////////
+// IVF MLX //
+/////////////
+
+#[cfg(mlx_available)]
+/// Build an IVF index on MLX (experimental, Apple Silicon, f32 only)
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `nlist` - Number of clusters (defaults to √n)
+/// * `k_means_params` - Optional k-means parameters. Takes the CPU
+///   [KMeansTrainingParams], since the GPU struct needs the `gpu` feature:
+///   `iters`, `init` and `balanced` are honoured, `path` is ignored, and
+///   every iteration runs (no early stop).
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The initialised `IvfIndexMlx`
+pub fn build_ivf_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    nlist: Option<usize>,
+    k_means_params: Option<KMeansTrainingParams>,
+    dist_metric: &str,
+    seed: usize,
+    verbose: bool,
+) -> Result<IvfIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    let index = IvfIndexMlx::build(
+        mat.into_row_major(),
+        metric,
+        nlist,
+        k_means_params,
+        seed,
+        verbose,
+    )?;
+    // The k-means transients sit in MLX's buffer cache once dropped.
+    crate::mlx::clear_cache()?;
+    Ok(index)
+}
+
+#[cfg(mlx_available)]
+/// Query an IVF MLX index
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Queries per device tile
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &IvfIndexMlx,
+    k: usize,
+    nprobe: Option<usize>,
+    nquery: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) =
+        index.query_batch(query_mat.into_row_major(), k, nprobe, nquery, verbose)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(mlx_available)]
+/// Query an IVF MLX index against itself (full kNN graph)
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours, self included
+/// * `nprobe` - Clusters to search (defaults to √nlist)
+/// * `nquery` - Queries per device tile
+/// * `return_dist` - Return distances
+/// * `verbose` - Controls verbosity of the function
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_ivf_index_mlx_self(
+    index: &IvfIndexMlx,
+    k: usize,
+    nprobe: Option<usize>,
+    nquery: Option<usize>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+}
+
+///////////////////
+// NNDescent MLX //
+///////////////////
+
+#[cfg(mlx_available)]
+/// Build a raw kNN graph with NN-Descent on MLX (experimental, Apple Silicon,
+/// f32 only). Counterpart of [`build_knn_graph_gpu`], minus the device.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric string
+/// * `k` - Neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent working degree (default 1.5*k)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for init (default auto)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Populated [`KnnGraphMlx`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_knn_graph_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> Result<KnnGraphMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let graph = crate::mlx::nndescent_mlx::build_knn_graph_mlx(
+        mat.into_row_major(),
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        seed,
+        verbose,
+    )?;
+    crate::mlx::clear_cache()?;
+    Ok(graph)
+}
+
+#[cfg(mlx_available)]
+/// Build an NN-Descent index on MLX with CAGRA optimisation (experimental,
+/// Apple Silicon, f32 only). Counterpart of [`build_nndescent_index_gpu`],
+/// minus the device and `retain_gpu`: the MLX index always stays resident.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
+///   not supported.
+/// * `k` - Final neighbours per node (default 30)
+/// * `build_k` - Internal NNDescent degree before CAGRA pruning
+///   (default `1.5*k`)
+/// * `max_iters` - Maximum NNDescent iterations (default 15)
+/// * `n_trees` - Forest size for init (default `5 + n^0.25`, capped at 20)
+/// * `delta` - Convergence threshold (default 0.001)
+/// * `rho` - Sampling rate (default 1.0, meaning no sampling)
+/// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// The initialised [`NNDescentIndexMlx`]
+#[allow(clippy::too_many_arguments)]
+pub fn build_nndescent_index_mlx(
+    mat: impl AnnMatrix<f32>,
+    dist_metric: &str,
+    k: Option<usize>,
+    build_k: Option<usize>,
+    max_iters: Option<usize>,
+    n_trees: Option<usize>,
+    delta: Option<f32>,
+    rho: Option<f32>,
+    refine_knn: Option<usize>,
+    seed: usize,
+    verbose: bool,
+) -> Result<NNDescentIndexMlx, AnnSearchErrors> {
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    let index = NNDescentIndexMlx::build(
+        mat.into_row_major(),
+        metric,
+        k,
+        build_k,
+        max_iters,
+        n_trees,
+        delta,
+        rho,
+        refine_knn,
+        seed,
+        verbose,
+    )?;
+    crate::mlx::clear_cache()?;
+    Ok(index)
+}
+
+#[cfg(mlx_available)]
+/// Query an NNDescent MLX index.
+///
+/// ### Params
+///
+/// * `query_mat` - Query data as samples x features. Accepts a faer matrix,
+///   an ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_queries, n_features)` tuple. See [`AnnMatrix`].
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours
+/// * `query_params` - Optional beam search parameters
+/// * `return_dist` - Return distances
+/// * `verbose` - Print progress
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_mlx(
+    query_mat: impl AnnMatrix<f32>,
+    index: &NNDescentIndexMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    return_dist: bool,
+    verbose: bool,
+) -> KnnOptionResult<f32> {
+    let (queries_flat, n_queries, _) = query_mat.into_row_major();
+    if verbose {
+        println!("  MLX batch query: {} vectors, k={}...", n_queries, k);
+    }
+    let (indices, distances) = index.query_batch(&queries_flat, n_queries, query_params, k)?;
+    Ok((indices, return_dist.then_some(distances)))
+}
+
+#[cfg(mlx_available)]
+/// Self-query an NNDescent MLX index (full kNN graph via beam search).
+///
+/// ### Params
+///
+/// * `index` - Reference to built index
+/// * `k` - Number of neighbours, self included
+/// * `query_params` - Optional beam search parameters
+/// * `return_dist` - Return distances
+///
+/// ### Returns
+///
+/// Tuple of (indices, optional distances)
+pub fn query_nndescent_index_mlx_self(
+    index: &NNDescentIndexMlx,
+    k: usize,
+    query_params: Option<CagraMlxSearchParams>,
+    return_dist: bool,
+) -> KnnOptionResult<f32> {
+    let (indices, distances) = index.self_query(k, query_params, 42)?;
+    Ok((indices, return_dist.then_some(distances)))
 }
 
 //////////////
@@ -3297,17 +3746,16 @@ where
 /// * `seed` - Random seed
 /// * `verbose` - Print progress
 /// * `device` - GPU device
-pub fn build_ivf_index_gpu<T, R>(
+pub fn build_ivf_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-    device: R::Device,
-) -> Result<IvfIndexGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<IvfIndexGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3335,9 +3783,9 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_ivf_index_gpu<T, R>(
+pub fn query_ivf_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &IvfIndexGpu<T, R>,
+    index: &IvfIndexGpu<T>,
     k: usize,
     nprobe: Option<usize>,
     nquery: Option<usize>,
@@ -3345,7 +3793,6 @@ pub fn query_ivf_index_gpu<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
@@ -3377,8 +3824,8 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_ivf_index_gpu_self<T, R>(
-    index: &IvfIndexGpu<T, R>,
+pub fn query_ivf_index_gpu_self<T>(
+    index: &IvfIndexGpu<T>,
     k: usize,
     nprobe: Option<usize>,
     nquery: Option<usize>,
@@ -3386,7 +3833,6 @@ pub fn query_ivf_index_gpu_self<T, R>(
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     index.generate_knn(k, nprobe, nquery, return_dist, verbose)
@@ -3421,7 +3867,7 @@ where
 ///   later GPU beam search does not re-upload them
 /// * `device` - GPU device
 #[allow(clippy::too_many_arguments)]
-pub fn build_nndescent_index_gpu<T, R>(
+pub fn build_nndescent_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -3434,10 +3880,9 @@ pub fn build_nndescent_index_gpu<T, R>(
     seed: usize,
     verbose: bool,
     retain_gpu: bool,
-    device: R::Device,
-) -> Result<NNDescentGpu<T, R>, AnnSearchErrors>
+    device: Device,
+) -> Result<NNDescentGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3469,16 +3914,15 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_nndescent_index_gpu<T, R>(
+pub fn query_nndescent_index_gpu<T>(
     query_mat: impl AnnMatrix<T>,
-    index: &mut NNDescentGpu<T, R>,
+    index: &mut NNDescentGpu<T>,
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
     verbose: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (queries_flat, n_queries, _) = query_mat.into_row_major();
@@ -3517,14 +3961,13 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn extract_nndescent_knn_gpu<T, R>(
-    index: &NNDescentGpu<T, R>,
+pub fn extract_nndescent_knn_gpu<T>(
+    index: &NNDescentGpu<T>,
     k: Option<usize>,
     include_self: bool,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     Ok(index.extract_knn(k, include_self, return_dist))
@@ -3581,14 +4024,13 @@ where
 /// ### Returns
 ///
 /// Tuple of (indices, optional distances)
-pub fn query_nndescent_index_gpu_self<T, R>(
-    index: &mut NNDescentGpu<T, R>,
+pub fn query_nndescent_index_gpu_self<T>(
+    index: &mut NNDescentGpu<T>,
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
 ) -> KnnOptionResult<T>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
@@ -3630,7 +4072,7 @@ where
 ///
 /// Populated [`KnnGraphGpu`].
 #[allow(clippy::too_many_arguments)]
-pub fn build_knn_graph_gpu<T, R>(
+pub fn build_knn_graph_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -3642,10 +4084,9 @@ pub fn build_knn_graph_gpu<T, R>(
     refine_knn: Option<usize>,
     seed: usize,
     verbose: bool,
-    device: R::Device,
+    device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3653,7 +4094,7 @@ where
         Dist::default()
     });
 
-    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T, R>(
+    crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
         mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose, device,
     )
 }
@@ -3698,7 +4139,7 @@ where
 /// around 2x at `C = 2`. Whenever the dataset already fits, this falls through
 /// to [`build_knn_graph_gpu`] rather than paying that for nothing.
 #[allow(clippy::too_many_arguments)]
-pub fn build_clustered_knn_graph_gpu<T, R>(
+pub fn build_clustered_knn_graph_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     k: Option<usize>,
@@ -3711,10 +4152,9 @@ pub fn build_clustered_knn_graph_gpu<T, R>(
     cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
     seed: usize,
     verbose: bool,
-    device: R::Device,
+    device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
@@ -3722,7 +4162,7 @@ where
         Dist::default()
     });
 
-    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T, R>(
+    crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T>(
         mat,
         metric,
         k,

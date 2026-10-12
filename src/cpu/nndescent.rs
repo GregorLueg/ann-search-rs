@@ -745,8 +745,8 @@ where
     /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
     /// nearest-first in `scratch.candidates`.
     ///
-/// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
-/// the allocating query and copies its result across.
+    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
+    /// the allocating query and copies its result across.
     ///
     /// ### Params
     ///
@@ -893,8 +893,14 @@ pub struct NNDescent<T> {
     /// Forest used for graph initialisation and query entry points. Annoy for
     /// Euclidean/Cosine, KdForest for Manhattan.
     forest: Forest<T>,
-    /// Flat k-NN graph of size `n * k`
-    graph: Vec<(usize, T)>,
+    /// Flat kNN graph of size `n * k`, sorted per node, undiversified. What
+    /// `extract_knn`, `graph()` and NSG read.
+    graph: Vec<(u32, T)>,
+    /// Flat id-only adjacency of size `n * k` the query walks: the diversified
+    /// graph when `diversify_prob > 0`, otherwise the ids of `graph`.
+    /// Sentinel-padded. Queries never read the stored distances, so they are
+    /// not kept here.
+    query_graph: Vec<u32>,
     /// Whether construction converged
     converged: bool,
     /// Original indices - for trait purposes
@@ -989,11 +995,10 @@ where
             Vec::new()
         };
 
-        // Capped at 12 following PyNNDescent
-        let n_trees = n_trees.unwrap_or_else(|| {
-            let calculated = 5 + ((n as f64).powf(0.25)).round() as usize;
-            calculated.min(12)
-        });
+        // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
+        // trees well past where the old per-point query saturated.
+        let n_trees =
+            n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
 
         let max_iter = max_iter.unwrap_or_else(|| {
             let calculated = ((n as f64).log2().round()) as usize;
@@ -1018,6 +1023,7 @@ where
             metric,
             norms,
             graph: Vec::new(),
+            query_graph: Vec::new(),
             converged: false,
             forest,
             original_ids: (0..n).collect(),
@@ -1033,11 +1039,21 @@ where
             verbose,
         )?;
 
-        let graph = if diversify_prob > T::zero() {
-            builder.diversify_graph(&build_graph, k, diversify_prob, seed)
+        // Diversification only shapes what the query walks. Extraction and
+        // NSG keep the full kNN graph.
+        let query_graph: Vec<u32> = if diversify_prob > T::zero() {
+            builder
+                .diversify_graph(&build_graph, k, diversify_prob, seed)
+                .into_iter()
+                .map(|(pid, _)| pid as u32)
+                .collect()
         } else {
-            build_graph
+            build_graph.iter().map(|&(pid, _)| pid as u32).collect()
         };
+        let graph: Vec<(u32, T)> = build_graph
+            .into_iter()
+            .map(|(pid, d)| (pid as u32, d))
+            .collect();
 
         Ok(NNDescent {
             vectors_flat: builder.vectors_flat,
@@ -1047,6 +1063,7 @@ where
             metric: builder.metric,
             norms: builder.norms,
             graph,
+            query_graph,
             converged,
             forest: builder.forest,
             original_ids: (0..n).collect(),
@@ -1076,7 +1093,7 @@ where
     /// ### Returns
     ///
     /// A slice view over the internal graph.
-    pub fn graph(&self) -> &[(usize, T)] {
+    pub fn graph(&self) -> &[(u32, T)] {
         &self.graph
     }
 
@@ -1180,6 +1197,53 @@ where
         Ok(graph)
     }
 
+    /// Initialise the flat k-NN graph by joining every forest leaf exhaustively
+    ///
+    /// pynndescent's seeding: every pair inside a leaf is scored once and
+    /// offered to both rows. A per-point forest query sees one budget's worth
+    /// of candidates however many trees there are; the leaf join sees every
+    /// leaf it sits in, so recall keeps climbing with the tree count.
+    ///
+    /// ### Params
+    ///
+    /// * `forest` - The Annoy forest the leaves come from
+    /// * `k` - Neighbours per node
+    ///
+    /// ### Returns
+    ///
+    /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
+    fn init_with_leaf_join(&self, forest: &AnnoyIndex<T>, k: usize) -> Vec<Neighbour<T>> {
+        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let mut graph = vec![sentinel; self.n * k];
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
+
+        for tree in 0..forest.n_trees {
+            forest.tree_leaves(tree).par_iter().for_each(|leaf| {
+                #[allow(clippy::redundant_locals)]
+                let graph_ptr = graph_ptr;
+                // SAFETY: the leaves of one tree partition the points and
+                // trees run one after another, so this leaf is the only
+                // writer of its members' rows.
+                let row = |p: u32| unsafe {
+                    std::slice::from_raw_parts_mut(graph_ptr.0.add(p as usize * k), k)
+                };
+                // A split that never balanced leaves an oversized leaf; join it
+                // in blocks rather than all pairs.
+                for block in leaf.chunks(LEAF_JOIN_BLOCK) {
+                    for (a, &p) in block.iter().enumerate() {
+                        for &q in &block[a + 1..] {
+                            let d = self.distance(p as usize, q as usize);
+                            insert_sorted(row(p), q as usize, d);
+                            insert_sorted(row(q), p as usize, d);
+                        }
+                    }
+                }
+            });
+        }
+
+        graph
+    }
+
     /// Run the main NN-Descent algorithm with chunked updates
     ///
     /// Alternates between building candidate lists (new and old, forward and
@@ -1229,7 +1293,10 @@ where
         };
 
         let start = Instant::now();
-        let mut graph = self.init_with_forest(k)?;
+        let mut graph = match &self.forest {
+            Forest::Annoy(forest) => self.init_with_leaf_join(forest, k),
+            Forest::Kd(_) => self.init_with_forest(k)?,
+        };
         timings.seed = start.elapsed();
 
         if verbose {
@@ -1821,10 +1888,10 @@ where
     ///
     /// ### Returns
     ///
-    /// Slice of `k` `(pid, distance)` pairs, possibly containing sentinels
+    /// Slice of `k` neighbour ids, possibly containing sentinels
     #[inline]
-    fn graph_neighbours(&self, idx: usize) -> &[(usize, T)] {
-        &self.graph[idx * self.k..(idx + 1) * self.k]
+    fn graph_neighbours(&self, idx: usize) -> &[u32] {
+        &self.query_graph[idx * self.k..(idx + 1) * self.k]
     }
 
     /// Query for k nearest neighbours using beam search.
@@ -1971,7 +2038,8 @@ where
         total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
         total += self.norms.capacity() * std::mem::size_of::<T>();
         total += self.forest.memory_usage_bytes();
-        total += self.graph.capacity() * std::mem::size_of::<(usize, T)>();
+        total += self.graph.capacity() * std::mem::size_of::<(u32, T)>();
+        total += self.query_graph.capacity() * std::mem::size_of::<u32>();
 
         total
     }
@@ -1980,6 +2048,51 @@ where
 ///////////////////////////
 // Trait implementations //
 ///////////////////////////
+
+/// Largest block of a leaf joined all-pairs, so a degenerate leaf (a split
+/// that never balanced) stays linear rather than quadratic in its size.
+const LEAF_JOIN_BLOCK: usize = 256;
+
+/// Insert `(src, d)` into a row sorted ascending by `(distance, id)`.
+///
+/// Rejects a duplicate id or anything no better than the row's worst entry.
+/// Inserted entries are flagged new.
+///
+/// ### Params
+///
+/// * `row` - One node's `k` neighbours, sentinel-padded
+/// * `src` - Candidate id
+/// * `d` - Its distance
+///
+/// ### Returns
+///
+/// Whether the row changed.
+#[inline(always)]
+fn insert_sorted<T: AnnSearchFloat>(row: &mut [Neighbour<T>], src: usize, d: T) -> bool {
+    let k = row.len();
+    if d > row[k - 1].dist {
+        return false;
+    }
+    // One pass finds both the duplicate and the insertion point. The scan must
+    // run to the end regardless, since a duplicate can sit past the insertion
+    // point.
+    let mut pos = k;
+    for (i, slot) in row.iter().enumerate() {
+        let pid = slot.pid();
+        if pid == src {
+            return false;
+        }
+        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
+            pos = i;
+        }
+    }
+    if pos == k {
+        return false;
+    }
+    row.copy_within(pos..k - 1, pos + 1);
+    row[pos] = Neighbour::new(src, d, true);
+    true
+}
 
 ////////////////////////
 // ApplySortedUpdates //
@@ -2028,36 +2141,13 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
                 let mut edge_updates = 0usize;
 
                 for update in segment {
-                    let d = update.dist;
-                    if d > cutoff {
+                    if update.dist > cutoff {
                         continue;
                     }
-                    let src = update.source as usize;
-
-                    // One pass finds both the duplicate and the insertion
-                    // point. The scan must run to the end regardless, since a
-                    // duplicate can sit past the insertion point.
-                    let mut pos = k;
-                    let mut duplicate = false;
-                    for (i, slot) in row.iter().enumerate() {
-                        let pid = slot.pid();
-                        if pid == src {
-                            duplicate = true;
-                            break;
-                        }
-                        if pos == k && (d < slot.dist || (d == slot.dist && src < pid)) {
-                            pos = i;
-                        }
+                    if insert_sorted(row, update.source as usize, update.dist) {
+                        cutoff = row[k - 1].dist;
+                        edge_updates += 1;
                     }
-
-                    if duplicate || pos == k {
-                        continue;
-                    }
-
-                    row.copy_within(pos..k - 1, pos + 1);
-                    row[pos] = Neighbour::new(src, d, true);
-                    cutoff = row[k - 1].dist;
-                    edge_updates += 1;
                 }
 
                 if edge_updates > 0 {
@@ -2173,7 +2263,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2255,7 +2346,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2301,7 +2393,7 @@ macro_rules! impl_nndescent_query {
                 candidates: &mut BinaryHeap<Reverse<(OrderedFloat<$float>, usize)>>,
                 results: &mut BinaryHeap<(OrderedFloat<$float>, usize)>,
             ) -> Result<(Vec<usize>, Vec<$float>), AnnSearchErrors> {
-                let init_candidates = (ef / 2).max(k).min(self.n);
+                let init_candidates = (ef / 2).max(2 * k).min(self.n);
                 let search_k = init_candidates * 3;
                 $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
                     let mut scratch = cell.borrow_mut();
@@ -2338,7 +2430,8 @@ macro_rules! impl_nndescent_query {
                         break;
                     }
 
-                    for &(nbr_idx, _) in self.graph_neighbours(curr_idx) {
+                    for &nbr in self.graph_neighbours(curr_idx) {
+                        let nbr_idx = nbr as usize;
                         if nbr_idx == SENTINEL_PID || visited.contains(nbr_idx) {
                             continue;
                         }
@@ -2460,7 +2553,7 @@ mod tests {
     fn neighbours(index: &NNDescent<f32>, i: usize) -> Vec<(usize, f32)> {
         index.graph[i * index.k..(i + 1) * index.k]
             .iter()
-            .copied()
+            .map(|&(pid, d)| (pid as usize, d))
             .filter(|&(pid, _)| pid != SENTINEL_PID)
             .collect()
     }
@@ -2468,7 +2561,7 @@ mod tests {
     fn neighbours_f64(index: &NNDescent<f64>, i: usize) -> Vec<(usize, f64)> {
         index.graph[i * index.k..(i + 1) * index.k]
             .iter()
-            .copied()
+            .map(|&(pid, d)| (pid as usize, d))
             .filter(|&(pid, _)| pid != SENTINEL_PID)
             .collect()
     }
@@ -2783,6 +2876,46 @@ mod tests {
             assert!(!neighbours(&index, i).is_empty());
         }
     }
+
+    #[test]
+    fn test_nndescent_diversify_shapes_the_query_graph_not_the_extraction() {
+        let n = 400;
+        let dim = 8;
+        let k = 10;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let index = NNDescent::<f32>::new(
+            (&data[..], n, dim),
+            Dist::SquaredEuclidean,
+            Some(k),
+            None,
+            None,
+            None,
+            0.001,
+            1.0,
+            42,
+            false,
+        )
+        .unwrap();
+
+        let (ids, _) = index.extract_knn(None, false, false);
+        assert!(
+            ids.iter().all(|row| row.len() == k),
+            "extraction lost edges"
+        );
+        // Diversification prunes over the forward+reverse pool and tops rows
+        // back up, so the query graph differs in content, not in fill.
+        let changed = index
+            .query_graph
+            .iter()
+            .zip(&index.graph)
+            .filter(|(&q, &(g, _))| q != g)
+            .count();
+        assert!(
+            changed > 0,
+            "diversify_prob = 1.0 left the query graph unchanged"
+        );
+    }
     ///////////////////////
     // Candidate sets    //
     ///////////////////////
@@ -2902,7 +3035,7 @@ mod tests {
         let graph: Vec<Neighbour<f32>> = index
             .graph
             .iter()
-            .map(|&(pid, d)| Neighbour::new(pid, d, true))
+            .map(|&(pid, d)| Neighbour::new(pid as usize, d, true))
             .collect();
         index.build_candidates(&graph, index.k, max_candidates, 42, &mut cands);
 
@@ -3036,6 +3169,7 @@ mod tests {
         let dim = index.dim;
         for i in 0..index.n {
             for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                let pid = pid as usize;
                 if pid == SENTINEL_PID {
                     continue;
                 }
@@ -3116,6 +3250,7 @@ mod tests {
         let dim = index.dim;
         for i in 0..index.n {
             for &(pid, d) in &index.graph[i * index.k..(i + 1) * index.k] {
+                let pid = pid as usize;
                 if pid == SENTINEL_PID {
                     continue;
                 }
@@ -3157,7 +3292,7 @@ mod tests {
         assert!(index
             .graph()
             .iter()
-            .any(|&(pid, _)| pid == SENTINEL_PID || pid < index.n));
+            .any(|&(pid, _)| pid as usize == SENTINEL_PID || (pid as usize) < index.n));
     }
 
     #[test]
@@ -3222,7 +3357,7 @@ mod tests {
             for i in 0..index.n {
                 let row: Vec<f32> = index.graph[i * index.k..(i + 1) * index.k]
                     .iter()
-                    .filter(|&&(pid, _)| pid != SENTINEL_PID)
+                    .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
                     .map(|&(_, d)| d)
                     .collect();
                 assert!(

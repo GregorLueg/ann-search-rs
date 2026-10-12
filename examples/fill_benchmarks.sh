@@ -5,7 +5,7 @@ TEMPLATE_DIR="docs/templates"
 OUTPUT_DIR="docs"
 
 usage() {
-    echo "Usage: $0 --kind <standard|gpu|binary|quantised|knn_graph|all> [--dry-run]"
+    echo "Usage: $0 --kind <standard|gpu|mlx|binary|quantised|knn_graph|all> [--dry-run]"
     exit 1
 }
 
@@ -51,6 +51,14 @@ fi
 # dry-run must leave $OUTPUT untouched.
 if ! $DRY_RUN; then
     cp "$TEMPLATE" "$OUTPUT"
+    VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+    # Dirty only when code differs; regenerated docs and results don't count.
+    COMMIT=$(git describe --always)
+    if [ -n "$(git status --porcelain -- src examples Cargo.toml Cargo.lock)" ]; then
+        COMMIT="${COMMIT}-dirty"
+    fi
+    RUNINFO="*ann-search-rs ${VERSION} (commit ${COMMIT}), run on $(date +%Y-%m-%d).*"
+    RUNINFO="$RUNINFO" perl -pi -e 's/<!-- RUNINFO -->/$ENV{RUNINFO}/' "$OUTPUT"
 fi
 
 run_and_replace() {
@@ -240,6 +248,35 @@ case "$KIND" in
             "nsg_cpu:euclidean:cell:128:500000|cargo run --example gridsearch_nsg --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
             "nsg_gpu:euclidean:cell:128:500000|cargo run --example gridsearch_nsg_gpu --features gpu --release -- --distance euclidean --data cell --n-samples 500000 --dim 128"
 
+        )
+        ;;
+    mlx)
+        # Needs mlx-c installed; not part of --kind all.
+        BENCHMARKS=(
+            "mlx:euclidean:gaussian:32|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean"
+            "mlx:cosine:gaussian:32|cargo run --example gridsearch_mlx --release --features mlx -- --distance cosine"
+            "mlx:euclidean:correlated:32|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data correlated"
+            "mlx:euclidean:lowrank:32|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data lowrank"
+            "mlx:euclidean:cell:128|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data cell --dim 128"
+            "mlx:euclidean:cell:64:250000|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "mlx:euclidean:cell:128:250000|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "mlx:euclidean:cell:64:500000|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "mlx:euclidean:cell:128:500000|cargo run --example gridsearch_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 128"
+            "cagra_mlx:euclidean:gaussian:32|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean"
+            "cagra_mlx:cosine:gaussian:32|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance cosine"
+            "cagra_mlx:euclidean:correlated:32|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data correlated"
+            "cagra_mlx:euclidean:lowrank:32|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data lowrank"
+            "cagra_mlx:euclidean:cell:128|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --dim 128"
+            "cagra_mlx:euclidean:cell:64:250000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 250000 --dim 64"
+            "cagra_mlx:euclidean:cell:128:250000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 250000 --dim 128"
+            "cagra_mlx:euclidean:cell:64:500000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 64"
+            "cagra_mlx:euclidean:cell:128:500000|cargo run --example gridsearch_cagra_mlx --release --features mlx -- --distance euclidean --data cell --n-samples 500000 --dim 128"
+            "mlx_knn:euclidean:lowrank:32:250000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 250000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:250000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 250000 --dim 64"
+            "mlx_knn:euclidean:lowrank:32:500000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 500000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:500000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 500000 --dim 64"
+            "mlx_knn:euclidean:lowrank:32:1000000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 1000000 --dim 32"
+            "mlx_knn:euclidean:lowrank:64:1000000|cargo run --example bench_mlx_nndescent --release --features gpu,mlx -- --distance euclidean --data lowrank --n-samples 1000000 --dim 64"
         )
         ;;
     binary)

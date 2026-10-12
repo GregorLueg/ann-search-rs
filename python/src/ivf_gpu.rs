@@ -10,7 +10,7 @@ use ann_search_rs::{build_ivf_index_gpu, query_ivf_index_gpu, query_ivf_index_gp
 use pyo3::prelude::*;
 
 use crate::dispatch::QueryOut;
-use crate::gpu_handle::{default_device, f32_array, gpu_handle, Rt};
+use crate::gpu_handle::{default_device, f32_array, gpu_handle};
 use crate::kmeans::kmeans_gpu_params;
 
 gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
@@ -55,7 +55,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
         let inner = py
             .detach(|| {
                 crate::pool::run(|| {
-                    build_ivf_index_gpu::<f32, Rt>(
+                    build_ivf_index_gpu::<f32>(
                         (data, n, dim),
                         nlist,
                         kmp,

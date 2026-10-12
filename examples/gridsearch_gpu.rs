@@ -74,12 +74,9 @@ fn main() {
     let device: cubecl::wgpu::WgpuDevice = Default::default();
 
     let start = Instant::now();
-    let gpu_exhaustive_idx = build_exhaustive_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
-        data.as_ref(),
-        &cli.distance,
-        device.clone(),
-    )
-    .unwrap();
+    let gpu_exhaustive_idx =
+        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
+            .unwrap();
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = gpu_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -154,14 +151,14 @@ fn main() {
     for nlist in nlist_values {
         println!("Building IVF-GPU index (nlist={})...", nlist);
         let start = Instant::now();
-        let ivf_gpu_idx = build_ivf_index_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        let ivf_gpu_idx = build_ivf_index_gpu::<f32>(
             data.as_ref(),
             Some(nlist),
             None,
             &cli.distance,
             cli.seed as usize,
             false,
-            device.clone(),
+            device.clone().into(),
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;

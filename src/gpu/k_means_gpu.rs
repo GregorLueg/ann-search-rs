@@ -21,6 +21,7 @@
 #![allow(missing_docs)] // complains about cubecl macros...
 
 use cubecl::prelude::*;
+use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use faer::Mat;
 use rand::rngs::StdRng;
@@ -140,8 +141,8 @@ impl Default for KMeansGpuParams {
 // Flash Assign //
 //////////////////
 
-/// One-thread-per-point Euclidean argmin, vectorised, centroids read straight
-/// from global memory.
+/// One-thread-per-point argmin, vectorised, centroids read straight from
+/// global memory.
 ///
 /// There is deliberately no shared-memory centroid tile. Every thread in a
 /// workgroup reads the same centroid element at the same time, so the value is
@@ -150,8 +151,10 @@ impl Default for KMeansGpuParams {
 /// memory that occupancy wants.
 ///
 /// The point is held in registers as `dim_lines` vectors rather than exploded
-/// to `dim_lines * LINE_SIZE` scalars. Squared differences accumulate in a
-/// vector and are reduced horizontally once per centroid.
+/// to `dim_lines * LINE_SIZE` scalars. Squared differences (or products, under
+/// cosine) accumulate in a vector and are reduced horizontally once per
+/// centroid. Cosine minimises `1 - dot(x, c) / (||x|| * ||c||)` from
+/// precomputed norms.
 ///
 /// ### Type parameters
 ///
@@ -163,25 +166,33 @@ impl Default for KMeansGpuParams {
 ///
 /// * `data` - Input data vectors `[n, dim]` in storage precision `S`
 /// * `centroids` - Centroid matrix `[k, dim]` in accumulator precision `A`
+/// * `point_norms` - Precomputed L2 norms of each data point `[n]`; read only
+///   under cosine
+/// * `centroid_norms` - Precomputed L2 norms of each centroid `[k]`; read only
+///   under cosine
 /// * `assignments` - Output hard assignment indices `[n]`
 /// * `n_samples` - Total number of data points
 /// * `k` - Number of clusters
 /// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
 /// * `wg_size` - Workgroup size; comptime
+/// * `use_cosine` - Cosine instead of squared Euclidean; comptime
 ///
 /// ### Grid mapping
 ///
 /// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
 ///   index
 #[cube(launch_unchecked)]
-pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
+pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
     data: &Tensor<Vector<S, N>>,
     centroids: &Tensor<Vector<A, N>>,
+    point_norms: &Tensor<A>,
+    centroid_norms: &Tensor<A>,
     assignments: &mut Tensor<u32>,
     n_samples: u32,
     k: u32,
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
+    #[comptime] use_cosine: bool,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -196,9 +207,13 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
         let mut pv = Vector::<A, N>::empty();
         #[unroll]
         for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
+            pv.insert(lane, A::cast_from(sl.extract(lane)));
         }
         p[i] = pv;
+    }
+    let mut pnorm = A::new(1.0_f32);
+    if use_cosine {
+        pnorm = point_norms[point_idx as usize];
     }
 
     let mut best_dist = A::new(f32::MAX);
@@ -217,8 +232,12 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
             let pv = p[i];
             #[unroll]
             for u in 0..CENTROID_UNROLL {
-                let diff = pv - centroids[(c as usize + u) * dim_lines + i];
-                accs[u] += diff * diff;
+                if use_cosine {
+                    accs[u] += pv * centroids[(c as usize + u) * dim_lines + i];
+                } else {
+                    let diff = pv - centroids[(c as usize + u) * dim_lines + i];
+                    accs[u] += diff * diff;
+                }
             }
         }
         #[unroll]
@@ -227,7 +246,10 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
             let mut sum = A::new(0.0_f32);
             #[unroll]
             for lane in 0..LINE_SIZE {
-                sum += av[lane];
+                sum += av.extract(lane);
+            }
+            if use_cosine {
+                sum = A::new(1.0_f32) - sum / (pnorm * centroid_norms[c as usize + u]);
             }
             if sum < best_dist {
                 best_dist = sum;
@@ -242,13 +264,20 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
-            let diff = p[i] - centroids[cbase + i];
-            acc += diff * diff;
+            if use_cosine {
+                acc += p[i] * centroids[cbase + i];
+            } else {
+                let diff = p[i] - centroids[cbase + i];
+                acc += diff * diff;
+            }
         }
         let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
-            sum += acc[lane];
+            sum += acc.extract(lane);
+        }
+        if use_cosine {
+            sum = A::new(1.0_f32) - sum / (pnorm * centroid_norms[c as usize]);
         }
         if sum < best_dist {
             best_dist = sum;
@@ -260,129 +289,13 @@ pub fn flash_assign_euclidean_vec<S: Float, A: Float, N: Size>(
     assignments[point_idx as usize] = best_idx;
 }
 
-/// Cosine analogue of [`fn@flash_assign_euclidean_vec`]. Uses precomputed L2
-/// norms; minimises `1 - dot(x, c) / (||x|| * ||c||)`.
-///
-/// ### Type parameters
-///
-/// * `S` - Storage precision of the data buffer
-/// * `A` - Accumulator precision; all distance arithmetic runs in `A`
-/// * `N` - Vectorisation width
-///
-/// ### Params
-///
-/// * `data` - Input data vectors `[n, dim]` in storage precision `S`
-/// * `centroids` - Centroid matrix `[k, dim]` in accumulator precision `A`
-/// * `point_norms` - Precomputed L2 norms of each data point `[n]`
-/// * `centroid_norms` - Precomputed L2 norms of each centroid `[k]`
-/// * `assignments` - Output hard assignment indices `[n]`
-/// * `n_samples` - Total number of data points
-/// * `k` - Number of clusters
-/// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
-/// * `wg_size` - Workgroup size; comptime
-///
-/// ### Grid mapping
-///
-/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
-///   index
-#[cube(launch_unchecked)]
-pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
-    data: &Tensor<Vector<S, N>>,
-    centroids: &Tensor<Vector<A, N>>,
-    point_norms: &Tensor<A>,
-    centroid_norms: &Tensor<A>,
-    assignments: &mut Tensor<u32>,
-    n_samples: u32,
-    k: u32,
-    #[comptime] dim_lines: usize,
-    #[comptime] wg_size: u32,
-) {
-    let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
-    if point_idx >= n_samples {
-        terminate!();
-    }
-    let p_base = point_idx as usize * dim_lines;
-
-    let mut p = Array::<Vector<A, N>>::new(dim_lines);
-    for i in 0..dim_lines {
-        let sl = data[p_base + i];
-        let mut pv = Vector::<A, N>::empty();
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
-        }
-        p[i] = pv;
-    }
-    let pnorm = point_norms[point_idx as usize];
-
-    let mut best_dist = A::new(f32::MAX);
-    let mut best_idx = 0u32;
-
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
-
-    let mut c = 0u32;
-    while c + cu <= k {
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
-        }
-        for i in 0..dim_lines {
-            let pv = p[i];
-            #[unroll]
-            for u in 0..CENTROID_UNROLL {
-                accs[u] += pv * centroids[(c as usize + u) * dim_lines + i];
-            }
-        }
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            let av = accs[u];
-            let mut dot = A::new(0.0_f32);
-            #[unroll]
-            for lane in 0..LINE_SIZE {
-                dot += av[lane];
-            }
-            let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize + u]);
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = c + u as u32;
-            }
-        }
-        c += cu;
-    }
-
-    // Tail for `k` not divisible by CENTROID_UNROLL.
-    while c < k {
-        let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
-        for i in 0..dim_lines {
-            acc += p[i] * centroids[cbase + i];
-        }
-        let mut dot = A::new(0.0_f32);
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            dot += acc[lane];
-        }
-        let dist = A::new(1.0_f32) - dot / (pnorm * centroid_norms[c as usize]);
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = c;
-        }
-        c += 1u32;
-    }
-
-    assignments[point_idx as usize] = best_idx;
-}
-
 /// Dispatch the appropriate assignment kernel and write results into a
-/// device-resident buffer. Selects between [`fn@flash_assign_euclidean_vec`]
-/// and [`fn@flash_assign_cosine_vec`] based on `metric`.
+/// device-resident buffer via [`fn@flash_assign_vec`].
 ///
 /// ### Type params
 ///
 /// * `S` - Storage precision of the data buffer
 /// * `A` - Accumulator precision for distance arithmetic
-/// * `R` - CubeCL runtime
 ///
 /// ### Params
 ///
@@ -403,20 +316,19 @@ pub fn flash_assign_cosine_vec<S: Float, A: Float, N: Size>(
 /// `Ok(())`; assignments are written into `assign_gpu` in place. `CubeclUtils`
 /// if the grid is over the device limit.
 #[allow(clippy::too_many_arguments)]
-fn flash_assign_device<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
-    cent_gpu: &GpuTensor<R, A>,
-    pnorm_gpu: &GpuTensor<R, A>,
-    cnorm_gpu: &GpuTensor<R, A>,
-    assign_gpu: &GpuTensor<R, u32>,
+fn flash_assign_device<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    cent_gpu: &GpuTensor<A>,
+    pnorm_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
+    assign_gpu: &GpuTensor<u32>,
     n: usize,
     k: usize,
     dim: usize,
     metric: &Dist,
 ) -> Result<(), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement,
 {
@@ -428,40 +340,29 @@ where
     let count = CubeCount::Static(gx, gy, 1);
     let cdim = CubeDim::new_1d(WORKGROUP_128);
 
-    match *metric {
-        Dist::SquaredEuclidean => unsafe {
-            flash_assign_euclidean_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cent_gpu.clone().into_tensor_arg(),
-                assign_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
-        Dist::Cosine => unsafe {
-            flash_assign_cosine_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cent_gpu.clone().into_tensor_arg(),
-                pnorm_gpu.clone().into_tensor_arg(),
-                cnorm_gpu.clone().into_tensor_arg(),
-                assign_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
+    let use_cosine = match *metric {
+        Dist::SquaredEuclidean => false,
+        Dist::Cosine => true,
         Dist::Manhattan => unreachable!("Manhattan distance is not supported!"),
+    };
+
+    unsafe {
+        flash_assign_vec::launch_unchecked::<S, A>(
+            client,
+            count,
+            cdim,
+            vec_size,
+            data_gpu.clone().into_tensor_arg(),
+            cent_gpu.clone().into_tensor_arg(),
+            pnorm_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            assign_gpu.clone().into_tensor_arg(),
+            n as u32,
+            k as u32,
+            dim_lines,
+            WORKGROUP_128,
+            use_cosine,
+        );
     }
 
     Ok(())
@@ -471,9 +372,9 @@ where
 // k-means || init //
 /////////////////////
 
-/// Squared Euclidean distance from each point to its nearest candidate.
+/// Distance from each point to its nearest candidate.
 ///
-/// Same traversal as [`fn@flash_assign_euclidean_vec`], but it keeps the
+/// Same traversal as [`fn@flash_assign_vec`], but it keeps the
 /// distance rather than the index. This is the D² pass of k-means||, which
 /// dominates that algorithm: it runs `ln(k) + 1` times against a candidate set
 /// growing by `2k` each round, so at n = 1e6, k = 100 it is n * dim * 2005
@@ -489,25 +390,33 @@ where
 ///
 /// * `data` - Input data vectors `[n, dim]` in storage precision `S`
 /// * `cands` - Candidate centres `[k, dim]` in accumulator precision `A`
+/// * `point_norms` - Precomputed L2 norms of each data point `[n]`; read only
+///   under cosine
+/// * `cand_norms` - Precomputed L2 norms of each candidate `[k]`; read only
+///   under cosine
 /// * `out` - Output nearest-candidate distances `[n]`
 /// * `n_samples` - Total number of data points
 /// * `k` - Number of candidates
 /// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
 /// * `wg_size` - Workgroup size; comptime
+/// * `use_cosine` - Cosine instead of squared Euclidean; comptime
 ///
 /// ### Grid mapping
 ///
 /// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
 ///   index
 #[cube(launch_unchecked)]
-pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
+pub fn min_dist_vec<S: Float, A: Float, N: Size>(
     data: &Tensor<Vector<S, N>>,
     cands: &Tensor<Vector<A, N>>,
+    point_norms: &Tensor<A>,
+    cand_norms: &Tensor<A>,
     out: &mut Tensor<A>,
     n_samples: u32,
     k: u32,
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
+    #[comptime] use_cosine: bool,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -521,9 +430,13 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         let mut pv = Vector::<A, N>::empty();
         #[unroll]
         for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
+            pv.insert(lane, A::cast_from(sl.extract(lane)));
         }
         p[i] = pv;
+    }
+    let mut pnorm = A::new(1.0_f32);
+    if use_cosine {
+        pnorm = point_norms[point_idx as usize];
     }
 
     let mut best = A::new(f32::MAX);
@@ -541,8 +454,12 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
             let pv = p[i];
             #[unroll]
             for u in 0..CENTROID_UNROLL {
-                let diff = pv - cands[(c as usize + u) * dim_lines + i];
-                accs[u] += diff * diff;
+                if use_cosine {
+                    accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
+                } else {
+                    let diff = pv - cands[(c as usize + u) * dim_lines + i];
+                    accs[u] += diff * diff;
+                }
             }
         }
         #[unroll]
@@ -551,7 +468,10 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
             let mut sum = A::new(0.0_f32);
             #[unroll]
             for lane in 0..LINE_SIZE {
-                sum += av[lane];
+                sum += av.extract(lane);
+            }
+            if use_cosine {
+                sum = A::new(1.0_f32) - sum / (pnorm * cand_norms[c as usize + u]);
             }
             if sum < best {
                 best = sum;
@@ -564,130 +484,23 @@ pub fn min_dist_euclidean_vec<S: Float, A: Float, N: Size>(
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
         for i in 0..dim_lines {
-            let diff = p[i] - cands[cbase + i];
-            acc += diff * diff;
+            if use_cosine {
+                acc += p[i] * cands[cbase + i];
+            } else {
+                let diff = p[i] - cands[cbase + i];
+                acc += diff * diff;
+            }
         }
         let mut sum = A::new(0.0_f32);
         #[unroll]
         for lane in 0..LINE_SIZE {
-            sum += acc[lane];
+            sum += acc.extract(lane);
+        }
+        if use_cosine {
+            sum = A::new(1.0_f32) - sum / (pnorm * cand_norms[c as usize]);
         }
         if sum < best {
             best = sum;
-        }
-        c += 1u32;
-    }
-
-    // Running minimum across rounds: `out` starts at +inf and each round
-    // only scores the candidates it added.
-    if best < out[point_idx as usize] {
-        out[point_idx as usize] = best;
-    }
-}
-
-/// Cosine analogue of [`fn@min_dist_euclidean_vec`].
-///
-/// ### Type parameters
-///
-/// * `S` - Storage precision of the data buffer
-/// * `A` - Accumulator precision
-/// * `N` - Vectorisation width
-///
-/// ### Params
-///
-/// * `data` - Input data vectors `[n, dim]` in storage precision `S`
-/// * `cands` - Candidate centres `[k, dim]` in accumulator precision `A`
-/// * `point_norms` - Precomputed L2 norms of each data point `[n]`
-/// * `cand_norms` - Precomputed L2 norms of each candidate `[k]`
-/// * `out` - Output nearest-candidate distances `[n]`
-/// * `n_samples` - Total number of data points
-/// * `k` - Number of candidates
-/// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
-/// * `wg_size` - Workgroup size; comptime
-///
-/// ### Grid mapping
-///
-/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> point
-///   index
-#[cube(launch_unchecked)]
-pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
-    data: &Tensor<Vector<S, N>>,
-    cands: &Tensor<Vector<A, N>>,
-    point_norms: &Tensor<A>,
-    cand_norms: &Tensor<A>,
-    out: &mut Tensor<A>,
-    n_samples: u32,
-    k: u32,
-    #[comptime] dim_lines: usize,
-    #[comptime] wg_size: u32,
-) {
-    let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
-    if point_idx >= n_samples {
-        terminate!();
-    }
-    let p_base = point_idx as usize * dim_lines;
-
-    let mut p = Array::<Vector<A, N>>::new(dim_lines);
-    for i in 0..dim_lines {
-        let sl = data[p_base + i];
-        let mut pv = Vector::<A, N>::empty();
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            pv[lane] = A::cast_from(sl[lane]);
-        }
-        p[i] = pv;
-    }
-    let pnorm = point_norms[point_idx as usize];
-
-    let mut best = A::new(f32::MAX);
-
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
-
-    let mut c = 0u32;
-    while c + cu <= k {
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
-        }
-        for i in 0..dim_lines {
-            let pv = p[i];
-            #[unroll]
-            for u in 0..CENTROID_UNROLL {
-                accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
-            }
-        }
-        #[unroll]
-        for u in 0..CENTROID_UNROLL {
-            let av = accs[u];
-            let mut dot = A::new(0.0_f32);
-            #[unroll]
-            for lane in 0..LINE_SIZE {
-                dot += av[lane];
-            }
-            let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize + u]);
-            if dist < best {
-                best = dist;
-            }
-        }
-        c += cu;
-    }
-
-    // Tail for `k` not divisible by CENTROID_UNROLL.
-    while c < k {
-        let cbase = c as usize * dim_lines;
-        let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
-        for i in 0..dim_lines {
-            acc += p[i] * cands[cbase + i];
-        }
-        let mut dot = A::new(0.0_f32);
-        #[unroll]
-        for lane in 0..LINE_SIZE {
-            dot += acc[lane];
-        }
-        let dist = A::new(1.0_f32) - dot / (pnorm * cand_norms[c as usize]);
-        if dist < best {
-            best = dist;
         }
         c += 1u32;
     }
@@ -705,7 +518,6 @@ pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
 ///
 /// * `S` - Storage precision of the data buffer
 /// * `A` - Accumulator precision
-/// * `R` - CubeCL runtime
 ///
 /// ### Params
 ///
@@ -725,20 +537,19 @@ pub fn min_dist_cosine_vec<S: Float, A: Float, N: Size>(
 /// `Ok(())`; distances are written into `out_gpu` in place. `CubeclUtils` if
 /// the grid is over the device limit.
 #[allow(clippy::too_many_arguments)]
-fn min_dist_device<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
-    cand_gpu: &GpuTensor<R, A>,
-    pnorm_gpu: &GpuTensor<R, A>,
-    cnorm_gpu: &GpuTensor<R, A>,
-    out_gpu: &GpuTensor<R, A>,
+fn min_dist_device<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    cand_gpu: &GpuTensor<A>,
+    pnorm_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
+    out_gpu: &GpuTensor<A>,
     n: usize,
     k: usize,
     dim: usize,
     metric: &Dist,
 ) -> Result<(), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement,
 {
@@ -749,40 +560,29 @@ where
     let count = CubeCount::Static(gx, gy, 1);
     let cdim = CubeDim::new_1d(WORKGROUP_128);
 
-    match *metric {
-        Dist::SquaredEuclidean => unsafe {
-            min_dist_euclidean_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cand_gpu.clone().into_tensor_arg(),
-                out_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
-        Dist::Cosine => unsafe {
-            min_dist_cosine_vec::launch_unchecked::<S, A, R>(
-                client,
-                count,
-                cdim,
-                vec_size,
-                data_gpu.clone().into_tensor_arg(),
-                cand_gpu.clone().into_tensor_arg(),
-                pnorm_gpu.clone().into_tensor_arg(),
-                cnorm_gpu.clone().into_tensor_arg(),
-                out_gpu.clone().into_tensor_arg(),
-                n as u32,
-                k as u32,
-                dim_lines,
-                WORKGROUP_128,
-            );
-        },
+    let use_cosine = match *metric {
+        Dist::SquaredEuclidean => false,
+        Dist::Cosine => true,
         Dist::Manhattan => unreachable!("Manhattan distance is not supported!"),
+    };
+
+    unsafe {
+        min_dist_vec::launch_unchecked::<S, A>(
+            client,
+            count,
+            cdim,
+            vec_size,
+            data_gpu.clone().into_tensor_arg(),
+            cand_gpu.clone().into_tensor_arg(),
+            pnorm_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            out_gpu.clone().into_tensor_arg(),
+            n as u32,
+            k as u32,
+            dim_lines,
+            WORKGROUP_128,
+            use_cosine,
+        );
     }
 
     Ok(())
@@ -968,12 +768,12 @@ where
 ///   candidate upload busts the per-binding size limit, or the distance
 ///   read-back fails.
 #[allow(clippy::too_many_arguments)]
-fn kmeans_parallel_init_gpu<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
+fn kmeans_parallel_init_gpu<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
     data_host: &[A],
     norms_host: &[A],
-    pnorm_gpu: &GpuTensor<R, A>,
+    pnorm_gpu: &GpuTensor<A>,
     n: usize,
     dim: usize,
     k: usize,
@@ -981,7 +781,6 @@ fn kmeans_parallel_init_gpu<S, A, R>(
     seed: usize,
 ) -> Result<Vec<A>, AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
 {
@@ -994,7 +793,7 @@ where
 
     // Running minimum on device: each round scores only the candidates added
     // since the last one.
-    let dist_gpu = GpuTensor::<R, A>::from_slice(
+    let dist_gpu = GpuTensor::<A>::from_slice(
         &vec![<A as num_traits::Float>::max_value(); n],
         vec![n],
         client,
@@ -1004,12 +803,11 @@ where
     for _ in 0..n_rounds {
         let n_new = cand_norms.len() - new_from;
         let cand_gpu =
-            GpuTensor::<R, A>::from_slice(&cands[new_from * dim..], vec![n_new, dim], client)?;
-        let cnorm_gpu =
-            GpuTensor::<R, A>::from_slice(&cand_norms[new_from..], vec![n_new], client)?;
+            GpuTensor::<A>::from_slice(&cands[new_from * dim..], vec![n_new, dim], client)?;
+        let cnorm_gpu = GpuTensor::<A>::from_slice(&cand_norms[new_from..], vec![n_new], client)?;
         new_from = cand_norms.len();
 
-        min_dist_device::<S, A, R>(
+        min_dist_device::<S, A>(
             client, data_gpu, &cand_gpu, pnorm_gpu, &cnorm_gpu, &dist_gpu, n, n_new, dim, metric,
         )?;
 
@@ -1262,19 +1060,18 @@ pub fn scatter_csr_privatised(
 /// limit. The merge pass is the one that reaches it first: its grid is
 /// `cube_count * k / 256`, which grows in both terms.
 #[allow(clippy::too_many_arguments)]
-pub fn build_csr_gpu_privatised<R>(
-    assignments: &GpuTensor<R, u32>,
+pub fn build_csr_gpu_privatised(
+    assignments: &GpuTensor<u32>,
     n: usize,
     k: usize,
     cube_count: usize,
-    privatised_counts: &GpuTensor<R, u32>,
-    counts: &GpuTensor<R, u32>,
-    offsets: &GpuTensor<R, u32>,
-    all_indices: &GpuTensor<R, u32>,
-    client: &ComputeClient<R>,
+    privatised_counts: &GpuTensor<u32>,
+    counts: &GpuTensor<u32>,
+    offsets: &GpuTensor<u32>,
+    all_indices: &GpuTensor<u32>,
+    client: &Client,
 ) -> Result<(), AnnSearchErrors>
 where
-    R: Runtime,
 {
     let limits = GpuLimits::from_client(client);
     let total_elements = cube_count * k;
@@ -1304,7 +1101,7 @@ where
         checked_cube_count("scatter_csr_privatised", cube_count as u32, 1, 1, &limits)?;
 
     unsafe {
-        histogram_clusters_privatised::launch_unchecked::<R>(
+        histogram_clusters_privatised::launch_unchecked(
             client,
             hist_count,
             CubeDim::new_1d(WORKGROUP_SIZE_X),
@@ -1314,7 +1111,7 @@ where
             k as u32,
         );
 
-        scan_columns_and_sum::launch_unchecked::<R>(
+        scan_columns_and_sum::launch_unchecked(
             client,
             scan_count,
             CubeDim::new_1d(256),
@@ -1324,7 +1121,7 @@ where
             cube_count as u32,
         );
 
-        exclusive_scan_offsets_2::launch_unchecked::<R>(
+        exclusive_scan_offsets_2::launch_unchecked(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new_1d(1),
@@ -1333,7 +1130,7 @@ where
             k as u32,
         );
 
-        merge_offsets_to_cursors::launch_unchecked::<R>(
+        merge_offsets_to_cursors::launch_unchecked(
             client,
             merge_count,
             CubeDim::new_1d(256),
@@ -1343,7 +1140,7 @@ where
             cube_count as u32,
         );
 
-        scatter_csr_privatised::launch_unchecked::<R>(
+        scatter_csr_privatised::launch_unchecked(
             client,
             scatter_count,
             CubeDim::new_1d(WORKGROUP_SIZE_X),
@@ -1441,7 +1238,7 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
     let sub = (tx / dim_eff) as u32;
     let subs = n_sub as u32;
 
-    let mut s_part = SharedMemory::<A>::new(SEGMENTED_SMEM_LEN);
+    let mut s_part = Shared::<[A]>::new_slice(SEGMENTED_SMEM_LEN);
 
     let stride = (n_sub * SEGMENT_UNROLL) as u32;
 
@@ -1521,17 +1318,16 @@ pub fn segmented_centroid_update<S: Float, A: Float>(
 ///
 /// `Ok(())`; `centroids` is updated in place. `CubeclUtils` if the grid is over
 /// the device limit.
-pub fn segmented_update<R, S, A>(
-    data: &GpuTensor<R, S>,
-    all_indices: &GpuTensor<R, u32>,
-    offsets: &GpuTensor<R, u32>,
-    centroids: &GpuTensor<R, A>,
+pub fn segmented_update<S, A>(
+    data: &GpuTensor<S>,
+    all_indices: &GpuTensor<u32>,
+    offsets: &GpuTensor<u32>,
+    centroids: &GpuTensor<A>,
     k: usize,
     dim: usize,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<(), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement,
 {
@@ -1540,7 +1336,7 @@ where
     let dim_eff = dim.min(WORKGROUP_128 as usize);
     let n_sub = WORKGROUP_128 as usize / dim_eff;
     unsafe {
-        segmented_centroid_update::launch_unchecked::<S, A, R>(
+        segmented_centroid_update::launch_unchecked::<S, A>(
             client,
             CubeCount::Static(gx, gy, 1),
             CubeDim::new_1d(WORKGROUP_128),
@@ -1720,13 +1516,13 @@ pub fn balance_reseed_centroids<S: Float, A: Float>(
 /// Number of centroids reseeded. Zero means the partition was balanced enough
 /// to leave alone, and no kernel was launched.
 #[allow(clippy::too_many_arguments)]
-fn balance_centroids<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
-    all_indices: &GpuTensor<R, u32>,
-    offsets: &GpuTensor<R, u32>,
-    cent_gpu: &GpuTensor<R, A>,
-    cnorm_gpu: &GpuTensor<R, A>,
+fn balance_centroids<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    all_indices: &GpuTensor<u32>,
+    offsets: &GpuTensor<u32>,
+    cent_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
     n: usize,
     k: usize,
     dim: usize,
@@ -1734,7 +1530,6 @@ fn balance_centroids<S, A, R>(
     seed: usize,
 ) -> Result<usize, AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float,
 {
@@ -1776,15 +1571,15 @@ where
         return Ok(0);
     }
 
-    let target_gpu = GpuTensor::<R, u32>::from_slice(&fix_target, vec![n_fix], client)?;
-    let pos_gpu = GpuTensor::<R, u32>::from_slice(&fix_pos, vec![n_fix], client)?;
-    let weight_gpu = GpuTensor::<R, A>::from_slice(&fix_weight, vec![n_fix], client)?;
+    let target_gpu = GpuTensor::<u32>::from_slice(&fix_target, vec![n_fix], client)?;
+    let pos_gpu = GpuTensor::<u32>::from_slice(&fix_pos, vec![n_fix], client)?;
+    let weight_gpu = GpuTensor::<A>::from_slice(&fix_weight, vec![n_fix], client)?;
 
     let limits = GpuLimits::from_client(client);
     let (gx, gy) = grid_2d(n_fix as u32, &limits)?;
 
     unsafe {
-        balance_reseed_centroids::launch_unchecked::<S, A, R>(
+        balance_reseed_centroids::launch_unchecked::<S, A>(
             client,
             CubeCount::Static(gx, gy, 1),
             CubeDim::new_1d(WORKGROUP_128),
@@ -1803,7 +1598,7 @@ where
     if *metric == Dist::Cosine {
         let (nx, ny) = grid_2d(k as u32, &limits)?;
         unsafe {
-            centroid_norms_l2::launch_unchecked::<A, R>(
+            centroid_norms_l2::launch_unchecked::<A>(
                 client,
                 CubeCount::Static(nx, ny, 1),
                 CubeDim::new_1d(1),
@@ -1859,33 +1654,32 @@ where
 /// `Ok(())`; `cent_gpu`, `assign_gpu` and the CSR scratch are updated in place.
 /// `CubeclUtils` if any dispatch is over the device limit.
 #[allow(clippy::too_many_arguments)]
-fn lloyd_step<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
-    cent_gpu: &GpuTensor<R, A>,
-    pnorm_gpu: &GpuTensor<R, A>,
-    cnorm_gpu: &GpuTensor<R, A>,
-    assign_gpu: &GpuTensor<R, u32>,
+fn lloyd_step<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    cent_gpu: &GpuTensor<A>,
+    pnorm_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
+    assign_gpu: &GpuTensor<u32>,
     n: usize,
     k: usize,
     dim: usize,
     metric: &Dist,
     cube_count: usize,
-    privatised_counts: &GpuTensor<R, u32>,
-    counts: &GpuTensor<R, u32>,
-    offsets: &GpuTensor<R, u32>,
-    all_indices: &GpuTensor<R, u32>,
+    privatised_counts: &GpuTensor<u32>,
+    counts: &GpuTensor<u32>,
+    offsets: &GpuTensor<u32>,
+    all_indices: &GpuTensor<u32>,
 ) -> Result<(), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement,
 {
-    flash_assign_device::<S, A, R>(
+    flash_assign_device::<S, A>(
         client, data_gpu, cent_gpu, pnorm_gpu, cnorm_gpu, assign_gpu, n, k, dim, metric,
     )?;
 
-    build_csr_gpu_privatised::<R>(
+    build_csr_gpu_privatised(
         assign_gpu,
         n,
         k,
@@ -1897,13 +1691,13 @@ where
         client,
     )?;
 
-    segmented_update::<R, S, A>(data_gpu, all_indices, offsets, cent_gpu, k, dim, client)?;
+    segmented_update::<S, A>(data_gpu, all_indices, offsets, cent_gpu, k, dim, client)?;
 
     if *metric == Dist::Cosine {
         let limits = GpuLimits::from_client(client);
         let (gx, gy) = grid_2d(k as u32, &limits)?;
         unsafe {
-            centroid_norms_l2::launch_unchecked::<A, R>(
+            centroid_norms_l2::launch_unchecked::<A>(
                 client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_1d(1),
@@ -1958,12 +1752,12 @@ where
 /// point, and the final `[n_centroids, dim_padded]` centroid buffer flattened
 /// row-major. `CubeclUtils` if any dispatch or allocation busts a device limit.
 #[allow(clippy::too_many_arguments)]
-fn run_kmeans_loop<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
-    cent_gpu: &GpuTensor<R, A>,
-    pnorm_gpu: &GpuTensor<R, A>,
-    cnorm_gpu: &GpuTensor<R, A>,
+fn run_kmeans_loop<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    cent_gpu: &GpuTensor<A>,
+    pnorm_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
     n: usize,
     n_centroids: usize,
     dim_padded: usize,
@@ -1973,17 +1767,16 @@ fn run_kmeans_loop<S, A, R>(
     verbose: bool,
 ) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float,
 {
-    let assign_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
+    let assign_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
 
     let cube_count = 512usize;
-    let privatised_counts = GpuTensor::<R, u32>::empty(vec![cube_count, n_centroids], client)?;
-    let counts = GpuTensor::<R, u32>::empty(vec![n_centroids], client)?;
-    let offsets = GpuTensor::<R, u32>::empty(vec![n_centroids + 1], client)?;
-    let all_indices = GpuTensor::<R, u32>::empty(vec![n], client)?;
+    let privatised_counts = GpuTensor::<u32>::empty(vec![cube_count, n_centroids], client)?;
+    let counts = GpuTensor::<u32>::empty(vec![n_centroids], client)?;
+    let offsets = GpuTensor::<u32>::empty(vec![n_centroids + 1], client)?;
+    let all_indices = GpuTensor::<u32>::empty(vec![n], client)?;
 
     if params.fixed {
         if verbose {
@@ -1993,7 +1786,7 @@ where
             )
         }
         for iter in 0..params.iters {
-            lloyd_step::<S, A, R>(
+            lloyd_step::<S, A>(
                 client,
                 data_gpu,
                 cent_gpu,
@@ -2012,7 +1805,7 @@ where
             )?;
 
             if params.balanced {
-                balance_centroids::<S, A, R>(
+                balance_centroids::<S, A>(
                     client,
                     data_gpu,
                     &all_indices,
@@ -2033,7 +1826,7 @@ where
         let change_floor = (n / 10_000).max(1) as u32;
 
         let limits = GpuLimits::from_client(client);
-        let assign_alt_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
+        let assign_alt_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
         let (cnt_gx, cnt_gy) = grid_2d((n as u32).div_ceil(WORKGROUP_SIZE_X), &limits)?;
 
         for iter in 0..params.iters {
@@ -2044,7 +1837,7 @@ where
                 (&assign_alt_gpu, &assign_gpu)
             };
 
-            lloyd_step::<S, A, R>(
+            lloyd_step::<S, A>(
                 client,
                 data_gpu,
                 cent_gpu,
@@ -2063,7 +1856,7 @@ where
             )?;
 
             if params.balanced {
-                balance_centroids::<S, A, R>(
+                balance_centroids::<S, A>(
                     client,
                     data_gpu,
                     &all_indices,
@@ -2079,9 +1872,9 @@ where
             }
 
             // Zeroed single-element atomic counter, recreated per iter.
-            let changed_gpu = GpuTensor::<R, u32>::from_slice(&[0u32], vec![1], client)?;
+            let changed_gpu = GpuTensor::<u32>::from_slice(&[0u32], vec![1], client)?;
             unsafe {
-                count_changed::launch_unchecked::<R>(
+                count_changed::launch_unchecked(
                     client,
                     CubeCount::Static(cnt_gx, cnt_gy, 1),
                     CubeDim::new_1d(WORKGROUP_SIZE_X),
@@ -2117,7 +1910,7 @@ where
 
     // Final assignment against the converged centroids. cnorm_gpu is already
     // consistent with cent_gpu (refreshed at the end of the last lloyd_step).
-    flash_assign_device::<S, A, R>(
+    flash_assign_device::<S, A>(
         client,
         data_gpu,
         cent_gpu,
@@ -2179,12 +1972,12 @@ where
 /// * `CubeclUtils` if a dispatch or an allocation busts a device limit, or a
 ///   read-back fails during initialisation or the loop.
 #[allow(clippy::too_many_arguments)]
-fn init_and_run<S, A, R>(
-    client: &ComputeClient<R>,
-    data_gpu: &GpuTensor<R, S>,
+fn init_and_run<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
     data_host: &[A],
     norms_host: &[A],
-    pnorm_gpu: &GpuTensor<R, A>,
+    pnorm_gpu: &GpuTensor<A>,
     n: usize,
     n_centroids: usize,
     dim_padded: usize,
@@ -2195,7 +1988,6 @@ fn init_and_run<S, A, R>(
     verbose: bool,
 ) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
 where
-    R: Runtime,
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
 {
@@ -2210,7 +2002,7 @@ where
             if verbose {
                 println!("  Initialising centroids via k-means|| (GPU)");
             }
-            kmeans_parallel_init_gpu::<S, A, R>(
+            kmeans_parallel_init_gpu::<S, A>(
                 client,
                 data_gpu,
                 data_host,
@@ -2225,19 +2017,18 @@ where
         }
     };
 
-    let cent_gpu =
-        GpuTensor::<R, A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
+    let cent_gpu = GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
 
     let cnorm_gpu = if *dist == Dist::Cosine {
         let cnorms: Vec<A> = (0..n_centroids)
             .map(|c| A::calculate_l2_norm(&centroids[c * dim_padded..(c + 1) * dim_padded]))
             .collect();
-        GpuTensor::<R, A>::from_slice(&cnorms, vec![n_centroids], client)?
+        GpuTensor::<A>::from_slice(&cnorms, vec![n_centroids], client)?
     } else {
-        GpuTensor::<R, A>::from_slice(&[A::one()], vec![1], client)?
+        GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
     };
 
-    run_kmeans_loop::<S, A, R>(
+    run_kmeans_loop::<S, A>(
         client,
         data_gpu,
         &cent_gpu,
@@ -2307,17 +2098,16 @@ where
 /// * `CubeclUtils` if a dispatch grid is over the device's cube-count limit
 ///   or an upload busts the per-binding size limit, or a read-back fails.
 #[allow(clippy::too_many_arguments)]
-pub fn k_means_clusters_gpu<T, R>(
+pub fn k_means_clusters_gpu<T>(
     data: impl AnnMatrix<T>,
     dist: &str,
     n_centroids: usize,
     kmeans_params: Option<KMeansGpuParams>,
     seed: usize,
-    device: R::Device,
+    device: Device,
     verbose: bool,
 ) -> Result<(Mat<T>, Vec<usize>), AnnSearchErrors>
 where
-    R: Runtime,
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
     let metric = parse_ann_dist(dist).unwrap_or_else(|| {
@@ -2329,9 +2119,9 @@ where
     });
 
     let (data_flat, n, dim) = data.into_row_major();
-    let client = R::client(&device);
+    let client = device.client();
 
-    let (centroids, assignments) = k_means_gpu_flat::<T, R>(
+    let (centroids, assignments) = k_means_gpu_flat::<T>(
         &data_flat,
         dim,
         n,
@@ -2455,7 +2245,7 @@ where
 /// * `CubeclUtils` if a dispatch grid is over the device's cube-count limit
 ///   or an upload busts the per-binding size limit, or a read-back fails
 #[allow(clippy::too_many_arguments)]
-pub fn k_means_gpu_flat<T, R>(
+pub fn k_means_gpu_flat<T>(
     data: &[T],
     dim: usize,
     n: usize,
@@ -2463,11 +2253,10 @@ pub fn k_means_gpu_flat<T, R>(
     metric: &Dist,
     params: Option<KMeansGpuParams>,
     seed: usize,
-    client: &ComputeClient<R>,
+    client: &Client,
     verbose: bool,
 ) -> Result<(Vec<T>, Vec<usize>), AnnSearchErrors>
 where
-    R: Runtime,
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
     let start = Instant::now();
@@ -2490,10 +2279,9 @@ where
 
     // The Lloyd loop rebuilds a CSR every iteration through a privatised
     // histogram, which is entirely `Atomic::fetch_add`. On a runtime without
-    // u32 atomics -- the CubeCL CPU runtime is the one that matters here, since
-    // the GPU indices' CI tests run on it -- those launches do nothing and
-    // report nothing, so every cluster comes back empty and the centroids never
-    // move. See `atomic_u32_add_supported` for why that failure is silent.
+    // u32 atomics those launches do nothing and report nothing, so every
+    // cluster comes back empty and the centroids never move. See
+    // `atomic_u32_add_supported` for why that failure is silent.
     // Falling back to the CPU k-means keeps the answer correct; only the
     // acceleration is lost.
     if !atomic_u32_add_supported(client) {
@@ -2532,9 +2320,9 @@ where
         Vec::new()
     };
     let pnorm_gpu = if *metric == Dist::Cosine {
-        GpuTensor::<R, T>::from_slice(&norms_host, vec![n], client)?
+        GpuTensor::<T>::from_slice(&norms_host, vec![n], client)?
     } else {
-        GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?
+        GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?
     };
 
     if verbose {
@@ -2561,14 +2349,13 @@ where
             .iter()
             .map(|x| half::f16::from_f32(x.to_f32().unwrap_or(0.0)))
             .collect();
-        let data_gpu =
-            GpuTensor::<R, half::f16>::from_slice(&data_f16, vec![n, dim_padded], client)?;
+        let data_gpu = GpuTensor::<half::f16>::from_slice(&data_f16, vec![n, dim_padded], client)?;
 
         if verbose {
             println!("  ... moved data to GPU (fp16): {:.2?}", start.elapsed());
         }
 
-        init_and_run::<half::f16, T, R>(
+        init_and_run::<half::f16, T>(
             client,
             &data_gpu,
             &data_padded,
@@ -2584,13 +2371,13 @@ where
             verbose,
         )?
     } else {
-        let data_gpu = GpuTensor::<R, T>::from_slice(&data_padded, vec![n, dim_padded], client)?;
+        let data_gpu = GpuTensor::<T>::from_slice(&data_padded, vec![n, dim_padded], client)?;
 
         if verbose {
             println!("  ... moved data to GPU: {:.2?}", start.elapsed());
         }
 
-        init_and_run::<T, T, R>(
+        init_and_run::<T, T>(
             client,
             &data_gpu,
             &data_padded,
@@ -2649,7 +2436,7 @@ where
 ///
 /// Flat `n_centroids * dim` row-major centroid buffer, unpadded.
 #[allow(clippy::too_many_arguments)]
-pub fn train_centroids_gpu<T, R>(
+pub fn train_centroids_gpu<T>(
     data: &[T],
     dim: usize,
     n: usize,
@@ -2657,14 +2444,13 @@ pub fn train_centroids_gpu<T, R>(
     metric: &Dist,
     params: Option<KMeansGpuParams>,
     seed: usize,
-    client: &ComputeClient<R>,
+    client: &Client,
     verbose: bool,
 ) -> Result<Vec<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
-    k_means_gpu_flat::<T, R>(
+    k_means_gpu_flat::<T>(
         data,
         dim,
         n,
@@ -2704,17 +2490,16 @@ where
 /// * `DistanceNotSupported` for `Manhattan`
 /// * `CubeclUtils` if the dispatch or an upload busts a device limit
 #[allow(clippy::too_many_arguments)]
-pub fn assign_all_gpu<T, R>(
+pub fn assign_all_gpu<T>(
     data: &[T],
     dim: usize,
     n: usize,
     centroids: &[T],
     n_centroids: usize,
     metric: &Dist,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<Vec<usize>, AnnSearchErrors>
 where
-    R: Runtime,
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
     if *metric == Dist::Manhattan {
@@ -2733,9 +2518,9 @@ where
         centroids.to_vec()
     };
 
-    let data_gpu = GpuTensor::<R, T>::from_slice(&data_padded, vec![n, dim_padded], client)?;
+    let data_gpu = GpuTensor::<T>::from_slice(&data_padded, vec![n, dim_padded], client)?;
     let cent_gpu =
-        GpuTensor::<R, T>::from_slice(&cents_padded, vec![n_centroids, dim_padded], client)?;
+        GpuTensor::<T>::from_slice(&cents_padded, vec![n_centroids, dim_padded], client)?;
 
     let (pnorm_gpu, cnorm_gpu) = if *metric == Dist::Cosine {
         let pnorms: Vec<T> = (0..n)
@@ -2745,19 +2530,19 @@ where
             .map(|c| T::calculate_l2_norm(&cents_padded[c * dim_padded..(c + 1) * dim_padded]))
             .collect();
         (
-            GpuTensor::<R, T>::from_slice(&pnorms, vec![n], client)?,
-            GpuTensor::<R, T>::from_slice(&cnorms, vec![n_centroids], client)?,
+            GpuTensor::<T>::from_slice(&pnorms, vec![n], client)?,
+            GpuTensor::<T>::from_slice(&cnorms, vec![n_centroids], client)?,
         )
     } else {
         (
-            GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?,
-            GpuTensor::<R, T>::from_slice(&[T::one()], vec![1], client)?,
+            GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?,
+            GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?,
         )
     };
 
-    let assign_gpu = GpuTensor::<R, u32>::empty(vec![n], client)?;
+    let assign_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
 
-    flash_assign_device::<T, T, R>(
+    flash_assign_device::<T, T>(
         client,
         &data_gpu,
         &cent_gpu,
@@ -2778,17 +2563,21 @@ where
 // Tests //
 ///////////
 
-/// Tests that run on the CubeCL CPU runtime, so they need no GPU and stay on
-/// the plain `gpu` feature. The IVF GPU build drives this k-means on
-/// `CpuRuntime` in CI, which is a different code path from the wgpu tests
-/// below and has caught real out-of-bounds writes that wgpu silently absorbed.
-#[cfg(all(test, feature = "gpu-cpu"))]
-mod cpu_runtime_tests {
+#[cfg(all(test, feature = "gpu-tests"))]
+mod entry_point_tests {
     use super::*;
-    use cubecl::cpu::{CpuDevice, CpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
+
+    fn try_device() -> Option<WgpuDevice> {
+        let device = WgpuDevice::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cubecl::Device::from(device.clone()).client();
+        }));
+        result.ok().map(|_| device)
+    }
 
     #[test]
-    fn test_kmeans_gpu_cpu_runtime_small_n_many_clusters() {
+    fn test_kmeans_gpu_small_n_many_clusters() {
         // The shape the IVF GPU tests build: 50 points into 20 cells, so most
         // clusters hold one or two points and several histogram cubes see none.
         let (n, dim, k) = (50usize, 4usize, 20usize);
@@ -2796,10 +2585,14 @@ mod cpu_runtime_tests {
             .map(|idx| ((idx / dim) + (idx % dim)) as f32 / 10.0)
             .collect();
 
-        let client = CpuRuntime::client(&CpuDevice);
+        let Some(device) = try_device() else {
+            return;
+        };
+
+        let client = cubecl::Device::from(device).client();
         let params = KMeansGpuParams::new(10, None, true, false);
 
-        let (centroids, assignments) = k_means_gpu_flat::<f32, CpuRuntime>(
+        let (centroids, assignments) = k_means_gpu_flat::<f32>(
             &data,
             dim,
             n,
@@ -2818,16 +2611,20 @@ mod cpu_runtime_tests {
     }
 
     #[test]
-    fn test_kmeans_gpu_cpu_runtime_small_n_many_clusters_random_init() {
+    fn test_kmeans_gpu_small_n_many_clusters_random_init() {
         let (n, dim, k) = (50usize, 4usize, 20usize);
         let data: Vec<f32> = (0..n * dim)
             .map(|idx| ((idx / dim) + (idx % dim)) as f32 / 10.0)
             .collect();
 
-        let client = CpuRuntime::client(&CpuDevice);
+        let Some(device) = try_device() else {
+            return;
+        };
+
+        let client = cubecl::Device::from(device).client();
         let params = KMeansGpuParams::new(10, Some(KMeansInit::Random), true, false);
 
-        let (centroids, assignments) = k_means_gpu_flat::<f32, CpuRuntime>(
+        let (centroids, assignments) = k_means_gpu_flat::<f32>(
             &data,
             dim,
             n,
@@ -2844,45 +2641,25 @@ mod cpu_runtime_tests {
         assert_eq!(assignments.len(), n);
     }
 
-    /// Pins the reason [`kmeans_cpu_fallback`] exists.
-    ///
-    /// The CSR stage of the Lloyd loop is all `Atomic::fetch_add`, and this
-    /// runtime has no u32 atomics, so those launches silently no-op: every
-    /// cluster reads back empty, the centroids never move, and
-    /// `scatter_csr_privatised` then writes through uninitialised cursors,
-    /// which segfaults rather than merely producing a wrong answer. If this
-    /// assertion ever flips because CubeCL grew CPU atomics, the fallback can
-    /// go -- but delete it deliberately, having re-run the CSR on this runtime,
-    /// not because it looks redundant.
-    #[test]
-    fn test_cpu_runtime_has_no_u32_atomics() {
-        let client = CpuRuntime::client(&CpuDevice);
-        assert!(
-            !atomic_u32_add_supported(&client),
-            "CPU runtime reports u32 atomics; re-check whether the k-means CPU \
-             fallback is still needed"
-        );
-    }
-
     /// Degenerate cosine data through the full entry point.
     ///
-    /// Note this does **not** exercise `kmeans_pp_on_candidates`: this runtime
-    /// has no u32 atomics, so `k_means_gpu_flat` takes the CPU fallback before
-    /// reaching it. `test_kmeans_pp_pads_to_k_from_a_single_candidate` covers
-    /// the padding directly. What this does cover is that the entry point
-    /// returns a correctly shaped result on data that defeats the D^2
-    /// weighting.
+    /// The entry point must return a correctly shaped result on data that
+    /// defeats the D^2 weighting.
     #[test]
-    fn test_kmeans_gpu_cpu_runtime_degenerate_cosine() {
+    fn test_kmeans_gpu_degenerate_cosine() {
         // Every row is the same direction, so under cosine every D^2 weight is
         // zero and k-means|| draws no candidates at all.
         let (n, dim, k) = (40usize, 4usize, 5usize);
         let data: Vec<f32> = (0..n * dim).map(|idx| (idx / dim) as f32 + 1.0).collect();
 
-        let client = CpuRuntime::client(&CpuDevice);
+        let Some(device) = try_device() else {
+            return;
+        };
+
+        let client = cubecl::Device::from(device).client();
         let params = KMeansGpuParams::new(10, Some(KMeansInit::KMeansParallel), true, false);
 
-        let (centroids, assignments) = k_means_gpu_flat::<f32, CpuRuntime>(
+        let (centroids, assignments) = k_means_gpu_flat::<f32>(
             &data,
             dim,
             n,
@@ -2933,7 +2710,7 @@ mod cpu_runtime_tests {
     }
 
     #[test]
-    fn test_assign_all_gpu_cpu_runtime_matches_cpu_assignment() {
+    fn test_assign_all_gpu_matches_cpu_assignment() {
         // `assign_all_gpu` replaced `assign_all_parallel` in the IVF build, so
         // the two must agree exactly on a case with unambiguous nearest
         // centroids.
@@ -2945,8 +2722,12 @@ mod cpu_runtime_tests {
             .map(|idx| (idx / dim) as f32 * 100.0 + (idx % dim) as f32 * 0.01)
             .collect();
 
-        let client = CpuRuntime::client(&CpuDevice);
-        let gpu = assign_all_gpu::<f32, CpuRuntime>(
+        let Some(device) = try_device() else {
+            return;
+        };
+
+        let client = cubecl::Device::from(device).client();
+        let gpu = assign_all_gpu::<f32>(
             &data,
             dim,
             n,
@@ -2979,12 +2760,12 @@ mod tests {
     use super::*;
     use crate::utils::dist::compute_l2_norm;
     use approx::assert_relative_eq;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuDevice;
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }))
         .ok()
         .map(|_| device)
@@ -3000,28 +2781,26 @@ mod tests {
         metric: &Dist,
         device: &WgpuDevice,
     ) -> Vec<usize> {
-        let client = WgpuRuntime::client(device);
-        let data_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(data, vec![n, dim], &client).unwrap();
-        let cent_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(cents, vec![k, dim], &client).unwrap();
-        let assign_gpu = GpuTensor::<WgpuRuntime, u32>::empty(vec![n], &client).unwrap();
+        let client = cubecl::Device::from(device.clone()).client();
+        let data_gpu = GpuTensor::<f32>::from_slice(data, vec![n, dim], &client).unwrap();
+        let cent_gpu = GpuTensor::<f32>::from_slice(cents, vec![k, dim], &client).unwrap();
+        let assign_gpu = GpuTensor::<u32>::empty(vec![n], &client).unwrap();
 
         let pnorm_gpu = if *metric == Dist::Cosine {
             let v: Vec<f32> = (0..n)
                 .map(|i| compute_l2_norm(&data[i * dim..(i + 1) * dim]))
                 .collect();
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&v, vec![n], &client).unwrap()
+            GpuTensor::<f32>::from_slice(&v, vec![n], &client).unwrap()
         } else {
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[1.0f32], vec![1], &client).unwrap()
+            GpuTensor::<f32>::from_slice(&[1.0f32], vec![1], &client).unwrap()
         };
         let cnorm_gpu = if *metric == Dist::Cosine {
             let v: Vec<f32> = (0..k)
                 .map(|c| compute_l2_norm(&cents[c * dim..(c + 1) * dim]))
                 .collect();
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&v, vec![k], &client).unwrap()
+            GpuTensor::<f32>::from_slice(&v, vec![k], &client).unwrap()
         } else {
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[1.0f32], vec![1], &client).unwrap()
+            GpuTensor::<f32>::from_slice(&[1.0f32], vec![1], &client).unwrap()
         };
 
         flash_assign_device(
@@ -3056,29 +2835,24 @@ mod tests {
         dim: usize,
         device: &WgpuDevice,
     ) -> Vec<f32> {
-        let client = WgpuRuntime::client(device);
+        let client = cubecl::Device::from(device.clone()).client();
         let cube_count = 64usize;
 
-        let data_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(data, vec![n, dim], &client).unwrap();
-        let assign_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(assignments, vec![n], &client).unwrap();
-        let cent_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(init_cents, vec![k, dim], &client).unwrap();
-        let privatised_counts = GpuTensor::<WgpuRuntime, u32>::from_slice(
+        let data_gpu = GpuTensor::<f32>::from_slice(data, vec![n, dim], &client).unwrap();
+        let assign_gpu = GpuTensor::<u32>::from_slice(assignments, vec![n], &client).unwrap();
+        let cent_gpu = GpuTensor::<f32>::from_slice(init_cents, vec![k, dim], &client).unwrap();
+        let privatised_counts = GpuTensor::<u32>::from_slice(
             &vec![0u32; cube_count * k],
             vec![cube_count * k],
             &client,
         )
         .unwrap();
-        let counts =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; k], vec![k], &client).unwrap();
+        let counts = GpuTensor::<u32>::from_slice(&vec![0u32; k], vec![k], &client).unwrap();
         let offsets =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; k + 1], vec![k + 1], &client)
-                .unwrap();
-        let all_indices = GpuTensor::<WgpuRuntime, u32>::empty(vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; k + 1], vec![k + 1], &client).unwrap();
+        let all_indices = GpuTensor::<u32>::empty(vec![n], &client).unwrap();
 
-        build_csr_gpu_privatised::<WgpuRuntime>(
+        build_csr_gpu_privatised(
             &assign_gpu,
             n,
             k,
@@ -3090,7 +2864,7 @@ mod tests {
             &client,
         )
         .unwrap();
-        segmented_update::<WgpuRuntime, f32, f32>(
+        segmented_update::<f32, f32>(
             &data_gpu,
             &all_indices,
             &offsets,
@@ -3238,26 +3012,23 @@ mod tests {
     #[test]
     fn test_csr_privatised_matches_cpu() {
         let Some(device) = try_device() else { return };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let assignments = vec![0u32, 1, 0, 2, 1, 0, 2, 2];
         let (n, k, cube_count) = (assignments.len(), 3usize, 64usize);
 
-        let assign_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&assignments, vec![n], &client).unwrap();
-        let privatised_counts = GpuTensor::<WgpuRuntime, u32>::from_slice(
+        let assign_gpu = GpuTensor::<u32>::from_slice(&assignments, vec![n], &client).unwrap();
+        let privatised_counts = GpuTensor::<u32>::from_slice(
             &vec![0u32; cube_count * k],
             vec![cube_count * k],
             &client,
         )
         .unwrap();
-        let counts =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; k], vec![k], &client).unwrap();
+        let counts = GpuTensor::<u32>::from_slice(&vec![0u32; k], vec![k], &client).unwrap();
         let offsets =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; k + 1], vec![k + 1], &client)
-                .unwrap();
-        let all_indices = GpuTensor::<WgpuRuntime, u32>::empty(vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; k + 1], vec![k + 1], &client).unwrap();
+        let all_indices = GpuTensor::<u32>::empty(vec![n], &client).unwrap();
 
-        build_csr_gpu_privatised::<WgpuRuntime>(
+        build_csr_gpu_privatised(
             &assign_gpu,
             n,
             k,
@@ -3442,13 +3213,13 @@ mod tests {
         let mat = Mat::<f32>::from_fn(n, dim, |i, j| ((i * 31 + j * 17) % 100) as f32 * 0.01);
         let params = KMeansGpuParams::new(10, None, true, false);
 
-        let (cents, assignments) = k_means_clusters_gpu::<f32, WgpuRuntime>(
+        let (cents, assignments) = k_means_clusters_gpu::<f32>(
             mat.as_ref(),
             "euclidean",
             k,
             Some(params),
             42,
-            device.clone(),
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -3514,13 +3285,13 @@ mod tests {
         let mat = Mat::<f32>::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         let params = KMeansGpuParams::new(20, Some(KMeansInit::KMeansParallel), true, false);
-        let (_, assignments) = k_means_clusters_gpu::<f32, WgpuRuntime>(
+        let (_, assignments) = k_means_clusters_gpu::<f32>(
             mat.as_ref(),
             "euclidean",
             n_blobs,
             Some(params),
             7,
-            device,
+            device.clone().into(),
             false,
         )
         .unwrap();
@@ -3559,13 +3330,13 @@ mod tests {
         let params = KMeansGpuParams::new(10, Some(KMeansInit::KMeansParallel), true, false);
 
         let run = || {
-            k_means_clusters_gpu::<f32, WgpuRuntime>(
+            k_means_clusters_gpu::<f32>(
                 mat.as_ref(),
                 "cosine",
                 k,
                 Some(params),
                 99,
-                device.clone(),
+                device.clone().into(),
                 false,
             )
             .unwrap()
@@ -3616,13 +3387,13 @@ mod tests {
         let mat = Mat::<f32>::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         let largest_cluster = |params: KMeansGpuParams| {
-            let (_, assignments) = k_means_clusters_gpu::<f32, WgpuRuntime>(
+            let (_, assignments) = k_means_clusters_gpu::<f32>(
                 mat.as_ref(),
                 "euclidean",
                 k,
                 Some(params),
                 7,
-                device.clone(),
+                device.clone().into(),
                 false,
             )
             .unwrap();

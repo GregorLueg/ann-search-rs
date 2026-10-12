@@ -1,0 +1,2 @@
+dataset,threads,library,method,param,build_s,build_peak_mib,resident_mib,query_s,qps,recall
+glove-100-angular,10,faiss,exhaustive,-,0.17527295899344608,913.1569366455078,452.9072570800781,2.6100812079967,3831.2984168317275,1.0

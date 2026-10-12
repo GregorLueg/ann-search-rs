@@ -6,7 +6,7 @@
 
 #![allow(missing_docs)]
 
-use cubecl::frontend::{Float, SharedMemory};
+use cubecl::frontend::{Float, Shared};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -130,194 +130,6 @@ impl Default for CagraGpuSearchParams {
     }
 }
 
-///////////////////////////
-// Distance probe kernel //
-///////////////////////////
-
-/// Probe kernel: loads a query vector into scalar shared memory,
-/// computes distance to a single database vector from global memory.
-///
-/// ### Params
-///
-/// * `vectors` - Database vectors `[n_nodes, dim/LINE_SIZE]` as `Line<F>`
-/// * `query` - Query vector `[dim/LINE_SIZE]` as `Line<F>`
-/// * `out_dist` - Output scalar distance `[1]`
-/// * `out_shared` - Output copy of the query shared memory `[dim_scalars]`
-/// * `target_node` - Index of the database vector to compare against
-/// * `use_cosine` - If true, computes dot product instead of squared L2 (comptime)
-/// * `dim_lines` - Number of `Line<F>` elements per vector row (comptime)
-///
-/// ### Returns
-///
-/// Writes computed distance to `out_dist[0]` and shared memory contents to
-/// `out_shared`. Both written by thread 0 only.
-///
-/// ### Grid mapping
-///
-/// * Single workgroup `(1,1,1)`, result written by thread 0
-#[cube(launch_unchecked)]
-fn probe_query_distance<F: Float, N: Size>(
-    vectors: &Tensor<Vector<F, N>>,
-    query: &Tensor<Vector<F, N>>,
-    out_dist: &mut Tensor<F>,
-    out_shared: &mut Tensor<F>,
-    target_node: u32,
-    #[comptime] use_cosine: bool,
-    #[comptime] dim_lines: usize,
-) {
-    let tx = UNIT_POS_X;
-    let dim_scalars = dim_lines * 4usize;
-
-    // Load query vector into scalar shared memory (all threads cooperate)
-    let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
-
-    let mut idx_load = tx as usize;
-    while idx_load < dim_scalars {
-        let line_idx = idx_load / 4usize;
-        let lane = idx_load % 4usize;
-        let line_val = query[line_idx];
-        sq_vec[idx_load] = line_val[lane];
-        idx_load += WORKGROUP_SIZE_X as usize;
-    }
-    sync_cube();
-
-    // Thread 0: compute distance from shared-memory query to global-memory target
-    if tx == 0u32 {
-        // Dump shared memory contents for verification
-        let mut s = 0usize;
-        while s < dim_scalars {
-            out_shared[s] = sq_vec[s];
-            s += 1usize;
-        }
-
-        // Compute distance: query (shared) vs target (global)
-        let mut sum = F::new(0.0_f32);
-        let mut s2 = 0usize;
-        while s2 < dim_scalars {
-            let line_idx = s2 / 4usize;
-            let lane = s2 % 4usize;
-            let line_val = vectors[target_node as usize * dim_lines + line_idx];
-            let vb = line_val[lane];
-            let va = sq_vec[s2];
-
-            if use_cosine {
-                sum += va * vb;
-            } else {
-                let diff = va - vb;
-                sum += diff * diff;
-            }
-            s2 += 1usize;
-        }
-
-        out_dist[0usize] = sum;
-    }
-}
-
-/// Hash table probe: insert node IDs, then query for presence.
-///
-/// Thread 0 inserts `n_insert` IDs from `insert_ids` into the hash table,
-/// then probes for `n_probe` IDs from `probe_ids`, writing 1 (found) or
-/// 0 (not found) into `probe_results`.
-///
-/// ### Params
-///
-/// * `insert_ids` - Node IDs to insert `[n_insert]`
-/// * `probe_ids` - Node IDs to probe for `[n_probe]`
-/// * `probe_results` - Output presence flags `[n_probe]`; 1 = found, 0 = absent
-/// * `n_insert` - Number of IDs to insert
-/// * `n_probe` - Number of IDs to probe
-/// * `hash_size` - Hash table capacity (comptime, must be a power of 2)
-///
-/// ### Returns
-///
-/// Writes per-probe presence flags into `probe_results`.
-///
-/// ### Grid mapping
-///
-/// * Single workgroup `(1,1,1)`, all work done by thread 0
-#[cube(launch_unchecked)]
-fn probe_hash_table(
-    insert_ids: &Tensor<u32>,
-    probe_ids: &Tensor<u32>,
-    probe_results: &mut Tensor<u32>,
-    n_insert: u32,
-    n_probe: u32,
-    #[comptime] hash_size: usize,
-) {
-    let tx = UNIT_POS_X;
-    let hash_mask = hash_size as u32 - 1u32;
-    let sentinel = 0x7FFFFFFFu32;
-
-    let mut s_hash = SharedMemory::<u32>::new(hash_size);
-
-    // All threads cooperate to clear the hash table
-    let mut i = tx as usize;
-    while i < hash_size {
-        s_hash[i] = sentinel;
-        i += WORKGROUP_SIZE_X as usize;
-    }
-    sync_cube();
-
-    // Thread 0: insert all IDs
-    if tx == 0u32 {
-        let mut ins = 0u32;
-        while ins < n_insert {
-            let node_id = insert_ids[ins as usize];
-            let mut slot = node_id & hash_mask;
-            let mut attempts = 0u32;
-
-            // Linear probe until we find an empty slot or the ID already present
-            let mut done = false;
-            while !done && attempts < hash_size as u32 {
-                let existing = s_hash[slot as usize];
-                if existing == sentinel {
-                    // Empty slot -- insert
-                    s_hash[slot as usize] = node_id;
-                    done = true;
-                } else if existing == node_id {
-                    // Already present -- skip
-                    done = true;
-                } else {
-                    // Collision -- linear probe
-                    slot = (slot + 1u32) & hash_mask;
-                    attempts += 1u32;
-                }
-            }
-            ins += 1u32;
-        }
-    }
-    sync_cube();
-
-    // Thread 0: probe for each ID
-    if tx == 0u32 {
-        let mut p = 0u32;
-        while p < n_probe {
-            let node_id = probe_ids[p as usize];
-            let mut slot = node_id & hash_mask;
-            let mut attempts = 0u32;
-            let mut found = 0u32;
-
-            let mut done = false;
-            while !done && attempts < hash_size as u32 {
-                let existing = s_hash[slot as usize];
-                if existing == node_id {
-                    found = 1u32;
-                    done = true;
-                } else if existing == sentinel {
-                    // Empty slot -- not present
-                    done = true;
-                } else {
-                    slot = (slot + 1u32) & hash_mask;
-                    attempts += 1u32;
-                }
-            }
-
-            probe_results[p as usize] = found;
-            p += 1u32;
-        }
-    }
-}
-
 /////////////////
 // Beam search //
 /////////////////
@@ -332,8 +144,6 @@ fn probe_hash_table(
 /// ### Params
 ///
 /// * `vectors` - Database vectors `[n_nodes, dim/N]` as `Vector<F, N>`
-/// * `norms` - Pre-computed L2 norms `[n_nodes]` (ignored when `use_cosine` is
-///   false)
 /// * `graph` - CAGRA navigational graph `[n_nodes, k_graph]` of neighbour IDs
 /// * `queries` - Query vectors `[n_queries, dim/N]` as `Vector<F, N>`
 /// * `entry_points` - Initial seed nodes `[n_queries, n_entry]`
@@ -344,7 +154,8 @@ fn probe_hash_table(
 /// * `n_nodes` - Total number of nodes in the graph
 /// * `k_out` - Number of neighbours to return per query
 /// * `k_graph` - Degree of the navigational graph (comptime)
-/// * `use_cosine` - Whether to compute cosine distance (comptime)
+/// * `use_cosine` - Whether to compute cosine distance, `1 - dot` on
+///   unit-normalised vectors and queries (comptime)
 /// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
 /// * `beam_width` - Number of active candidates maintained during search
 ///   (comptime)
@@ -359,7 +170,6 @@ fn probe_hash_table(
 #[cube(launch_unchecked)]
 pub fn cagra_beam_search<F: Float, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     graph: &Tensor<u32>,
     queries: &Tensor<Vector<F, N>>,
     entry_points: &Tensor<u32>,
@@ -386,7 +196,10 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let lanes = LINE_SIZE;
     let tx = UNIT_POS_X;
     let dim_scalars = dim_lines * lanes;
-    let hash_mask = hash_size as u32 - 1u32;
+    // cubecl 0.11: a comptime cast inside a short-circuit `while` condition fails
+    // IR verification ("not dominated by definition"), so it is hoisted here.
+    let hash_cap = hash_size as u32;
+    let hash_mask = hash_cap - 1u32;
     let sentinel = 0x7FFFFFFFu32;
     let f_max = F::new(999999999.0_f32);
     let bw = beam_width as u32;
@@ -395,16 +208,16 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     let expand_u32 = expand_per_iter as u32;
 
     // shared memory set up
-    let mut sq_vec = SharedMemory::<F>::new(dim_scalars);
-    let mut s_cand_dist = SharedMemory::<F>::new(beam_width);
-    let mut s_cand_idx = SharedMemory::<u32>::new(beam_width);
-    let mut s_cand_expanded = SharedMemory::<u32>::new(beam_width);
-    let mut s_hash = SharedMemory::<u32>::new(hash_size);
-    let mut s_nbr_idx = SharedMemory::<u32>::new(total_slots);
-    let mut s_nbr_dist = SharedMemory::<F>::new(total_slots);
-    let mut s_active_flag = SharedMemory::<u32>::new(1usize);
-    let mut s_num_cands = SharedMemory::<u32>::new(1usize);
-    let mut s_query_norm = SharedMemory::<F>::new(1usize);
+    let mut sq_vec = Shared::<[F]>::new_slice(dim_scalars);
+    let mut s_cand_dist = Shared::<[F]>::new_slice(beam_width);
+    let mut s_cand_idx = Shared::<[u32]>::new_slice(beam_width);
+    let mut s_cand_expanded = Shared::<[u32]>::new_slice(beam_width);
+    let mut s_hash = Shared::<[u32]>::new_slice(hash_size);
+    let mut s_nbr_idx = Shared::<[u32]>::new_slice(total_slots);
+    let mut s_nbr_dist = Shared::<[F]>::new_slice(total_slots);
+    let mut s_active_flag = Shared::<[u32]>::new_slice(1usize);
+    let mut s_num_cands = Shared::<[u32]>::new_slice(1usize);
+    let mut s_hash_count = Shared::<[u32]>::new_slice(1usize);
 
     let q_line_offset = q_idx as usize * dim_lines;
     let mut il = tx as usize;
@@ -412,7 +225,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         let line_idx = il / lanes;
         let lane = il % lanes;
         let line_val = queries[q_line_offset + line_idx];
-        sq_vec[il] = line_val[lane];
+        sq_vec[il] = line_val.extract_dynamic(lane);
         il += WORKGROUP_SIZE_X as usize;
     }
 
@@ -432,17 +245,6 @@ pub fn cagra_beam_search<F: Float, N: Size>(
     sync_cube();
 
     if tx == 0u32 {
-        if use_cosine {
-            let mut norm_sq = F::new(0.0_f32);
-            let mut s = 0usize;
-            while s < dim_scalars {
-                let v = sq_vec[s];
-                norm_sq += v * v;
-                s += 1usize;
-            }
-            s_query_norm[0usize] = F::sqrt(norm_sq);
-        }
-
         let entry_base = q_idx as usize * n_entry;
         let mut num_cands = 0u32;
 
@@ -453,8 +255,8 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 let mut hs = node_id & hash_mask;
                 let mut ha = 0u32;
                 let mut hd = false;
-                let mut is_new: bool = false;
-                while !hd && ha < hash_size as u32 {
+                let mut is_new = false;
+                while !hd && ha < hash_cap {
                     let ex = s_hash[hs as usize];
                     if ex == sentinel {
                         s_hash[hs as usize] = node_id;
@@ -476,18 +278,18 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         if use_cosine {
                             #[unroll]
                             for lane in 0..lanes {
-                                sum += sq_vec[s_off + lane] * lv[lane];
+                                sum += sq_vec[s_off + lane] * lv.extract(lane);
                             }
                         } else {
                             #[unroll]
                             for lane in 0..lanes {
-                                let d = sq_vec[s_off + lane] - lv[lane];
+                                let d = sq_vec[s_off + lane] - lv.extract(lane);
                                 sum += d * d;
                             }
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[node_id as usize])
+                        F::new(1.0_f32) - sum
                     } else {
                         sum
                     };
@@ -518,19 +320,60 @@ pub fn cagra_beam_search<F: Float, N: Size>(
             e += 1usize;
         }
         s_num_cands[0usize] = num_cands;
+        // Every entry that went in was new, so the beam and the table agree.
+        s_hash_count[0usize] = num_cands;
     }
 
     sync_cube();
 
+    // Forget the table before this iteration's inserts could push it past
+    // three quarters full. Linear probing degrades sharply above that, and a
+    // full table drops every new neighbour, which caps the search at
+    // `hash_size` visited nodes whatever the beam width. Re-inserting the beam
+    // keeps its members deduplicated; any other node seen again is worse than
+    // the beam's worst (the worst only ever improves), so the merge skips it.
+    let reset_at = (hash_size * 3 / 4) as u32;
+    let total_slots_u32 = total_slots as u32;
+
     let max_iter_u32 = max_iters as u32;
-    let mut iter: u32 = 0u32;
-    let mut last_iter: u32 = 0u32;
+    let mut iter = 0u32;
+    let mut last_iter = 0u32;
     while iter < max_iter_u32 {
         if tx == 0u32 {
             last_iter = iter;
             s_active_flag[0usize] = sentinel;
             let nc = s_num_cands[0usize];
-            let mut active_count: u32 = 0u32;
+            let mut active_count = 0u32;
+            let mut hash_count = s_hash_count[0usize];
+
+            if hash_count + total_slots_u32 > reset_at {
+                let mut hr = 0usize;
+                while hr < hash_size {
+                    s_hash[hr] = sentinel;
+                    hr += 1usize;
+                }
+                hash_count = 0u32;
+                let mut bi = 0u32;
+                while bi < nc {
+                    let node = s_cand_idx[bi as usize];
+                    let mut hs = node & hash_mask;
+                    let mut ha = 0u32;
+                    let mut placed = false;
+                    // Bounded like every other probe: a planner-shrunk table
+                    // can be smaller than the beam on a small device.
+                    while !placed && ha < hash_cap {
+                        if s_hash[hs as usize] == sentinel {
+                            s_hash[hs as usize] = node;
+                            placed = true;
+                        } else {
+                            hs = (hs + 1u32) & hash_mask;
+                            ha += 1u32;
+                        }
+                    }
+                    hash_count += 1u32;
+                    bi += 1u32;
+                }
+            }
 
             // Claim up to P unexpanded candidates in beam order (ascending dist).
             let mut fc = 0u32;
@@ -548,8 +391,8 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             let mut hs = nbr & hash_mask;
                             let mut ha = 0u32;
                             let mut hd = false;
-                            let mut is_new: bool = false;
-                            while !hd && ha < hash_size as u32 {
+                            let mut is_new = false;
+                            while !hd && ha < hash_cap {
                                 let ex = s_hash[hs as usize];
                                 if ex == sentinel {
                                     s_hash[hs as usize] = nbr;
@@ -564,6 +407,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             }
                             if is_new {
                                 s_nbr_idx[slot_base + j] = nbr;
+                                hash_count += 1u32;
                             } else {
                                 s_nbr_idx[slot_base + j] = sentinel;
                             }
@@ -577,6 +421,9 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 fc += 1u32;
             }
 
+            s_hash_count[0usize] = hash_count;
+            let claimed = active_count;
+
             // Pad remaining expansion slots with sentinels.
             while active_count < expand_u32 {
                 let slot_base = active_count as usize * k_graph;
@@ -588,17 +435,11 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                 active_count += 1u32;
             }
 
-            // Terminate when nothing was expanded this iteration, judged by
-            // whether any non-sentinel landed in `s_nbr_idx`.
-            let mut any_real: bool = false;
-            let mut ck = 0usize;
-            while ck < total_slots {
-                if s_nbr_idx[ck] != sentinel {
-                    any_real = true;
-                }
-                ck += 1usize;
-            }
-            if any_real {
+            // Stop once every beam entry has been expanded. A claimed node
+            // whose neighbours were all seen already is not a reason to stop:
+            // unexpanded entries further down the beam may still lead
+            // somewhere.
+            if claimed > 0u32 {
                 s_active_flag[0usize] = 0u32;
             } else {
                 s_active_flag[0usize] = sentinel;
@@ -624,18 +465,18 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                         if use_cosine {
                             #[unroll]
                             for lane in 0..lanes {
-                                sum += sq_vec[s_off + lane] * lv[lane];
+                                sum += sq_vec[s_off + lane] * lv.extract(lane);
                             }
                         } else {
                             #[unroll]
                             for lane in 0..lanes {
-                                let d = sq_vec[s_off + lane] - lv[lane];
+                                let d = sq_vec[s_off + lane] - lv.extract(lane);
                                 sum += d * d;
                             }
                         }
                     }
                     let dist = if use_cosine {
-                        F::new(1.0_f32) - sum / (s_query_norm[0usize] * norms[nbr as usize])
+                        F::new(1.0_f32) - sum
                     } else {
                         sum
                     };
@@ -652,14 +493,14 @@ pub fn cagra_beam_search<F: Float, N: Size>(
         if tx == 0u32 && flag != sentinel {
             let mut nc = s_num_cands[0usize];
 
-            let mut j: usize = 0usize;
+            let mut j = 0usize;
             while j < total_slots {
                 if s_nbr_idx[j] != sentinel {
                     let dist = s_nbr_dist[j];
                     let nbr = s_nbr_idx[j];
 
                     let worst = s_cand_dist[bw_last];
-                    let mut skip: bool = false;
+                    let mut skip = false;
                     if nc >= bw && dist >= worst {
                         skip = true;
                     }
@@ -679,7 +520,7 @@ pub fn cagra_beam_search<F: Float, N: Size>(
                             ip += 1u32;
                         }
 
-                        let mut do_insert: bool = true;
+                        let mut do_insert = true;
                         if insert_pos >= bw {
                             do_insert = false;
                         }
@@ -755,14 +596,14 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 /// * `queries_flat` - Flattened query vectors [n_queries * dim]
 /// * `n_queries` - Number of queries
 /// * `dim` - Original (unpadded) query dimensionality
-/// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE]
-/// * `norms_gpu` - GPU-resident L2 norms `[n]` (Cosine) or a dummy scalar
-///   (Euclidean)
+/// * `vectors_gpu` - GPU-resident database vectors [n, dim_padded/LINE_SIZE],
+///   unit-normalised under cosine
 /// * `graph_gpu` - GPU-resident CAGRA navigational graph [n, k_graph]
 /// * `n` - Number of vectors in the database
 /// * `k_graph` - Degree of the navigational graph
 /// * `k_out` - Number of neighbours to return per query
-/// * `use_cosine` - Whether to use cosine distance
+/// * `use_cosine` - Whether to use cosine distance; the queries are
+///   unit-normalised here
 /// * `seed` - Random seed used when `entry_points` is `None`
 /// * `query_params` - Beam search parameters (beam width, max iterations,
 ///   number of entry points); defaults applied where fields are `None`
@@ -776,13 +617,12 @@ pub fn cagra_beam_search<F: Float, N: Size>(
 /// `(indices, distances)` per query, sorted by distance ascending.
 /// Sentinel entries (unfilled slots) are filtered out.
 #[allow(clippy::too_many_arguments)]
-pub fn cagra_search_batch_gpu<T, R>(
+pub fn cagra_search_batch_gpu<T>(
     queries_flat: &[T],
     n_queries: usize,
     dim: usize,
-    vectors_gpu: &GpuTensor<R, T>,
-    norms_gpu: &GpuTensor<R, T>,
-    graph_gpu: &GpuTensor<R, u32>,
+    vectors_gpu: &GpuTensor<T>,
+    graph_gpu: &GpuTensor<u32>,
     n: usize,
     k_graph: usize,
     k_out: usize,
@@ -790,11 +630,10 @@ pub fn cagra_search_batch_gpu<T, R>(
     seed: usize,
     query_params: &CagraGpuSearchParams,
     entry_points: Option<&[u32]>,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> KnnResult<T>
 where
-    R: Runtime,
-    T: CubeclFloat + num_traits::Float,
+    T: CubeclFloat + AnnSearchFloat,
 {
     let limits = GpuLimits::from_client(client);
     let line = LINE_SIZE;
@@ -804,7 +643,7 @@ where
     let (width, iters, n_entry, expand) = query_params.get_vals();
 
     // Pad queries
-    let queries_padded = if dim_padded != dim {
+    let mut queries_padded = if dim_padded != dim {
         let mut padded = vec![T::zero(); n_queries * dim_padded];
         for i in 0..n_queries {
             for j in 0..dim {
@@ -815,9 +654,12 @@ where
     } else {
         queries_flat.to_vec()
     };
+    if use_cosine {
+        normalise_rows(&mut queries_padded, dim_padded);
+    }
 
     let queries_gpu =
-        GpuTensor::<R, T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
+        GpuTensor::<T>::from_slice(&queries_padded, vec![n_queries, dim_padded], client)?;
 
     // Entry points: use provided or fall back to random
     let entry_flat = match entry_points {
@@ -832,12 +674,12 @@ where
                 .collect()
         }
     };
-    let entry_gpu = GpuTensor::<R, u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client)?;
+    let entry_gpu = GpuTensor::<u32>::from_slice(&entry_flat, vec![n_queries, n_entry], client)?;
 
     // Output tensors
-    let out_idx_gpu = GpuTensor::<R, u32>::empty(vec![n_queries, k_out], client)?;
-    let out_dist_gpu = GpuTensor::<R, T>::empty(vec![n_queries, k_out], client)?;
-    let out_iters_gpu = GpuTensor::<R, u32>::empty(vec![n_queries], client)?;
+    let out_idx_gpu = GpuTensor::<u32>::empty(vec![n_queries, k_out], client)?;
+    let out_dist_gpu = GpuTensor::<T>::empty(vec![n_queries, k_out], client)?;
+    let out_iters_gpu = GpuTensor::<u32>::empty(vec![n_queries], client)?;
 
     // 2D grid for large query counts
     let (cubes_x, cubes_y) = grid_2d(n_queries as u32, &limits)?;
@@ -855,13 +697,12 @@ where
     )?;
 
     unsafe {
-        cagra_beam_search::launch_unchecked::<T, R>(
+        cagra_beam_search::launch_unchecked::<T>(
             client,
             CubeCount::Static(cubes_x, cubes_y, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
             line,
             vectors_gpu.clone().into_tensor_arg(),
-            norms_gpu.clone().into_tensor_arg(),
             graph_gpu.clone().into_tensor_arg(),
             queries_gpu.into_tensor_arg(),
             entry_gpu.into_tensor_arg(),
@@ -927,309 +768,14 @@ where
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
-    use cubecl::wgpu::WgpuRuntime;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cubecl::wgpu::WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }));
         result.ok().map(|_| device)
-    }
-
-    #[test]
-    fn test_probe_query_distance_euclidean_dim32() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 50usize;
-        let dim = 32usize;
-        let dim_vec = dim / line;
-
-        let mut data = vec![0.0f32; n * dim];
-        for i in 0..n {
-            for j in 0..dim {
-                data[i * dim + j] = (i * 100 + j) as f32;
-            }
-        }
-
-        let query: Vec<f32> = (0..dim).map(|j| j as f32 + 0.5).collect();
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let query_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client).unwrap();
-        let out_dist =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client).unwrap();
-        let out_shared =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client)
-                .unwrap();
-
-        let target_node = 3u32;
-
-        unsafe {
-            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                query_gpu.into_tensor_arg(),
-                out_dist.clone().into_tensor_arg(),
-                out_shared.clone().into_tensor_arg(),
-                target_node,
-                false,
-                dim_vec,
-            );
-        }
-
-        let shared_result = out_shared.read(&client).unwrap();
-        let dist_result = out_dist.read(&client).unwrap();
-
-        for j in 0..dim {
-            let expected = j as f32 + 0.5;
-            assert!(
-                (shared_result[j] - expected).abs() < 1e-4,
-                "Shared memory mismatch at [{}]: got {} expected {}",
-                j,
-                shared_result[j],
-                expected
-            );
-        }
-
-        let cpu_dist: f32 = (0..dim)
-            .map(|j| {
-                let diff = query[j] - data[target_node as usize * dim + j];
-                diff * diff
-            })
-            .sum();
-        let gpu_dist = dist_result[0];
-
-        println!("GPU dist: {gpu_dist:.4}  CPU dist: {cpu_dist:.4}");
-        assert!(
-            (gpu_dist - cpu_dist).abs() < 1e-1,
-            "Distance mismatch: gpu={gpu_dist}, cpu={cpu_dist}"
-        );
-    }
-
-    #[test]
-    fn test_probe_query_distance_cosine_dim32() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 50usize;
-        let dim = 32usize;
-        let dim_vec = dim / line;
-
-        let mut data = vec![0.0f32; n * dim];
-        for i in 0..n {
-            for j in 0..dim {
-                data[i * dim + j] = (i * 100 + j) as f32;
-            }
-        }
-
-        let query: Vec<f32> = (0..dim).map(|j| j as f32 + 0.5).collect();
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let query_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&query, vec![dim], &client).unwrap();
-        let out_dist =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32; 1], vec![1], &client).unwrap();
-        let out_shared =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&vec![0.0f32; dim], vec![dim], &client)
-                .unwrap();
-
-        let target_node = 5u32;
-
-        unsafe {
-            probe_query_distance::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                query_gpu.into_tensor_arg(),
-                out_dist.clone().into_tensor_arg(),
-                out_shared.clone().into_tensor_arg(),
-                target_node,
-                true,
-                dim_vec,
-            );
-        }
-
-        let dist_result = out_dist.read(&client).unwrap();
-
-        let cpu_dot: f32 = (0..dim)
-            .map(|j| query[j] * data[target_node as usize * dim + j])
-            .sum();
-        let gpu_dot = dist_result[0];
-
-        println!("GPU dot: {gpu_dot:.4}  CPU dot: {cpu_dot:.4}");
-        assert!(
-            (gpu_dot - cpu_dot).abs() / cpu_dot.abs().max(1e-6) < 1e-3,
-            "Dot product mismatch: gpu={gpu_dot}, cpu={cpu_dot}"
-        );
-    }
-
-    #[test]
-    fn test_hash_table_basic() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-
-        let client = WgpuRuntime::client(&device);
-
-        let insert_ids = vec![10u32, 20, 30, 500, 1023];
-        let probe_ids = vec![10u32, 20, 31, 500, 999, 1023, 0];
-        let expected = [1u32, 1, 0, 1, 0, 1, 0];
-
-        let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
-                .unwrap();
-        let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
-                .unwrap();
-        let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            &vec![0u32; probe_ids.len()],
-            vec![probe_ids.len()],
-            &client,
-        )
-        .unwrap();
-
-        unsafe {
-            probe_hash_table::launch_unchecked::<WgpuRuntime>(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(),
-                probe_gpu.into_tensor_arg(),
-                results_gpu.clone().into_tensor_arg(),
-                insert_ids.len() as u32,
-                probe_ids.len() as u32,
-                HASH_SIZE,
-            );
-        }
-
-        let results = results_gpu.read(&client).unwrap();
-        for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                got, exp,
-                "Probe [{}] for ID {}: got {} expected {}",
-                i, probe_ids[i], got, exp
-            );
-        }
-    }
-
-    #[test]
-    fn test_hash_table_collisions() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-
-        let client = WgpuRuntime::client(&device);
-
-        let hash_size = HASH_SIZE as u32;
-        let insert_ids = vec![0u32, hash_size, hash_size * 2, hash_size * 3];
-        let probe_ids = vec![0u32, hash_size, hash_size * 2, hash_size * 3, hash_size * 4];
-        let expected = [1u32, 1, 1, 1, 0];
-
-        let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
-                .unwrap();
-        let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
-                .unwrap();
-        let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            &vec![0u32; probe_ids.len()],
-            vec![probe_ids.len()],
-            &client,
-        )
-        .unwrap();
-
-        unsafe {
-            probe_hash_table::launch_unchecked::<WgpuRuntime>(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(),
-                probe_gpu.into_tensor_arg(),
-                results_gpu.clone().into_tensor_arg(),
-                insert_ids.len() as u32,
-                probe_ids.len() as u32,
-                HASH_SIZE,
-            );
-        }
-
-        let results = results_gpu.read(&client).unwrap();
-        for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                got, exp,
-                "Collision probe [{}] for ID {}: got {} expected {}",
-                i, probe_ids[i], got, exp
-            );
-        }
-    }
-
-    #[test]
-    fn test_hash_table_duplicates() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-
-        let client = WgpuRuntime::client(&device);
-
-        let insert_ids = vec![42u32, 42, 42, 99, 99, 42];
-        let probe_ids = vec![42u32, 99, 100];
-        let expected = [1u32, 1, 0];
-
-        let insert_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&insert_ids, vec![insert_ids.len()], &client)
-                .unwrap();
-        let probe_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&probe_ids, vec![probe_ids.len()], &client)
-                .unwrap();
-        let results_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
-            &vec![0u32; probe_ids.len()],
-            vec![probe_ids.len()],
-            &client,
-        )
-        .unwrap();
-
-        unsafe {
-            probe_hash_table::launch_unchecked::<WgpuRuntime>(
-                &client,
-                CubeCount::Static(1, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                insert_gpu.into_tensor_arg(),
-                probe_gpu.into_tensor_arg(),
-                results_gpu.clone().into_tensor_arg(),
-                insert_ids.len() as u32,
-                probe_ids.len() as u32,
-                HASH_SIZE,
-            );
-        }
-
-        let results = results_gpu.read(&client).unwrap();
-        for (i, (&got, &exp)) in results.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                got, exp,
-                "Duplicate probe [{}] for ID {}: got {} expected {}",
-                i, probe_ids[i], got, exp
-            );
-        }
     }
 
     #[test]
@@ -1239,7 +785,7 @@ mod tests {
             return;
         };
 
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 50usize;
         let dim = 32usize;
         let k_graph = 10usize;
@@ -1255,13 +801,9 @@ mod tests {
 
         let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
-                .unwrap();
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
         let query = vec![0.0f32; dim];
 
@@ -1270,7 +812,6 @@ mod tests {
             1,
             dim,
             &vectors_gpu,
-            &norms_gpu,
             &graph_gpu,
             n,
             k_graph,
@@ -1306,7 +847,7 @@ mod tests {
             return;
         };
 
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 500usize;
         let dim = 32usize;
         let k_graph = 15usize;
@@ -1334,20 +875,15 @@ mod tests {
             }
         }
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let graph_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&graph_flat, vec![n, k_graph], &client)
-                .unwrap();
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
 
         let (gpu_indices, _) = cagra_search_batch_gpu(
             &queries,
             n_queries,
             dim,
             &vectors_gpu,
-            &norms_gpu,
             &graph_gpu,
             n,
             k_graph,
@@ -1380,6 +916,90 @@ mod tests {
             recall > 0.85,
             "Recall too low: {recall:.4} (expected > 0.85 with brute-force graph)"
         );
+    }
+
+    /// A beam that visits far more nodes than the visited table holds. Before
+    /// the table was reset, every insert past `hash_size` was dropped and the
+    /// search stopped early, so recall collapsed once the table filled.
+    #[test]
+    fn test_beam_search_outgrows_the_hash_table() {
+        let Some(device) = try_device() else {
+            eprintln!("Skipping: no wgpu backend");
+            return;
+        };
+
+        let client = cubecl::Device::from(device.clone()).client();
+        let n = 2000usize;
+        let dim = 32usize;
+        let k_graph = 15usize;
+        let k_out = 10usize;
+        let n_queries = 20usize;
+        let (beam_width, max_iters, n_entry, expand) = (64usize, 192usize, 8usize, 3usize);
+        let hash_size = 128usize;
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        let data: Vec<f32> = (0..n * dim)
+            .map(|_| rng.random_range(-10.0..10.0f32))
+            .collect();
+        let graph_flat = build_brute_force_graph(&data, n, dim, k_graph);
+        let queries: Vec<f32> = (0..n_queries * dim)
+            .map(|_| rng.random_range(-10.0..10.0f32))
+            .collect();
+        let entries: Vec<u32> = (0..n_queries * n_entry)
+            .map(|_| rng.random_range(0..n as u32))
+            .collect();
+
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let graph_gpu =
+            GpuTensor::<u32>::from_slice(&graph_flat, vec![n, k_graph], &client).unwrap();
+        let queries_gpu =
+            GpuTensor::<f32>::from_slice(&queries, vec![n_queries, dim], &client).unwrap();
+        let entry_gpu =
+            GpuTensor::<u32>::from_slice(&entries, vec![n_queries, n_entry], &client).unwrap();
+        let out_idx = GpuTensor::<u32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_dist = GpuTensor::<f32>::empty(vec![n_queries, k_out], &client).unwrap();
+        let out_iters = GpuTensor::<u32>::empty(vec![n_queries], &client).unwrap();
+
+        unsafe {
+            cagra_beam_search::launch_unchecked::<f32>(
+                &client,
+                CubeCount::Static(n_queries as u32, 1, 1),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                LINE_SIZE,
+                vectors_gpu.into_tensor_arg(),
+                graph_gpu.into_tensor_arg(),
+                queries_gpu.into_tensor_arg(),
+                entry_gpu.into_tensor_arg(),
+                out_idx.clone().into_tensor_arg(),
+                out_dist.into_tensor_arg(),
+                out_iters.into_tensor_arg(),
+                n as u32,
+                k_out as u32,
+                k_graph,
+                false,
+                dim / LINE_SIZE,
+                beam_width,
+                hash_size,
+                max_iters,
+                n_entry,
+                expand,
+            );
+        }
+
+        let idx = out_idx.read(&client).unwrap();
+        let gt = brute_force_knn(&queries, &data, n_queries, n, dim, k_out);
+        let hits: usize = (0..n_queries)
+            .map(|qi| {
+                let found = &idx[qi * k_out..(qi + 1) * k_out];
+                gt[qi]
+                    .iter()
+                    .filter(|&&g| found.contains(&(g as u32)))
+                    .count()
+            })
+            .sum();
+        let recall = hits as f64 / (n_queries * k_out) as f64;
+        println!("Recall with a {hash_size}-slot table and beam {beam_width}: {recall:.4}");
+        assert!(recall > 0.85, "Recall too low: {recall:.4}");
     }
 
     fn build_brute_force_graph(data: &[f32], n: usize, dim: usize, k: usize) -> Vec<u32> {

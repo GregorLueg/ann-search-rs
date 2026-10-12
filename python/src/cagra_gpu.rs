@@ -19,7 +19,7 @@ use ann_search_rs::{
 use pyo3::prelude::*;
 
 use crate::dispatch::QueryOut;
-use crate::gpu_handle::{default_device, f32_array, gpu_handle, Rt};
+use crate::gpu_handle::{default_device, f32_array, gpu_handle};
 
 /// Assemble [`CagraGpuSearchParams`] from the four beam knobs.
 ///
@@ -103,7 +103,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
         let inner = py
             .detach(|| {
                 crate::pool::run(|| {
-                    build_nndescent_index_gpu::<f32, Rt>(
+                    build_nndescent_index_gpu::<f32>(
                         (data, n, dim),
                         &metric,
                         k,

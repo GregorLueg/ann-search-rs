@@ -229,7 +229,7 @@ fn main() {
     // Baseline: the unbatched builder, so the table stands on its own.
     println!("Building unbatched GPU kNN graph (k={})...", cli.k);
     let start = Instant::now();
-    let graph = build_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+    let graph = build_knn_graph_gpu::<f32>(
         data.as_ref(),
         &cli.distance,
         Some(cli.k),
@@ -241,7 +241,7 @@ fn main() {
         None,
         cli.seed as usize,
         true,
-        device.clone(),
+        device.clone().into(),
     )
     .unwrap();
     let build_time_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -278,7 +278,7 @@ fn main() {
             ClusteredBuildParams::new(Some(n_clusters), SAMPLE_FRAC, N_ASSIGN, None);
 
         let start = Instant::now();
-        let graph = build_clustered_knn_graph_gpu::<f32, cubecl::wgpu::WgpuRuntime>(
+        let graph = build_clustered_knn_graph_gpu::<f32>(
             data.as_ref(),
             &cli.distance,
             Some(cli.k),
@@ -291,7 +291,7 @@ fn main() {
             Some(cluster_params),
             cli.seed as usize,
             true,
-            device.clone(),
+            device.clone().into(),
         )
         .unwrap();
         let build_time_ms = start.elapsed().as_secs_f64() * 1000.0;

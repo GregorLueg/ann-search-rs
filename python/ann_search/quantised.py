@@ -83,7 +83,7 @@ class ExhaustiveBf16Index(_BaseQuantisedIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustiveBf16
+    _HANDLE = _core.ExhaustiveBf16
 
     @beartype
     def __init__(
@@ -132,7 +132,7 @@ class IvfBf16Index(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfBf16
+    _HANDLE = _core.IvfBf16
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -200,7 +200,7 @@ class ExhaustiveSq8Index(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustiveSq8
+    _HANDLE = _core.ExhaustiveSq8
 
     @beartype
     def __init__(
@@ -263,7 +263,7 @@ class IvfSq8Index(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfSq8
+    _HANDLE = _core.IvfSq8
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -341,7 +341,7 @@ class HnswSq8uIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.HnswSq8u
+    _HANDLE = _core.HnswSq8u
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -419,7 +419,7 @@ class HnswRaBitQIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.HnswRaBitQ
+    _HANDLE = _core.HnswRaBitQ
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -491,7 +491,7 @@ class QgIndex(_BaseQuantisedIndex):
             The build is silent.
     """
 
-    _HANDLE: ClassVar[type] = _core.Qg
+    _HANDLE = _core.Qg
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -562,7 +562,7 @@ class ExhaustivePqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustivePq
+    _HANDLE = _core.ExhaustivePq
 
     @beartype
     def __init__(
@@ -621,7 +621,7 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustiveOpq
+    _HANDLE = _core.ExhaustiveOpq
 
     @beartype
     def __init__(
@@ -680,7 +680,7 @@ class IvfPqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfPq
+    _HANDLE = _core.IvfPq
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -747,7 +747,7 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfOpq
+    _HANDLE = _core.IvfOpq
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -826,7 +826,7 @@ class SoarPqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.SoarPq
+    _HANDLE = _core.SoarPq
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype
@@ -907,7 +907,7 @@ class SoarOpqIndex(_BaseQuantisedIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.SoarOpq
+    _HANDLE = _core.SoarOpq
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
     @beartype

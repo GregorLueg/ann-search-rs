@@ -110,11 +110,11 @@ fn train_gpu(
 ) -> Vec<f32> {
     use ann_search_rs::gpu::k_means_gpu::train_centroids_gpu;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-    use cubecl::Runtime;
+    use cubecl_utils_rs::prelude::Runtime;
 
-    let client = WgpuRuntime::client(&WgpuDevice::default());
+    let client = <WgpuRuntime>::client(&WgpuDevice::default());
     let params = KMeansGpuParams::new(cli.iters, init, true, false);
-    train_centroids_gpu::<f32, WgpuRuntime>(
+    train_centroids_gpu::<f32>(
         data,
         dim,
         n,

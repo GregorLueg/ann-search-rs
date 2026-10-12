@@ -10,6 +10,7 @@
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
+use cubecl::Device;
 
 use ann_search_rs::gpu::dist_gpu::*;
 use ann_search_rs::gpu::topk_gpu::{
@@ -77,11 +78,16 @@ fn make_db(n: usize, dim: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Row-wise L2 norms, needed by the cosine kernel.
-fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
-    flat.chunks_exact(dim)
-        .map(|row| row.iter().map(|v| v * v).sum::<f32>().sqrt())
-        .collect()
+/// Synthetic queries and database, unit-normalised for cosine, which is what
+/// the kernels expect.
+fn make_inputs(cfg: &BenchConfig) -> (Vec<f32>, Vec<f32>) {
+    let mut queries = make_queries(cfg.n_queries, cfg.dim);
+    let mut db = make_db(cfg.n_db, cfg.dim);
+    if cfg.metric == Dist::Cosine {
+        normalise_rows(&mut queries, cfg.dim);
+        normalise_rows(&mut db, cfg.dim);
+    }
+    (queries, db)
 }
 
 /// Seed the top-k output buffers with the `f32::MAX` / `0` sentinel.
@@ -89,7 +95,7 @@ fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
 /// Called from the timed `execute`, not from `prepare`, and that placement is
 /// deliberate. `Benchmark::run` calls `prepare` once and clones the input for
 /// every iteration, so seeding there leaves iterations 2..n reducing into an
-/// already-populated top-k, where the `dist < local[k - 1]` acceptance test
+/// already-populated top-k, where the `dist <local[k - 1]` acceptance test
 /// rejects nearly every candidate. Those iterations do far less work than the
 /// first, and the gap widens with `k`, which flattens exactly the curve a `k`
 /// sweep is trying to measure.
@@ -104,17 +110,17 @@ fn l2_norms(flat: &[f32], dim: usize) -> Vec<f32> {
 /// * `indices` - Top-k index buffer `[n_queries, k]`
 /// * `nq` - Number of queries
 /// * `k` - Number of neighbours
-fn seed_topk<R: Runtime>(
-    client: &ComputeClient<R>,
-    dists: &GpuTensor<R, f32>,
-    indices: &GpuTensor<R, u32>,
+fn seed_topk(
+    client: &Client,
+    dists: &GpuTensor<f32>,
+    indices: &GpuTensor<u32>,
     nq: usize,
     k: usize,
 ) {
     let init_gx = (k as u32).div_ceil(WORKGROUP_SIZE_X);
     let init_gy = (nq as u32).div_ceil(4);
     unsafe {
-        init_topk::launch_unchecked::<f32, R>(
+        init_topk::launch_unchecked::<f32>(
             client,
             CubeCount::Static(init_gx, init_gy, 1),
             CubeDim::new_2d(WORKGROUP_SIZE_X, 4),
@@ -141,12 +147,7 @@ fn seed_topk<R: Runtime>(
 /// ### Returns
 ///
 /// The populated [`TopkInput`].
-fn make_topk_input<R: Runtime>(
-    client: &ComputeClient<R>,
-    nq: usize,
-    ndb: usize,
-    k: usize,
-) -> TopkInput<R> {
+fn make_topk_input(client: &Client, nq: usize, ndb: usize, k: usize) -> TopkInput {
     // High-entropy values on purpose. The original generator cycled through
     // only 1000 distinct distances, so at large `n_db` every value had dozens of
     // exact duplicates. That is not what a real distance matrix looks like, and
@@ -161,48 +162,42 @@ fn make_topk_input<R: Runtime>(
         .collect();
 
     TopkInput {
-        distances_gpu: GpuTensor::<R, f32>::from_slice(&dists, vec![nq, ndb], client)
+        distances_gpu: GpuTensor::<f32>::from_slice(&dists, vec![nq, ndb], client)
             .expect("GPU allocation exceeds the device binding limit"),
-        topk_dists: GpuTensor::<R, f32>::empty(vec![nq, k], client)
+        topk_dists: GpuTensor::<f32>::empty(vec![nq, k], client)
             .expect("GPU allocation exceeds the device binding limit"),
-        topk_indices: GpuTensor::<R, u32>::empty(vec![nq, k], client)
+        topk_indices: GpuTensor::<u32>::empty(vec![nq, k], client)
             .expect("GPU allocation exceeds the device binding limit"),
     }
 }
 
 // ──────────────────────────────────────────────
-// 1. Distance kernel only (euclidean_tiled)
+// 1. Distance kernel only (dist_tiled)
 // ──────────────────────────────────────────────
 
-struct DistanceBench<R: Runtime> {
+struct DistanceBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-struct DistanceInput<R: Runtime> {
-    query_gpu: GpuTensor<R, f32>,
-    db_gpu: GpuTensor<R, f32>,
-    distances_gpu: GpuTensor<R, f32>,
-    /// Query norms, populated for cosine only
-    query_norms_gpu: Option<GpuTensor<R, f32>>,
-    /// Database norms, populated for cosine only
-    db_norms_gpu: Option<GpuTensor<R, f32>>,
+struct DistanceInput {
+    query_gpu: GpuTensor<f32>,
+    db_gpu: GpuTensor<f32>,
+    distances_gpu: GpuTensor<f32>,
 }
 
-impl<R: Runtime> Clone for DistanceInput<R> {
+impl Clone for DistanceInput {
     fn clone(&self) -> Self {
         Self {
             query_gpu: self.query_gpu.clone(),
             db_gpu: self.db_gpu.clone(),
             distances_gpu: self.distances_gpu.clone(),
-            query_norms_gpu: self.query_norms_gpu.clone(),
-            db_norms_gpu: self.db_norms_gpu.clone(),
         }
     }
 }
 
-impl<R: Runtime> Benchmark for DistanceBench<R> {
-    type Input = DistanceInput<R>;
+impl Benchmark for DistanceBench {
+    type Input = DistanceInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -210,39 +205,19 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let nq = self.cfg.n_queries;
         let ndb = self.cfg.n_db;
 
-        let queries = make_queries(nq, dim);
-        let db = make_db(ndb, dim);
+        let (queries, db) = make_inputs(&self.cfg);
 
-        let query_gpu = GpuTensor::<R, f32>::from_slice(&queries, vec![nq, dim], &self.client)
+        let query_gpu = GpuTensor::<f32>::from_slice(&queries, vec![nq, dim], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let db_gpu = GpuTensor::<R, f32>::from_slice(&db, vec![ndb, dim], &self.client)
+        let db_gpu = GpuTensor::<f32>::from_slice(&db, vec![ndb, dim], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-        let distances_gpu = GpuTensor::<R, f32>::empty(vec![nq, ndb], &self.client)
+        let distances_gpu = GpuTensor::<f32>::empty(vec![nq, ndb], &self.client)
             .expect("GPU allocation exceeds the device binding limit");
-
-        let (query_norms_gpu, db_norms_gpu) = if self.cfg.metric == Dist::Cosine {
-            let qn = l2_norms(&queries, dim);
-            let dn = l2_norms(&db, dim);
-            (
-                Some(
-                    GpuTensor::<R, f32>::from_slice(&qn, vec![nq], &self.client)
-                        .expect("GPU allocation exceeds the device binding limit"),
-                ),
-                Some(
-                    GpuTensor::<R, f32>::from_slice(&dn, vec![ndb], &self.client)
-                        .expect("GPU allocation exceeds the device binding limit"),
-                ),
-            )
-        } else {
-            (None, None)
-        };
 
         DistanceInput {
             query_gpu,
             db_gpu,
             distances_gpu,
-            query_norms_gpu,
-            db_norms_gpu,
         }
     }
 
@@ -262,51 +237,24 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
         let (grid_y, grid_z) =
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
-        match self.cfg.metric {
-            Dist::Cosine => unsafe {
-                cosine_tiled::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input
-                        .query_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs query norms")
-                        .into_tensor_arg(),
-                    input
-                        .db_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs db norms")
-                        .into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                );
-            },
-            _ => unsafe {
-                euclidean_tiled::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                );
-            },
+        let use_cosine = self.cfg.metric == Dist::Cosine;
+        unsafe {
+            dist_tiled::launch_unchecked::<f32>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, grid_z),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, wg_y),
+                vec_size,
+                input.query_gpu.into_tensor_arg(),
+                input.db_gpu.into_tensor_arg(),
+                input.distances_gpu.into_tensor_arg(),
+                0u32,
+                ndb as u32,
+                nq as u32,
+                ndb as u32,
+                dim_lines,
+                wg_y,
+                use_cosine,
+            );
         }
 
         Ok(())
@@ -331,13 +279,13 @@ impl<R: Runtime> Benchmark for DistanceBench<R> {
 // 1b. Register-tiled distance kernel
 // ──────────────────────────────────────────────
 
-struct DistanceRegBench<R: Runtime> {
+struct DistanceRegBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-impl<R: Runtime> Benchmark for DistanceRegBench<R> {
-    type Input = DistanceInput<R>;
+impl Benchmark for DistanceRegBench {
+    type Input = DistanceInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -365,59 +313,28 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
         let (grid_y, grid_z) =
             grid_2d((nq as u32).div_ceil(wg_y), &limits).expect("grid too large");
 
-        match self.cfg.metric {
-            Dist::Cosine => unsafe {
-                cosine_tiled_reg::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input
-                        .query_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs query norms")
-                        .into_tensor_arg(),
-                    input
-                        .db_norms_gpu
-                        .as_ref()
-                        .expect("cosine needs db norms")
-                        .into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                    TILE_D,
-                    TILE_Q,
-                    plan.kb_lines,
-                );
-            },
-            _ => unsafe {
-                euclidean_tiled_reg::launch_unchecked::<f32, R>(
-                    &self.client,
-                    CubeCount::Static(grid_x, grid_y, grid_z),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
-                    vec_size,
-                    input.query_gpu.into_tensor_arg(),
-                    input.db_gpu.into_tensor_arg(),
-                    input.distances_gpu.into_tensor_arg(),
-                    0u32,
-                    0u32,
-                    ndb as u32,
-                    nq as u32,
-                    ndb as u32,
-                    dim_lines,
-                    wg_y,
-                    TILE_D,
-                    TILE_Q,
-                    plan.kb_lines,
-                );
-            },
+        let use_cosine = self.cfg.metric == Dist::Cosine;
+        unsafe {
+            dist_tiled_reg::launch_unchecked::<f32>(
+                &self.client,
+                CubeCount::Static(grid_x, grid_y, grid_z),
+                CubeDim::new_2d(WORKGROUP_SIZE_X, threads_y),
+                vec_size,
+                input.query_gpu.into_tensor_arg(),
+                input.db_gpu.into_tensor_arg(),
+                input.distances_gpu.into_tensor_arg(),
+                0u32,
+                0u32,
+                ndb as u32,
+                nq as u32,
+                ndb as u32,
+                dim_lines,
+                wg_y,
+                TILE_D,
+                TILE_Q,
+                plan.kb_lines,
+                use_cosine,
+            );
         }
 
         Ok(())
@@ -444,18 +361,18 @@ impl<R: Runtime> Benchmark for DistanceRegBench<R> {
 // 2. extract_topk only (pre-filled distance matrix)
 // ──────────────────────────────────────────────
 
-struct TopkBench<R: Runtime> {
+struct TopkBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-struct TopkInput<R: Runtime> {
-    distances_gpu: GpuTensor<R, f32>,
-    topk_dists: GpuTensor<R, f32>,
-    topk_indices: GpuTensor<R, u32>,
+struct TopkInput {
+    distances_gpu: GpuTensor<f32>,
+    topk_dists: GpuTensor<f32>,
+    topk_indices: GpuTensor<u32>,
 }
 
-impl<R: Runtime> Clone for TopkInput<R> {
+impl Clone for TopkInput {
     fn clone(&self) -> Self {
         Self {
             distances_gpu: self.distances_gpu.clone(),
@@ -465,8 +382,8 @@ impl<R: Runtime> Clone for TopkInput<R> {
     }
 }
 
-impl<R: Runtime> Benchmark for TopkBench<R> {
-    type Input = TopkInput<R>;
+impl Benchmark for TopkBench {
+    type Input = TopkInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -487,7 +404,7 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
 
         let extract_grid = (nq as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            extract_topk::launch_unchecked::<f32, R>(
+            extract_topk::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(extract_grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -522,51 +439,33 @@ impl<R: Runtime> Benchmark for TopkBench<R> {
 // 3. Full pipeline (distance + topk, chunked)
 // ──────────────────────────────────────────────
 
-struct FullPipelineBench<R: Runtime> {
+struct FullPipelineBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
-    device: R::Device,
+    client: Client,
+    device: Device,
 }
 
 #[derive(Clone)]
 struct PipelineInput {
     queries: Vec<f32>,
     db: Vec<f32>,
-    /// Empty unless the config is cosine
-    query_norms: Vec<f32>,
-    /// Empty unless the config is cosine
-    db_norms: Vec<f32>,
 }
 
-impl<R: Runtime> Benchmark for FullPipelineBench<R> {
+impl Benchmark for FullPipelineBench {
     type Input = PipelineInput;
     type Output = (Vec<Vec<usize>>, Vec<Vec<f32>>);
 
     fn prepare(&self) -> Self::Input {
-        let dim = self.cfg.dim;
+        let (queries, db) = make_inputs(&self.cfg);
 
-        let queries = make_queries(self.cfg.n_queries, dim);
-        let db = make_db(self.cfg.n_db, dim);
-
-        let (query_norms, db_norms) = if self.cfg.metric == Dist::Cosine {
-            (l2_norms(&queries, dim), l2_norms(&db, dim))
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        PipelineInput {
-            queries,
-            db,
-            query_norms,
-            db_norms,
-        }
+        PipelineInput { queries, db }
     }
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
-        let qb = BatchData::new(&input.queries, &input.query_norms, self.cfg.n_queries);
-        let dbb = BatchData::new(&input.db, &input.db_norms, self.cfg.n_db);
+        let qb = BatchData::new(&input.queries, self.cfg.n_queries);
+        let dbb = BatchData::new(&input.db, self.cfg.n_db);
 
-        let result = query_batch_gpu::<f32, R>(
+        let result = query_batch_gpu::<f32>(
             self.cfg.k,
             &qb,
             &dbb,
@@ -604,13 +503,13 @@ impl<R: Runtime> Benchmark for FullPipelineBench<R> {
 ///
 /// Same input, same sentinel seeding inside the timed region, so the two arms
 /// are directly comparable.
-struct TopkRadixBench<R: Runtime> {
+struct TopkRadixBench {
     cfg: BenchConfig,
-    client: ComputeClient<R>,
+    client: Client,
 }
 
-impl<R: Runtime> Benchmark for TopkRadixBench<R> {
-    type Input = TopkInput<R>;
+impl Benchmark for TopkRadixBench {
+    type Input = TopkInput;
     type Output = ();
 
     fn prepare(&self) -> Self::Input {
@@ -632,7 +531,7 @@ impl<R: Runtime> Benchmark for TopkRadixBench<R> {
         let (gx, gy) = grid_2d(nq as u32, &limits).map_err(|e| e.to_string())?;
 
         unsafe {
-            radix_select_topk::launch_unchecked::<f32, R>(
+            radix_select_topk::launch_unchecked::<f32>(
                 &self.client,
                 CubeCount::Static(gx, gy, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -670,11 +569,11 @@ impl<R: Runtime> Benchmark for TopkRadixBench<R> {
 ///
 /// The per-binding limit is the one that bites: a wave can fit the total VRAM
 /// budget while a single tensor busts `max_page_size`.
-fn report_device_limits<R: Runtime>(client: &ComputeClient<R>) {
+fn report_device_limits(client: &Client) {
     let props = client.properties();
     let hw = &props.hardware;
     println!("====== Device ======");
-    println!("runtime          : {}", R::name(client));
+    println!("runtime          : {}", client.name());
     println!(
         "plane size       : {} .. {}{}",
         hw.plane_size_min,
@@ -703,12 +602,12 @@ fn report_device_limits<R: Runtime>(client: &ComputeClient<R>) {
 ///
 /// * `cfg` - Config to validate against
 /// * `client` - GPU compute client
-fn validate_distance_reg<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
-    let base = DistanceBench::<R> {
+fn validate_distance_reg(cfg: &BenchConfig, client: &Client) {
+    let base = DistanceBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
-    let tiled = DistanceRegBench::<R> {
+    let tiled = DistanceRegBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
@@ -770,10 +669,10 @@ fn validate_distance_reg<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R
     );
 }
 
-fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
-    let client = R::client(device);
+fn run_exhaustive_suite(device: &Device) {
+    let client = device.client();
 
-    report_device_limits::<R>(&client);
+    report_device_limits(&client);
 
     // ── Kernel-level benchmarks (single chunk sizes) ──
     //
@@ -793,7 +692,7 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     // The top-k arms are gated per configuration inside `run_topk_pair`, which
     // covers every `k` in the sweep rather than one sample of it.
     for cfg in &kernel_configs {
-        validate_distance_reg::<R>(cfg, &client);
+        validate_distance_reg(cfg, &client);
     }
     println!();
 
@@ -808,11 +707,11 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
             cfg.tag()
         );
 
-        let dist_bench = DistanceBench::<R> {
+        let dist_bench = DistanceBench {
             cfg: cfg.clone(),
             client: client.clone(),
         };
-        let dist_reg_bench = DistanceRegBench::<R> {
+        let dist_reg_bench = DistanceRegBench {
             cfg: cfg.clone(),
             client: client.clone(),
         };
@@ -836,7 +735,7 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     // kernel is sublinear, so the crossover is expected somewhere in the teens
     // to thirties and needs resolving rather than guessing.
     for k in [10usize, 15, 20, 25, 30, 40, 50, 100, 150, 250] {
-        run_topk_pair::<R>(&BenchConfig::euclidean(8192, 16_384, 32, k), &client);
+        run_topk_pair(&BenchConfig::euclidean(8192, 16_384, 32, k), &client);
     }
 
     // Two axes rather than one. Radix select is linear in n_db while the serial
@@ -846,7 +745,7 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     println!("\n====== Top-k reducers: n_db x k corners (4096q) ======");
     for ndb in [4096usize, 16_384, 65_536] {
         for k in [10usize, 50] {
-            run_topk_pair::<R>(&BenchConfig::euclidean(4096, ndb, 32, k), &client);
+            run_topk_pair(&BenchConfig::euclidean(4096, ndb, 32, k), &client);
         }
     }
 
@@ -867,7 +766,7 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
     // measured end to end rather than on the isolated reducer: with n_db=50000
     // the pipeline runs four DB chunks, and `extract_topk` becomes nearly free
     // after the first because a tight running top-k rejects almost every
-    // candidate at its `dist < local[k - 1]` test. Radix select pays full price
+    // candidate at its `dist <local[k - 1]` test. Radix select pays full price
     // on every chunk. The isolated bench only ever measures the cold chunk, so
     // it reports radix winning at every `k` while the pipeline does not.
     let crossover_configs: Vec<BenchConfig> = [15usize, 30, 50, 75, 100, 150]
@@ -886,7 +785,7 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
             cfg.tag()
         );
 
-        let full_bench = FullPipelineBench::<R> {
+        let full_bench = FullPipelineBench {
             cfg: cfg.clone(),
             client: client.clone(),
             device: device.clone(),
@@ -909,12 +808,12 @@ fn run_exhaustive_suite<R: Runtime>(device: &R::Device) {
 ///
 /// * `cfg` - Configuration under test
 /// * `client` - Compute client
-fn validate_topk_arms<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
-    let serial = TopkBench::<R> {
+fn validate_topk_arms(cfg: &BenchConfig, client: &Client) {
+    let serial = TopkBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
-    let radix = TopkRadixBench::<R> {
+    let radix = TopkRadixBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
@@ -973,7 +872,7 @@ fn validate_topk_arms<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) 
 ///
 /// * `cfg` - Configuration to run
 /// * `client` - Compute client
-fn run_topk_pair<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
+fn run_topk_pair(cfg: &BenchConfig, client: &Client) {
     let limits = GpuLimits::from_client(client);
     let radix_smem = radix_select_smem_bytes(cfg.k, WORKGROUP_SIZE_X as usize, SURV_ARRAYS_DENSE);
 
@@ -986,13 +885,13 @@ fn run_topk_pair<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
         resident_workgroups(radix_smem, &limits),
     );
 
-    validate_topk_arms::<R>(cfg, client);
+    validate_topk_arms(cfg, client);
 
-    let serial = TopkBench::<R> {
+    let serial = TopkBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
-    let radix = TopkRadixBench::<R> {
+    let radix = TopkRadixBench {
         cfg: cfg.clone(),
         client: client.clone(),
     };
@@ -1005,5 +904,5 @@ fn run_topk_pair<R: Runtime>(cfg: &BenchConfig, client: &ComputeClient<R>) {
 }
 
 fn main() {
-    run_exhaustive_suite::<cubecl::wgpu::WgpuRuntime>(&Default::default());
+    run_exhaustive_suite(&Default::default());
 }

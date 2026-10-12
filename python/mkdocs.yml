@@ -43,6 +43,7 @@ nav:
       - Indices: api/indices.md
       - Quantised indices: api/quantised.md
       - GPU indices: api/gpu.md
+      - MLX indices: api/mlx.md
       - Estimator base: api/base.md
       - Synthetic data: api/datasets.md
 

@@ -3,6 +3,79 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.11.0
+
+**Features**
+
+- New experimental `mlx` feature: an Apple Silicon backend that drives Metal
+  through [mlx-c](https://github.com/ml-explore/mlx-c) instead of wgpu. Covers
+  exhaustive search, IVF (with its own k-means), the NN-Descent kNN graph, CAGRA
+  graph optimisation and beam search, and a queryable NN-Descent index
+  (`build_*_mlx` / `query_*_mlx` / `query_*_mlx_self`). f32 only. Needs
+  `brew install mlx-c`, or `MLX_C_PREFIX` pointing at an install.
+- If mlx-c is not found, the build warns and leaves the MLX code out rather
+  than failing. `MLX_AVAILABLE` says whether it made it in, and the
+  `links = "mlxc"` metadata hands dependants `DEP_MLXC_AVAILABLE`, so their
+  build scripts can pick the MLX or the wgpu path.
+- MLX against wgpu on an M1 Max at 500k x 128: exhaustive self-kNN 47.7 s to
+  15.4 s, IVF build 1.1 s to 0.6 s, CAGRA build 6.2 s to 4.4 s, CAGRA self query
+  (beam width 16) 1.27 s to 0.75 s. Full tables in
+  [`docs/benchmarks_mlx.md`](docs/benchmarks_mlx.md).
+- CPU NN-Descent seeds its graph by joining every forest leaf exhaustively, as
+  PyNNDescent does, instead of one forest query per point. On 2.86M Tahoe PCA
+  cells (dim 32, degree 15) at 64 trees: build 50.3 s to 28.0 s, recall@15
+  0.976 to 0.990. Manhattan keeps the Kd forest and the per-point query.
+- CPU NN-Descent defaults to scanpy's tree count, `min(5 + round(sqrt(n) / 20),
+  64)`, up from `min(5 + round(n^0.25), 12)`.
+
+**Performance**
+
+- GPU NN-Descent drops mutual-neighbour duplicates before the local join.
+- GPU forest leaves that filled the shared-memory budget exactly (dim 128 on a
+  32 KiB device) ran far slower on Apple Silicon. Staging now keeps one point of
+  headroom.
+
+**Fixes**
+
+- GPU NN-Descent random initialisation could draw the same neighbour id twice.
+
+**Breaking changes**
+
+- CubeCL 0.11 dropped the runtime generic. The GPU builders take a type-erased
+  `cubecl::Device` instead of `R::Device`, so
+  `build_*_gpu::<f32, WgpuRuntime>(..., device)` becomes
+  `build_*_gpu::<f32>(..., device.into())`. Same for `k_means_clusters_gpu`.
+- The `gpu-cpu` feature is gone. The cubecl-cpu runtime in 0.11 caps a cube at
+  `available_parallelism` units, and every kernel here launches 32- or
+  128-wide cubes, which fail silently there.
+
+Only matters if you launch the GPU kernels yourself:
+
+- The Euclidean and cosine kernel pairs merged behind a comptime flag:
+  `euclidean_tiled` / `cosine_tiled` are now `dist_tiled`, and likewise
+  `dist_tiled_reg`, `compute_ivf_mega_cached`, `flash_assign_vec` and
+  `min_dist_vec`. Cosine is normalised on the host instead (`normalise_rows`),
+  so the norm arguments are gone.
+- `ForestRouter`, `default_forest_trees` and `compact_knn_rows` moved to
+  `utils::rp_forest`, shared between wgpu and MLX.
+- `knn_graph()` on the wgpu and MLX NN-Descent indices returns `&[(u32, T)]`
+  instead of `usize` ids, halving the host graph. `extract_knn` is unchanged.
+
+**Docs**
+
+- New single-cell self-kNN benchmark on 2.86M Tahoe PCA cells against
+  pynndescent (scanpy settings), hnswlib and FAISS:
+  [`docs/benchmarks_single_cell.md`](docs/benchmarks_single_cell.md).
+- MLX rows in the cross-library comparison, and an MLX against wgpu kNN-graph
+  section in [`docs/benchmarks_mlx.md`](docs/benchmarks_mlx.md). Every
+  benchmark doc rerun.
+
+**Chore**
+
+- `wide` floor raised to 1.6.0, which replaced the deprecated `blend` with
+  `select`.
+- `cubecl` 0.10 to 0.11, `cubecl-utils-rs` 0.1 to 0.2, `faer` 0.23 to 0.24.
+
 ## 0.10.1
 
 **Performance**

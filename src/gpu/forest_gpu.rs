@@ -7,93 +7,31 @@
 
 #![allow(missing_docs)]
 
-use cubecl::frontend::{Atomic, SharedMemory};
+use cubecl::frontend::{Atomic, Shared};
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-use rayon::prelude::*;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use crate::gpu::nndescent_gpu::{launch_merge_proposals, reset_proposals, MAX_PROPOSALS};
 use crate::gpu::*;
 use crate::prelude::*;
-
-/// Result of parallel tree construction for a single tree.
-///
-/// Each element is a tuple of:
-/// - `Vec<u32>` -- final partition ID per point (length `n`), used to build the
-///   leaf structure for GPU pairwise distance computation.
-/// - `Option<Vec<Vec<T>>>` -- per-level random projection vectors
-///   (`[max_depth][dim]`). Present only for trees retained by the
-///   `ForestRouter` for query-time entry point routing.
-/// - `Option<Vec<Vec<T>>>` -- per-level partition medians
-///   (`[max_depth][n_partitions_at_level]`). Present only for router
-///   trees, paired with the projection vectors above.
-type TreeResults<T> = Vec<(Vec<u32>, Option<Vec<Vec<T>>>, Option<Vec<Vec<T>>>)>;
-
-////////////////////
-// Kernel helpers //
-////////////////////
+pub use crate::utils::rp_forest::ForestRouter;
+use crate::utils::rp_forest::*;
 
 /////////////
 // Kernels //
 /////////////
 
-/// Compute dot product of each vector with a random projection vector.
-///
-/// ### Params
-///
-/// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/N]`
-/// * `random_vec` - Random projection vector `[dim/N]`
-/// * `dot_values` - Output dot products `[n]`
-/// * `n` - Number of points
-/// * `dim_lines` - Number of `Vector<F, N>` elements per vector row (comptime)
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> point index
-#[cube(launch_unchecked)]
-fn compute_dot_products<F: CubeclFloat, N: Size>(
-    vectors: &Tensor<Vector<F, N>>,
-    random_vec: &Tensor<Vector<F, N>>,
-    dot_values: &mut Tensor<F>,
-    n_pts: u32,
-    #[comptime] dim_lines: usize,
-) {
-    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if idx >= n_pts {
-        terminate!();
-    }
-    let lanes = LINE_SIZE;
-    let off = idx as usize * dim_lines;
-    let mut sum = F::new(0.0_f32);
-    for i in 0..dim_lines {
-        let v = vectors[off + i];
-        let r = random_vec[i];
-        let prod = v * r;
-        #[unroll]
-        for lane in 0..lanes {
-            sum += prod[lane];
-        }
-    }
-    dot_values[idx as usize] = sum;
-}
-
 /// Project every point onto all of a tree's random vectors in one pass.
 ///
-/// The per-level kernel this replaces read the whole vector matrix once per
-/// level, because it computed one projection at a time. The projections do not
-/// depend on the partitioning at all: `random_vec` for a level is derived
-/// purely from the tree seed and the level index, so all `n_levels` of them are
-/// known before the first one is needed. Only the median-and-scatter step is
+/// The projections do not depend on the partitioning at all: `random_vec` for
+/// a level is derived purely from the tree seed and the level index, so all
+/// `n_levels` of them are known before the first one is needed. Only the median-and-scatter step is
 /// sequential across levels.
 ///
-/// Reading each point's row once and accumulating `n_levels` dot products cuts
-/// vector traffic by `n_levels` and collapses `n_levels` launches and readbacks
-/// into one. The projection rows are read from global rather than staged in
+/// Reading each point's row once and accumulating `n_levels` dot products
+/// reads the vector matrix once instead of once per level, with one launch and
+/// one readback. The projection rows are read from global rather than staged in
 /// shared memory: every thread reads the same element at the same time, so they
 /// broadcast from cache, and staging would put a `n_levels * dim` ceiling on
 /// the kernel.
@@ -148,7 +86,7 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
             let prod = v * r;
             #[unroll]
             for lane in 0..lanes {
-                acc[l] += prod[lane];
+                acc[l] += prod.extract(lane);
             }
         }
     }
@@ -160,46 +98,10 @@ fn compute_dot_products_multi<F: CubeclFloat, N: Size>(
     }
 }
 
-/// Partition points by comparing dot products against per-partition medians.
-///
-/// ### Params
-///
-/// * `partition_id` - Current partition ID per point `[n]`; updated in-place
-///   to `pid * 2` (left) or `pid * 2 + 1` (right)
-/// * `dot_values` - Dot product of each point with the projection vector `[n]`
-/// * `medians` - Median dot value per partition `[n_partitions]`
-/// * `n` - Number of points
-///
-/// ### Grid mapping
-///
-/// * `ABSOLUTE_POS_X` -> point index
-#[cube(launch_unchecked)]
-fn partition_points<F: CubeclFloat>(
-    partition_id: &mut Tensor<u32>,
-    dot_values: &Tensor<F>,
-    medians: &Tensor<F>,
-    n: u32,
-) {
-    let idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * WORKGROUP_SIZE_X + UNIT_POS_X;
-    if idx >= n {
-        terminate!();
-    }
-
-    let pid = partition_id[idx as usize];
-    let dot = dot_values[idx as usize];
-    let median = medians[pid as usize];
-
-    let mut new_pid = pid * 2u32 + 1u32;
-    if dot <= median {
-        new_pid = pid * 2u32;
-    }
-    partition_id[idx as usize] = new_pid;
-}
-
 /// Points per leaf whose staging fits the device's shared-memory budget.
 ///
 /// Per-point cost is `dim_padded * elem_bytes` for the vector, four bytes for
-/// the pid and `elem_bytes` for the norm, plus eight fixed bytes covering
+/// the pid and `elem_bytes` for the threshold, plus eight fixed bytes covering
 /// `shared_leaf_start` and `shared_leaf_size`.
 ///
 /// ### Params
@@ -221,13 +123,16 @@ fn compute_max_leaf_size(
     // `shared_leaf_start` + `shared_leaf_size`
     const OVERHEAD: usize = 8;
 
-    // Per point: `shared_vecs` holds a row, `shared_pids` a u32, and
-    // `shared_norms` and `shared_thresh` a float each. Every `SharedMemory` in
+    // Per point: `shared_vecs` holds a row, `shared_pids` a u32 and
+    // `shared_thresh` a float. Every `SharedMemory` in
     // `leaf_pairwise_proposals` is counted here; missing one busts the device
     // limit, and `launch_unchecked` then does no work and reports nothing.
-    let per_point = dim_padded * elem_bytes + 4 + 2 * elem_bytes;
+    let per_point = dim_padded * elem_bytes + 4 + elem_bytes;
     let available = limits.max_shared_bytes.saturating_sub(OVERHEAD);
-    let fits = available / per_point;
+    // One point of headroom: a footprint that filled the budget exactly (dim
+    // 128 on a 32 KiB device) ran the leaf kernel far slower on Apple Silicon
+    // than one point less, with identical output.
+    let fits = (available / per_point).saturating_sub(1);
 
     if fits < 2 {
         return Err(AnnSearchErrors::DimTooHighForSharedMemory {
@@ -253,7 +158,6 @@ fn compute_max_leaf_size(
 /// ### Params
 ///
 /// * `vectors` - Row-major vector matrix, line-vectorised `[n, dim/LINE_SIZE]`
-/// * `norms` - Pre-computed L2 norms `[n]` (ignored when `use_cosine` is false)
 /// * `leaf_points` - Flat array of global point IDs in leaf order
 /// * `leaf_offsets` - CSR-style offsets into `leaf_points`, length n_leaves + 1
 /// * `graph_dist` - Current kNN graph distances [n, k], used for threshold
@@ -276,7 +180,6 @@ fn compute_max_leaf_size(
 #[cube(launch_unchecked)]
 pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     vectors: &Tensor<Vector<F, N>>,
-    norms: &Tensor<F>,
     leaf_points: &Tensor<u32>,
     leaf_offsets: &Tensor<u32>,
     graph_dist: &Tensor<F>,
@@ -299,8 +202,8 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
     let lanes = LINE_SIZE;
     let dim_scalars = dim_lines * lanes;
 
-    let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
-    let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
+    let mut shared_leaf_start = Shared::<[u32]>::new_slice(1usize);
+    let mut shared_leaf_size = Shared::<[u32]>::new_slice(1usize);
 
     if tx == 0u32 {
         let start = leaf_offsets[leaf_idx as usize];
@@ -326,11 +229,10 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         terminate!();
     }
 
-    // Scalar shared memory (never use SharedMemory<Line<F>> -- see post-mortem)
-    let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
-    let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
-    let mut shared_norms = SharedMemory::<F>::new(max_leaf_size);
-    let mut shared_thresh = SharedMemory::<F>::new(max_leaf_size);
+    // Scalar shared memory (never use Shared<[Line<F>]> -- see post-mortem)
+    let mut shared_vecs = Shared::<[F]>::new_slice(max_leaf_size * dim_scalars);
+    let mut shared_pids = Shared::<[u32]>::new_slice(max_leaf_size);
+    let mut shared_thresh = Shared::<[F]>::new_slice(max_leaf_size);
 
     let k = graph_dist.shape(1usize);
 
@@ -341,9 +243,6 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         // The partner's acceptance threshold is a global read inside the pair
         // loop otherwise, so `leaf_size` reads become `leaf_size^2 / 2`.
         shared_thresh[i as usize] = graph_dist[global_pid as usize * k + k - 1usize];
-        if use_cosine {
-            shared_norms[i as usize] = norms[global_pid as usize];
-        }
         i += WORKGROUP_SIZE_X;
     }
     sync_cube();
@@ -360,7 +259,7 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
         if pid < n_pts {
             let vec_offset = pid as usize * dim_lines + line_idx;
             let line_val = vectors[vec_offset];
-            shared_vecs[idx_load] = line_val[lane];
+            shared_vecs[idx_load] = line_val.extract_dynamic(lane);
         }
         idx_load += WORKGROUP_SIZE_X as usize;
     }
@@ -391,7 +290,7 @@ pub fn leaf_pairwise_proposals<F: CubeclFloat, N: Size>(
                 }
 
                 let dist = if use_cosine {
-                    F::new(1.0_f32) - (sum / (shared_norms[ii] * shared_norms[jj]))
+                    F::new(1.0_f32) - sum
                 } else {
                     sum
                 };
@@ -448,191 +347,6 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
     }
 }
 
-/////////////////
-// CPU helpers //
-/////////////////
-
-/// Build leaf-point arrays from final partition IDs.
-///
-/// Groups points by partition, sorts them, and builds a CSR-style offset
-/// array for subsequent per-leaf GPU kernels.
-///
-/// ### Params
-///
-/// * `partition_ids` - Partition ID per point, length `n`
-/// * `n` - Number of points
-///
-/// ### Returns
-///
-/// `(leaf_points, leaf_offsets, n_leaves)` where `leaf_points` is the
-/// global point IDs sorted by partition, `leaf_offsets` is the CSR offset
-/// array of length `n_leaves + 1`, and `n_leaves` is the number of distinct
-/// partitions.
-fn build_leaf_structure(partition_ids: &[u32], n: usize) -> (Vec<u32>, Vec<u32>, usize) {
-    let mut sorted: Vec<(u32, u32)> = partition_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &pid)| (pid, i as u32))
-        .collect();
-    sorted.par_sort_unstable_by_key(|&(pid, _)| pid);
-
-    let leaf_points: Vec<u32> = sorted.iter().map(|&(_, idx)| idx).collect();
-
-    let mut leaf_offsets = vec![0u32];
-    for i in 1..n {
-        if sorted[i].0 != sorted[i - 1].0 {
-            leaf_offsets.push(i as u32);
-        }
-    }
-    leaf_offsets.push(n as u32);
-
-    let n_leaves = leaf_offsets.len() - 1;
-    (leaf_points, leaf_offsets, n_leaves)
-}
-
-/// Compute per-partition median dot values on CPU.
-///
-/// Used after each random projection step to determine the split threshold
-/// for bisecting each partition.
-///
-/// ### Params
-///
-/// * `partition_ids` - Current partition ID per point, length `n`
-/// * `dot_values` - Dot product of each point with the projection vector,
-///   length `n`
-/// * `n_partitions` - Number of active partitions at the current tree level
-///
-/// ### Returns
-///
-/// Vector of length `n_partitions` containing the median dot value for each
-/// partition. Empty partitions retain `T::zero()`.
-fn compute_partition_medians<T: AnnSearchFloat>(
-    partition_ids: &[u32],
-    dot_values: &[T],
-    n_partitions: usize,
-) -> Vec<T> {
-    // add 50% slack to the expected capacity to accommodate uneven splits
-    // and drastically reduce reallocation thrashing.
-    let expected_cap = dot_values.len() / n_partitions + (dot_values.len() / n_partitions / 2);
-    let mut buckets: Vec<Vec<T>> = vec![Vec::with_capacity(expected_cap); n_partitions];
-
-    for (&pid, &dot) in partition_ids.iter().zip(dot_values.iter()) {
-        let p = pid as usize;
-        if p < n_partitions {
-            buckets[p].push(dot);
-        }
-    }
-
-    // parallelise the median finding using Rayon - hopefully faster ... ?
-    buckets
-        .into_par_iter()
-        .map(|mut bucket| {
-            if bucket.is_empty() {
-                T::zero()
-            } else {
-                let mid = bucket.len() / 2;
-                bucket.select_nth_unstable_by(mid, |a, b| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                bucket[mid]
-            }
-        })
-        .collect()
-}
-
-//////////////////
-// ForestRouter //
-//////////////////
-
-/// Lightweight query-time router reusing GPU forest tree structure.
-/// Replaces the Annoy index for beam search entry point selection.
-pub struct ForestRouter<T: AnnSearchFloat> {
-    /// Per tree, per level: random projection vector [n_trees][max_depth][dim]
-    random_vecs: Vec<Vec<Vec<T>>>,
-    /// Per tree, per level: median per partition [n_trees][max_depth][variable]
-    medians: Vec<Vec<Vec<T>>>,
-    /// Per tree: leaves[partition_id] -> point indices [n_trees][2^max_depth][]
-    leaves: Vec<Vec<Vec<u32>>>,
-    /// Tree depth
-    max_depth: usize,
-    /// Original (unpadded) dimensionality
-    dim: usize,
-    /// Number of trees stored for routing
-    n_trees: usize,
-}
-
-impl<T: AnnSearchFloat> ForestRouter<T> {
-    /// Route a query through every stored tree using priority-queue
-    /// traversal (same strategy as Annoy) to find entry point candidates.
-    ///
-    /// Explores multiple leaves per tree by backtracking to the most
-    /// promising unexplored branches, ranked by distance to the split
-    /// hyperplane.
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The query for which to identify the entry points
-    ///
-    /// ### Returns
-    ///
-    /// Leaf-co-members
-    pub fn find_entry_points(&self, query: &[T], max_candidates: usize) -> Vec<usize> {
-        let mut candidates = Vec::new();
-        let q = &query[..self.dim];
-        let per_tree = (max_candidates / self.n_trees).max(1);
-
-        for t in 0..self.n_trees {
-            // Priority queue: (margin to hyperplane, pid, level)
-            // Smallest margin = most promising unexplored branch
-            let mut pq: BinaryHeap<Reverse<(OrderedFloat<T>, u32, usize)>> = BinaryHeap::new();
-            pq.push(Reverse((OrderedFloat(T::zero()), 0u32, 0usize)));
-
-            let mut found = 0usize;
-
-            while let Some(Reverse((_, pid, level))) = pq.pop() {
-                if found >= per_tree {
-                    break;
-                }
-
-                if level >= self.max_depth {
-                    // Reached a leaf
-                    if let Some(leaf) = self.leaves[t].get(pid as usize) {
-                        candidates.extend(leaf.iter().map(|&p| p as usize));
-                        found += leaf.len();
-                    }
-                    continue;
-                }
-
-                let dot = T::dot_simd(q, &self.random_vecs[t][level]);
-                let median = self.medians[t][level]
-                    .get(pid as usize)
-                    .copied()
-                    .unwrap_or_else(T::zero);
-                let margin = if dot <= median {
-                    median - dot
-                } else {
-                    dot - median
-                };
-
-                // Go to the preferred side first (margin = 0),
-                // push the other side with its actual margin
-                let (preferred, other) = if dot <= median {
-                    (pid * 2, pid * 2 + 1)
-                } else {
-                    (pid * 2 + 1, pid * 2)
-                };
-
-                pq.push(Reverse((OrderedFloat(T::zero()), preferred, level + 1)));
-                pq.push(Reverse((OrderedFloat(margin), other, level + 1)));
-            }
-        }
-
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates
-    }
-}
-
 ////////////////////////
 // Main orchestration //
 ////////////////////////
@@ -641,17 +355,17 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
 ///
 /// Split host/device. Every level's random projection is a function of the
 /// tree seed and the level index alone, so all `max_depth` projections are
-/// generated upfront and their dot products come off the device in one
-/// `compute_dot_products_multi` launch per tree: one readback per tree rather
-/// than one launch plus one blocking readback per level. Medians and the
-/// partition scatter then run on the host under rayon, and the leaf pairwise
-/// distances plus the proposal merge go back to the device.
+/// generated upfront. The trees then go in batches sized by
+/// [`plan_forest_batch`]: the batch's dot products come off the device in one
+/// `compute_dot_products_multi` launch and one readback, medians and the
+/// partition scatter run on the host under rayon, and the leaf pairwise
+/// distances plus the proposal merge go back to the device. Only one batch's
+/// projections are ever alive, `batch * max_depth * n` floats rather than
+/// `n_trees * max_depth * n`.
 ///
 /// ### Params
 ///
 /// * `vectors_gpu` - GPU-resident vector matrix `[n, dim_padded/LINE_SIZE]`
-/// * `norms_gpu` - GPU-resident L2 norms `[n]`; unused when `use_cosine` is
-///   false
 /// * `graph_idx_gpu` - kNN graph index buffer `[n, k]`; updated in-place
 /// * `graph_dist_gpu` - kNN graph distance buffer `[n, k]`; updated in-place
 /// * `prop_idx_gpu` - Proposal index scratch buffer `[n, MAX_PROPOSALS]`
@@ -676,15 +390,14 @@ impl<T: AnnSearchFloat> ForestRouter<T> {
 /// trees, for query-time entry-point routing. The graph itself lands in
 /// `graph_idx_gpu` / `graph_dist_gpu` in place.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_forest_init<T, R>(
-    vectors_gpu: &GpuTensor<R, T>,
-    norms_gpu: &GpuTensor<R, T>,
-    graph_idx_gpu: &GpuTensor<R, u32>,
-    graph_dist_gpu: &GpuTensor<R, T>,
-    prop_idx_gpu: &GpuTensor<R, u32>,
-    prop_dist_gpu: &GpuTensor<R, T>,
-    prop_count_gpu: &GpuTensor<R, u32>,
-    update_counter_gpu: &GpuTensor<R, u32>,
+pub fn gpu_forest_init<T>(
+    vectors_gpu: &GpuTensor<T>,
+    graph_idx_gpu: &GpuTensor<u32>,
+    graph_dist_gpu: &GpuTensor<T>,
+    prop_idx_gpu: &GpuTensor<u32>,
+    prop_dist_gpu: &GpuTensor<T>,
+    prop_count_gpu: &GpuTensor<u32>,
+    update_counter_gpu: &GpuTensor<u32>,
     n: usize,
     dim: usize,
     dim_padded: usize,
@@ -692,10 +405,9 @@ pub fn gpu_forest_init<T, R>(
     seed: usize,
     use_cosine: bool,
     verbose: bool,
-    client: &ComputeClient<R>,
+    client: &Client,
 ) -> Result<ForestRouter<T>, AnnSearchErrors>
 where
-    R: Runtime,
     T: AnnSearchFloat + CubeclFloat,
 {
     let limits = GpuLimits::from_client(client);
@@ -705,8 +417,12 @@ where
 
     let max_leaf_size = compute_max_leaf_size(dim_padded, size_of::<T>(), &limits)?;
 
-    // Decouple the depth calculation to target leaves of ~64
-    let target_leaf_size = 64.0;
+    // Leaves of ~64, but never more than the leaf kernel can stage. At high
+    // dim the capacity drops below 64 (10 points at dim 784 on 32 KiB) and the
+    // kernel would truncate every leaf, leaving most points without
+    // proposals. Deeper trees keep every point in play; at dim <= 64 the
+    // capacity is 256 and nothing changes.
+    let target_leaf_size = 64.0_f64.min(max_leaf_size as f64);
     let max_depth = if n as f64 <= target_leaf_size {
         0
     } else {
@@ -714,7 +430,7 @@ where
     };
 
     // How many trees to keep routing data for (query entry points)
-    let n_router_trees = n_trees.min(5);
+    let n_router_trees = n_trees.min(N_ROUTER_TREES);
 
     if verbose {
         println!(
@@ -724,175 +440,78 @@ where
     }
 
     let forest_start = Instant::now();
-
-    // Build trees in parallel
-    let cpu_start = Instant::now();
+    let mut tree_time = std::time::Duration::ZERO;
+    let mut merge_time = std::time::Duration::ZERO;
 
     let dot_grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
     let (dot_grid_x, dot_grid_y) = grid_2d(dot_grid, &limits)?;
 
-    // Every tree's projections up front, so the dot products for the whole
-    // forest are one upload, one launch and one readback. Per-tree launches
-    // from the rayon pool each paid their own upload and readback sync, and
-    // those serialised on the client.
-    let mut projections_flat = vec![T::zero(); n_trees * max_depth * dim_padded];
-    let mut tree_level_vecs: Vec<Vec<Vec<T>>> = Vec::with_capacity(n_trees);
-    for tree_idx in 0..n_trees {
-        let tree_seed =
-            (seed as u64).wrapping_add((tree_idx as u64).wrapping_mul(0x9E3779B97F4A7C15u64));
-        let mut level_vecs: Vec<Vec<T>> = Vec::with_capacity(max_depth);
-        for level in 0..max_depth {
-            let level_seed =
-                tree_seed.wrapping_add((level as u64).wrapping_mul(0x517CC1B727220A95u64));
-            let mut rng = SmallRng::seed_from_u64(level_seed);
-            let mut random_vec = vec![T::zero(); dim];
-            for v in random_vec.iter_mut() {
-                *v = T::from_f64(rng.random_range(-1.0..1.0)).unwrap();
-            }
-            let norm_sq: T = random_vec.iter().map(|x| *x * *x).sum();
-            let norm = num_traits::Float::sqrt(norm_sq);
-            if norm > T::zero() {
-                for x in random_vec.iter_mut() {
-                    *x /= norm;
-                }
-            }
-            let off = (tree_idx * max_depth + level) * dim_padded;
-            projections_flat[off..off + dim].copy_from_slice(&random_vec);
-            level_vecs.push(random_vec);
-        }
-        tree_level_vecs.push(level_vecs);
-    }
-
-    let all_dots = if max_depth > 0 {
-        let projections_gpu = GpuTensor::<R, T>::from_slice(
-            &projections_flat,
-            vec![n_trees * max_depth, dim_padded],
-            client,
-        )?;
-        let all_dots_gpu = GpuTensor::<R, T>::empty(vec![n_trees * max_depth, n], client)?;
-        let dot_count = checked_cube_count(
-            "compute_dot_products_multi",
-            dot_grid_x,
-            dot_grid_y,
-            n_trees as u32,
-            &limits,
-        )?;
-        unsafe {
-            compute_dot_products_multi::launch_unchecked::<T, R>(
-                client,
-                dot_count,
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.clone().into_tensor_arg(),
-                projections_gpu.into_tensor_arg(),
-                all_dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-                max_depth,
-            );
-        }
-        all_dots_gpu.read(client)?
-    } else {
-        Vec::new()
-    };
-
-    let all_tree_results: TreeResults<T> = tree_level_vecs
-        .into_par_iter()
-        .enumerate()
-        .map(|(tree_idx, level_vecs)| {
-            let save_routing = tree_idx < n_router_trees;
-            let mut partition_ids = vec![0u32; n];
-            let mut routing_vecs: Option<Vec<Vec<T>>> = if save_routing {
-                Some(Vec::with_capacity(max_depth))
-            } else {
-                None
-            };
-            let mut routing_medians: Option<Vec<Vec<T>>> = if save_routing {
-                Some(Vec::with_capacity(max_depth))
-            } else {
-                None
-            };
-
-            for (level, random_vec) in level_vecs.into_iter().enumerate() {
-                // Level-major within the tree, so each level's block is contiguous.
-                let off = (tree_idx * max_depth + level) * n;
-                let dot_values = &all_dots[off..off + n];
-                // CPU median computation (fast, O(n), parallelised internally)
-                let n_partitions = 1usize << level;
-                let medians = compute_partition_medians(&partition_ids, dot_values, n_partitions);
-                // CPU partition update (trivial parallel scatter)
-                partition_ids
-                    .par_iter_mut()
-                    .zip(dot_values.par_iter())
-                    .for_each(|(pid, &dot)| {
-                        let p = *pid as usize;
-                        *pid = if dot <= medians[p] {
-                            *pid * 2
-                        } else {
-                            *pid * 2 + 1
-                        };
-                    });
-                if save_routing {
-                    routing_vecs.as_mut().unwrap().push(random_vec);
-                    routing_medians.as_mut().unwrap().push(medians);
-                }
-            }
-            (partition_ids, routing_vecs, routing_medians)
-        })
-        .collect();
-
-    let leaf_structures: Vec<_> = all_tree_results
-        .par_iter()
-        .map(|tree| build_leaf_structure(&tree.0, n))
-        .collect();
-
-    if verbose {
-        println!("    Tree construction: {:.2?}", cpu_start.elapsed());
-    }
-
-    // build forest router
-    let mut router_rvecs = Vec::with_capacity(n_router_trees);
-    let mut router_medians = Vec::with_capacity(n_router_trees);
-    let mut router_leaves = Vec::with_capacity(n_router_trees);
-
-    for (partition_ids, rvecs_opt, medians_opt) in &all_tree_results[..n_router_trees] {
-        router_rvecs.push(rvecs_opt.clone().unwrap());
-        router_medians.push(medians_opt.clone().unwrap());
-
-        let max_pid = partition_ids
-            .iter()
-            .fold(0u32, |acc, &x| if x > acc { x } else { acc }) as usize;
-        let mut leaves = vec![Vec::new(); max_pid + 1];
-        for (i, &pid) in partition_ids.iter().enumerate() {
-            leaves[pid as usize].push(i as u32);
-        }
-        router_leaves.push(leaves);
-    }
-
-    let router = ForestRouter {
-        random_vecs: router_rvecs,
-        medians: router_medians,
-        leaves: router_leaves,
-        max_depth,
-        dim,
-        n_trees: n_router_trees,
-    };
-
-    // GPU phase: batched pairwise + merge
-    let gpu_start = Instant::now();
-    let trees_per_batch = 5;
+    // Projections for the whole forest are tiny; their dot products are not.
+    // Those go a batch of trees at a time: one upload, one launch and one
+    // readback per batch, then the batch is partitioned, proposed and merged
+    // before the next is projected.
+    let (projections_flat, tree_level_vecs) =
+        forest_projections::<T>(n_trees, max_depth, dim, dim_padded, seed);
+    let trees_per_batch = plan_forest_batch(n, max_depth, size_of::<T>(), FOREST_DOTS_BUDGET_BYTES);
     let n_batches = n_trees.div_ceil(trees_per_batch);
+    let mut level_vecs = tree_level_vecs.into_iter();
+    let mut router = ForestRouter::empty(max_depth, dim);
 
     for batch_idx in 0..n_batches {
         let batch_start = batch_idx * trees_per_batch;
-        let batch_end = (batch_start + trees_per_batch).min(n_trees);
+        let batch_trees = trees_per_batch.min(n_trees - batch_start);
 
+        let cpu_start = Instant::now();
+        let dots = if max_depth > 0 {
+            let rows = batch_trees * max_depth;
+            let off = batch_start * max_depth * dim_padded;
+            let projections_gpu = GpuTensor::<T>::from_slice(
+                &projections_flat[off..off + rows * dim_padded],
+                vec![rows, dim_padded],
+                client,
+            )?;
+            let dots_gpu = GpuTensor::<T>::empty(vec![rows, n], client)?;
+            let dot_count = checked_cube_count(
+                "compute_dot_products_multi",
+                dot_grid_x,
+                dot_grid_y,
+                batch_trees as u32,
+                &limits,
+            )?;
+            unsafe {
+                compute_dot_products_multi::launch_unchecked::<T>(
+                    client,
+                    dot_count,
+                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
+                    line,
+                    vectors_gpu.clone().into_tensor_arg(),
+                    projections_gpu.into_tensor_arg(),
+                    dots_gpu.clone().into_tensor_arg(),
+                    n as u32,
+                    dim_vec,
+                    max_depth,
+                );
+            }
+            dots_gpu.read(client)?
+        } else {
+            Vec::new()
+        };
+        let leaf_structures = partition_trees(
+            &dots,
+            level_vecs.by_ref().take(batch_trees).collect(),
+            batch_start,
+            n,
+            max_depth,
+            &mut router,
+        );
+        drop(dots);
+        tree_time += cpu_start.elapsed();
+
+        let gpu_start = Instant::now();
         let mut batch_leaf_points: Vec<u32> = Vec::new();
         let mut batch_leaf_offsets: Vec<u32> = Vec::new();
 
-        for tree_idx in batch_start..batch_end {
-            let (leaf_points, leaf_offsets, n_leaves) = &leaf_structures[tree_idx];
-
+        for (leaf_points, leaf_offsets, n_leaves) in &leaf_structures {
             if *n_leaves == 0 {
                 continue;
             }
@@ -903,6 +522,7 @@ where
             }
             batch_leaf_points.extend_from_slice(leaf_points);
         }
+        drop(leaf_structures);
 
         batch_leaf_offsets.push(batch_leaf_points.len() as u32);
         let batch_leaves = batch_leaf_offsets.len() - 1;
@@ -929,19 +549,19 @@ where
             continue;
         }
 
-        let leaf_points_gpu = GpuTensor::<R, u32>::from_slice(
+        let leaf_points_gpu = GpuTensor::<u32>::from_slice(
             &batch_leaf_points,
             vec![batch_leaf_points.len()],
             client,
         )?;
-        let leaf_offsets_gpu = GpuTensor::<R, u32>::from_slice(
+        let leaf_offsets_gpu = GpuTensor::<u32>::from_slice(
             &batch_leaf_offsets,
             vec![batch_leaf_offsets.len()],
             client,
         )?;
 
         unsafe {
-            reset_proposals::launch_unchecked::<R>(
+            reset_proposals::launch_unchecked(
                 client,
                 CubeCount::Static(grid_n_x, grid_n_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -954,13 +574,12 @@ where
         let (cubes_x, cubes_y) = grid_2d(batch_leaves as u32, &limits)?;
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<T, R>(
+            leaf_pairwise_proposals::launch_unchecked::<T>(
                 client,
                 CubeCount::Static(cubes_x, cubes_y, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.clone().into_tensor_arg(),
-                norms_gpu.clone().into_tensor_arg(),
                 leaf_points_gpu.into_tensor_arg(),
                 leaf_offsets_gpu.into_tensor_arg(),
                 graph_dist_gpu.clone().into_tensor_arg(),
@@ -976,7 +595,7 @@ where
             );
         }
 
-        launch_merge_proposals::<T, R>(
+        launch_merge_proposals::<T>(
             client,
             &limits,
             graph_idx_gpu,
@@ -988,13 +607,14 @@ where
             n,
             graph_idx_gpu.shape()[1],
         )?;
+        merge_time += gpu_start.elapsed();
     }
 
     if verbose {
+        println!("    Tree construction: {tree_time:.2?}");
         println!(
             "    GPU batched pairwise + merge ({} batches): {:.2?}",
-            n_batches,
-            gpu_start.elapsed()
+            n_batches, merge_time
         );
     }
 
@@ -1023,8 +643,8 @@ mod budget_tests {
             + leaf_size * dim_padded * elem_bytes
             // shared_pids
             + leaf_size * 4
-            // shared_norms + shared_thresh
-            + 2 * leaf_size * elem_bytes
+            // shared_thresh
+            + leaf_size * elem_bytes
     }
 
     fn limits_with(shared: usize) -> GpuLimits {
@@ -1090,12 +710,11 @@ mod budget_tests {
 mod tests {
     use super::*;
     use cubecl::wgpu::WgpuDevice;
-    use cubecl::wgpu::WgpuRuntime;
 
     fn try_device() -> Option<WgpuDevice> {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cubecl::wgpu::WgpuRuntime::client(&device);
+            cubecl::Device::from(device.clone()).client();
         }));
         result.ok().map(|_| device)
     }
@@ -1104,12 +723,12 @@ mod tests {
     const MAX_LEAF_SIZE: usize = 128;
 
     #[test]
-    fn test_dot_products_multi_matches_single() {
+    fn test_dot_products_multi_matches_host() {
         let Some(device) = try_device() else {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 133usize;
         let dim = 16usize;
@@ -1123,16 +742,14 @@ mod tests {
             .map(|i| ((i * 17 + 3) % 19) as f32 * 0.21 - 1.0)
             .collect();
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
         let proj_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&projections, vec![n_levels, dim], &client)
-                .unwrap();
-        let multi_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n_levels, n], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&projections, vec![n_levels, dim], &client).unwrap();
+        let multi_gpu = GpuTensor::<f32>::empty(vec![n_levels, n], &client).unwrap();
 
         let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
         unsafe {
-            compute_dot_products_multi::launch_unchecked::<f32, WgpuRuntime>(
+            compute_dot_products_multi::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(grid, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1147,256 +764,21 @@ mod tests {
         }
         let multi = multi_gpu.read(&client).unwrap();
 
-        // Same projections, one level at a time, through the reference kernel.
+        // Host reference, one level at a time.
         for level in 0..n_levels {
-            let rvec = projections[level * dim..(level + 1) * dim].to_vec();
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-            let single_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    single_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-            let single = single_gpu.read(&client).unwrap();
+            let rvec = &projections[level * dim..(level + 1) * dim];
             for i in 0..n {
+                let b: f32 = data[i * dim..(i + 1) * dim]
+                    .iter()
+                    .zip(rvec)
+                    .map(|(x, r)| x * r)
+                    .sum();
                 let a = multi[level * n + i];
-                let b = single[i];
                 assert!(
                     (a - b).abs() <= 1e-4 * b.abs().max(1.0),
-                    "level {level} point {i}: multi {a}, single {b}"
+                    "level {level} point {i}: multi {a}, host {b}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn test_dot_products_basic() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 4usize;
-        let dim = 4usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5,
-        ];
-        let rvec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let rvec_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                rvec_gpu.into_tensor_arg(),
-                dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-            );
-        }
-
-        let dots = dots_gpu.read(&client).unwrap();
-        let expected = [1.0f32, 0.0, 1.0, 0.5];
-        for (i, (&got, &exp)) in dots.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-5,
-                "dot[{i}]: got {got}, expected {exp}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dot_products_dim32() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 16usize;
-        let dim = 32usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = (0..n * dim).map(|idx| (idx / dim + 1) as f32).collect();
-        let rvec: Vec<f32> = vec![1.0; dim];
-
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let rvec_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                line,
-                vectors_gpu.into_tensor_arg(),
-                rvec_gpu.into_tensor_arg(),
-                dots_gpu.clone().into_tensor_arg(),
-                n as u32,
-                dim_vec,
-            );
-        }
-
-        let dots = dots_gpu.read(&client).unwrap();
-        for i in 0..n {
-            let expected = (i + 1) as f32 * dim as f32;
-            assert!(
-                (dots[i] - expected).abs() < 1e-2,
-                "dot[{i}]: got {}, expected {}",
-                dots[i],
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_partition_basic() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let n = 8usize;
-        let pids = vec![0u32; n];
-        let dots: Vec<f32> = (0..n).map(|i| i as f32).collect();
-        let medians: Vec<f32> = vec![3.5];
-
-        let pid_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&pids, vec![n], &client).unwrap();
-        let dot_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(&dots, vec![n], &client).unwrap();
-        let med_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![1], &client).unwrap();
-
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-        unsafe {
-            partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                &client,
-                CubeCount::Static(grid, 1, 1),
-                CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                pid_gpu.clone().into_tensor_arg(),
-                dot_gpu.into_tensor_arg(),
-                med_gpu.into_tensor_arg(),
-                n as u32,
-            );
-        }
-
-        let result = pid_gpu.read(&client).unwrap();
-        for i in 0..4 {
-            assert_eq!(result[i], 0, "point {i} should be in partition 0");
-        }
-        for i in 4..8 {
-            assert_eq!(result[i], 1, "point {i} should be in partition 1");
-        }
-    }
-
-    #[test]
-    fn test_partition_multilevel_with_cpu_medians() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let n = 16usize;
-        let line = LINE_SIZE;
-        let dim = 4usize;
-        let dim_vec = dim / line;
-
-        let data: Vec<f32> = (0..n).flat_map(|i| vec![i as f32, 0.0, 0.0, 0.0]).collect();
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-
-        let mut cpu_pids = vec![0u32; n];
-        let pid_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&cpu_pids, vec![n], &client).unwrap();
-
-        for level in 0..2usize {
-            let rvec: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-
-            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
-            let n_partitions = 1usize << level;
-            let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
-            let med_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client)
-                    .unwrap();
-
-            unsafe {
-                partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    med_gpu.into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            // Mirror on CPU
-            for i in 0..n {
-                let pid = cpu_pids[i] as usize;
-                cpu_pids[i] = if dots_cpu[i] <= medians[pid] {
-                    cpu_pids[i] * 2
-                } else {
-                    cpu_pids[i] * 2 + 1
-                };
-            }
-        }
-
-        // Verify GPU and CPU agree
-        let gpu_pids = pid_gpu.read(&client).unwrap();
-        assert_eq!(gpu_pids, cpu_pids, "GPU and CPU partition IDs must match");
-
-        let (_, leaf_offsets, n_leaves) = build_leaf_structure(&cpu_pids, n);
-        assert_eq!(n_leaves, 4, "2 levels should produce 4 leaves");
-
-        for i in 0..n_leaves {
-            let size = leaf_offsets[i + 1] - leaf_offsets[i];
-            assert!(
-                (2..=8).contains(&size),
-                "Leaf {i} has {size} points (expected ~4)"
-            );
         }
     }
 
@@ -1415,8 +797,8 @@ mod tests {
         let lanes = LINE_SIZE;
         let dim_scalars = dim_lines * lanes;
 
-        let mut shared_leaf_start = SharedMemory::<u32>::new(1usize);
-        let mut shared_leaf_size = SharedMemory::<u32>::new(1usize);
+        let mut shared_leaf_start = Shared::<[u32]>::new_slice(1usize);
+        let mut shared_leaf_size = Shared::<[u32]>::new_slice(1usize);
 
         if tx == 0u32 {
             let start = leaf_offsets[leaf_idx as usize];
@@ -1429,8 +811,8 @@ mod tests {
         let leaf_start = shared_leaf_start[0usize];
         let leaf_size = shared_leaf_size[0usize];
 
-        let mut shared_vecs = SharedMemory::<F>::new(max_leaf_size * dim_scalars);
-        let mut shared_pids = SharedMemory::<u32>::new(max_leaf_size);
+        let mut shared_vecs = Shared::<[F]>::new_slice(max_leaf_size * dim_scalars);
+        let mut shared_pids = Shared::<[u32]>::new_slice(max_leaf_size);
 
         let mut i = tx;
         while i < leaf_size {
@@ -1451,7 +833,7 @@ mod tests {
             if pid < n_pts {
                 let vec_offset = pid as usize * dim_lines + line_idx;
                 let line_val = vectors[vec_offset];
-                shared_vecs[idx_load] = line_val[lane];
+                shared_vecs[idx_load] = line_val.extract_dynamic(lane);
             }
             idx_load += WORKGROUP_SIZE_X as usize;
         }
@@ -1472,7 +854,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 8usize;
         let dim = 8usize;
@@ -1488,13 +870,10 @@ mod tests {
         let leaf_points: Vec<u32> = vec![2, 5, 7];
         let leaf_offsets: Vec<u32> = vec![0, 3];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![3], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
-        let out_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![3], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let out_gpu = GpuTensor::<f32>::from_slice(
             &vec![0.0f32; MAX_LEAF_SIZE * dim],
             vec![MAX_LEAF_SIZE * dim],
             &client,
@@ -1502,7 +881,7 @@ mod tests {
         .unwrap();
 
         unsafe {
-            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1536,7 +915,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 64usize;
         let dim = 32usize;
@@ -1552,13 +931,10 @@ mod tests {
         let leaf_points: Vec<u32> = vec![3, 10, 22, 31, 45, 50, 58, 63];
         let leaf_offsets: Vec<u32> = vec![0, 8];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![8], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
-        let out_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![8], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let out_gpu = GpuTensor::<f32>::from_slice(
             &vec![0.0f32; MAX_LEAF_SIZE * dim],
             vec![MAX_LEAF_SIZE * dim],
             &client,
@@ -1566,7 +942,7 @@ mod tests {
         .unwrap();
 
         unsafe {
-            debug_leaf_shared_roundtrip::launch_unchecked::<f32, WgpuRuntime>(
+            debug_leaf_shared_roundtrip::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -1600,7 +976,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
@@ -1614,32 +990,23 @@ mod tests {
         let leaf_offsets: Vec<u32> = vec![0, 4];
         let graph_dist = vec![f32::MAX; n * build_k];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1691,7 +1058,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 4usize;
         let dim = 4usize;
@@ -1712,36 +1079,30 @@ mod tests {
         let leaf_points: Vec<u32> = vec![0, 1, 2, 3];
         let leaf_offsets: Vec<u32> = vec![0, 4];
         let graph_dist = vec![f32::MAX; n * build_k];
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&norms, vec![n], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        // The kernel takes unit rows; the reference below keeps the raw ones.
+        let mut unit = data.clone();
+        crate::gpu::normalise_rows(&mut unit, dim);
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&unit, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![4], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         eprintln!(
                 "config: dim={dim} line={line} dim_vec={dim_vec} MAX_LEAF_SIZE={MAX_LEAF_SIZE} MAX_PROPOSALS={MAX_PROPOSALS}"
             );
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1793,7 +1154,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let line = LINE_SIZE;
         let n = 32usize;
         let dim = 32usize;
@@ -1807,32 +1168,23 @@ mod tests {
         let leaf_offsets: Vec<u32> = vec![0, 16];
         let graph_dist = vec![f32::MAX; n * build_k];
 
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
-        let lp_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
-        let lo_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
+        let vectors_gpu = GpuTensor::<f32>::from_slice(&data, vec![n, dim], &client).unwrap();
+        let lp_gpu = GpuTensor::<u32>::from_slice(&leaf_points, vec![16], &client).unwrap();
+        let lo_gpu = GpuTensor::<u32>::from_slice(&leaf_offsets, vec![2], &client).unwrap();
         let gdist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&graph_dist, vec![n, build_k], &client)
-                .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+            GpuTensor::<f32>::from_slice(&graph_dist, vec![n, build_k], &client).unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
 
         unsafe {
-            leaf_pairwise_proposals::launch_unchecked::<f32, WgpuRuntime>(
+            leaf_pairwise_proposals::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
                 line,
                 vectors_gpu.into_tensor_arg(),
-                norms_gpu.into_tensor_arg(),
                 lp_gpu.into_tensor_arg(),
                 lo_gpu.into_tensor_arg(),
                 gdist_gpu.into_tensor_arg(),
@@ -1880,7 +1232,7 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
         let n = 500usize;
         let dim = 8usize;
         let dim_padded = dim;
@@ -1895,33 +1247,24 @@ mod tests {
             .collect();
 
         let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
-        let norms_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&[0.0f32], vec![1], &client).unwrap();
-        let graph_idx_gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(
+            GpuTensor::<f32>::from_slice(&data, vec![n, dim_padded], &client).unwrap();
+        let graph_idx_gpu = GpuTensor::<u32>::from_slice(
             &vec![0x7FFFFFFFu32; n * build_k],
             vec![n, build_k],
             &client,
         )
         .unwrap();
-        let graph_dist_gpu = GpuTensor::<WgpuRuntime, f32>::from_slice(
-            &vec![f32::MAX; n * build_k],
-            vec![n, build_k],
-            &client,
-        )
-        .unwrap();
-        let prop_idx_gpu =
-            GpuTensor::<WgpuRuntime, u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
-        let prop_dist_gpu =
-            GpuTensor::<WgpuRuntime, f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let graph_dist_gpu =
+            GpuTensor::<f32>::from_slice(&vec![f32::MAX; n * build_k], vec![n, build_k], &client)
+                .unwrap();
+        let prop_idx_gpu = GpuTensor::<u32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
+        let prop_dist_gpu = GpuTensor::<f32>::empty(vec![n, MAX_PROPOSALS], &client).unwrap();
         let prop_count_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
-        let update_counter_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&[0u32], vec![1], &client).unwrap();
+            GpuTensor::<u32>::from_slice(&vec![0u32; n], vec![n], &client).unwrap();
+        let update_counter_gpu = GpuTensor::<u32>::from_slice(&[0u32], vec![1], &client).unwrap();
 
         let _ = gpu_forest_init(
             &vectors_gpu,
-            &norms_gpu,
             &graph_idx_gpu,
             &graph_dist_gpu,
             &prop_idx_gpu,
@@ -2003,14 +1346,14 @@ mod tests {
             eprintln!("Skipping: no wgpu backend");
             return;
         };
-        let client = WgpuRuntime::client(&device);
+        let client = cubecl::Device::from(device.clone()).client();
 
         let sentinel = 0x7FFFFFFFu32;
         let data = vec![5u32, 10 | (1u32 << 31), sentinel, 42u32];
-        let gpu = GpuTensor::<WgpuRuntime, u32>::from_slice(&data, vec![4], &client).unwrap();
+        let gpu = GpuTensor::<u32>::from_slice(&data, vec![4], &client).unwrap();
 
         unsafe {
-            mark_all_new::launch_unchecked::<WgpuRuntime>(
+            mark_all_new::launch_unchecked(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
@@ -2030,96 +1373,5 @@ mod tests {
         assert_eq!(result[2], sentinel);
         assert_eq!(result[3] & pid_mask, 42);
         assert_ne!(result[3] & is_new, 0);
-    }
-
-    #[test]
-    fn test_cpu_gpu_partition_mirror() {
-        let Some(device) = try_device() else {
-            eprintln!("Skipping: no wgpu backend");
-            return;
-        };
-        let client = WgpuRuntime::client(&device);
-        let line = LINE_SIZE;
-        let n = 64usize;
-        let dim = 8usize;
-        let dim_vec = dim / line;
-
-        // Random-ish data
-        let data: Vec<f32> = (0..n * dim)
-            .map(|i| ((i * 7 + 3) % 100) as f32 / 10.0)
-            .collect();
-        let vectors_gpu =
-            GpuTensor::<WgpuRuntime, f32>::from_slice(&data, vec![n, dim], &client).unwrap();
-        let dots_gpu = GpuTensor::<WgpuRuntime, f32>::empty(vec![n], &client).unwrap();
-        let grid = (n as u32).div_ceil(WORKGROUP_SIZE_X);
-
-        let mut cpu_pids = vec![0u32; n];
-        let pid_gpu =
-            GpuTensor::<WgpuRuntime, u32>::from_slice(&cpu_pids, vec![n], &client).unwrap();
-
-        // Run 4 levels with known random vecs
-        for level in 0..4usize {
-            let rvec: Vec<f32> = (0..dim)
-                .map(|j| ((level * 3 + j * 5 + 1) % 11) as f32 / 5.0 - 1.0)
-                .collect();
-            let rvec_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&rvec, vec![dim], &client).unwrap();
-
-            unsafe {
-                compute_dot_products::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    line,
-                    vectors_gpu.clone().into_tensor_arg(),
-                    rvec_gpu.into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    n as u32,
-                    dim_vec,
-                );
-            }
-
-            let dots_cpu = dots_gpu.clone().read(&client).unwrap();
-            let n_partitions = 1usize << level;
-            let medians = compute_partition_medians(&cpu_pids, &dots_cpu, n_partitions);
-            let med_gpu =
-                GpuTensor::<WgpuRuntime, f32>::from_slice(&medians, vec![n_partitions], &client)
-                    .unwrap();
-
-            unsafe {
-                partition_points::launch_unchecked::<f32, WgpuRuntime>(
-                    &client,
-                    CubeCount::Static(grid, 1, 1),
-                    CubeDim::new_2d(WORKGROUP_SIZE_X, 1),
-                    pid_gpu.clone().into_tensor_arg(),
-                    dots_gpu.clone().into_tensor_arg(),
-                    med_gpu.into_tensor_arg(),
-                    n as u32,
-                );
-            }
-
-            for i in 0..n {
-                let pid = cpu_pids[i] as usize;
-                cpu_pids[i] = if dots_cpu[i] <= medians[pid] {
-                    cpu_pids[i] * 2
-                } else {
-                    cpu_pids[i] * 2 + 1
-                };
-            }
-        }
-
-        let gpu_pids = pid_gpu.read(&client).unwrap();
-        assert_eq!(
-            gpu_pids, cpu_pids,
-            "GPU and CPU partitions diverged after 4 levels"
-        );
-
-        // Should have roughly 16 partitions (2^4) with ~4 points each
-        let unique: std::collections::HashSet<u32> = cpu_pids.iter().copied().collect();
-        println!(
-            "{} unique partitions from 4 levels of 64 points",
-            unique.len()
-        );
-        assert!(unique.len() >= 8 && unique.len() <= 16);
     }
 }
