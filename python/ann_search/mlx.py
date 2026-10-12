@@ -21,7 +21,7 @@ not follow `ann_search.set_num_threads`.
 from __future__ import annotations
 
 import threading
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 from beartype import beartype
@@ -29,6 +29,9 @@ from beartype import beartype
 from . import _ann_search as _core
 from ._base import BaseAnnIndex, ExtractKnnMixin
 from ._metrics import NO_MANHATTAN
+
+if TYPE_CHECKING:
+    from ._ann_search import _GpuHandle
 
 if not hasattr(_core, "ExhaustiveMlx"):  # pragma: no cover - build-dependent
     raise ImportError(
@@ -44,6 +47,8 @@ class _BaseMlxIndex(BaseAnnIndex):
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _FORCE_DTYPE: ClassVar[np.dtype | None] = np.dtype(np.float32)
     _SERIALISABLE: ClassVar[bool] = False
+    # Not a `_Handle`: no save/load. `_SERIALISABLE` keeps the base off those.
+    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[invalid-attribute-override]
 
     def fit(self, X: Any, y: Any = None) -> BaseAnnIndex:
         self._thread = threading.get_ident()
@@ -73,7 +78,7 @@ class ExhaustiveMlxIndex(_BaseMlxIndex):
         verbose: Device versus host time split, to the process stdout.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustiveMlx
+    _HANDLE = _core.ExhaustiveMlx
 
     @beartype
     def __init__(
@@ -110,7 +115,7 @@ class IvfMlxIndex(_BaseMlxIndex):
         verbose: Progress to the process stdout, not ``sys.stdout``.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfMlx
+    _HANDLE = _core.IvfMlx
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe", "nquery")
 
     @beartype
@@ -185,7 +190,7 @@ class CagraMlxIndex(ExtractKnnMixin, _BaseMlxIndex):
         set `beam_width` too.
     """
 
-    _HANDLE: ClassVar[type] = _core.CagraMlx
+    _HANDLE = _core.CagraMlx
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = (
         "beam_width",
         "max_beam_iters",

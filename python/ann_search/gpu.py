@@ -18,7 +18,7 @@ backend rather than choices:
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 from beartype import beartype
@@ -26,6 +26,9 @@ from beartype import beartype
 from . import _ann_search as _core
 from ._base import BaseAnnIndex, ExtractKnnMixin
 from ._metrics import NO_MANHATTAN
+
+if TYPE_CHECKING:
+    from ._ann_search import _GpuHandle
 
 if not hasattr(_core, "ExhaustiveGpu"):  # pragma: no cover - build-dependent
     raise ImportError(
@@ -52,6 +55,8 @@ class _BaseGpuIndex(BaseAnnIndex):
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _FORCE_DTYPE: ClassVar[np.dtype | None] = _GPU_DTYPE
     _SERIALISABLE: ClassVar[bool] = False
+    # Not a `_Handle`: no save/load. `_SERIALISABLE` keeps the base off those.
+    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[invalid-attribute-override]
 
 
 class ExhaustiveGpuIndex(_BaseGpuIndex):
@@ -73,7 +78,7 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.ExhaustiveGpu
+    _HANDLE = _core.ExhaustiveGpu
 
     @beartype
     def __init__(
@@ -125,7 +130,7 @@ class IvfGpuIndex(_BaseGpuIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.IvfGpu
+    _HANDLE = _core.IvfGpu
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe", "nquery")
 
     @beartype
@@ -232,7 +237,7 @@ class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
         from 100 to 16. If you touch one, set `beam_width` too.
     """
 
-    _HANDLE: ClassVar[type] = _core.CagraGpu
+    _HANDLE = _core.CagraGpu
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = (
         "beam_width",
         "max_beam_iters",

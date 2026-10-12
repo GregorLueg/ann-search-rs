@@ -50,7 +50,7 @@ class ExhaustiveIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Exhaustive
+    _HANDLE = _core.Exhaustive
 
     @beartype
     def __init__(
@@ -91,7 +91,7 @@ class KmknnIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Kmknn
+    _HANDLE = _core.Kmknn
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
 
     @beartype
@@ -145,7 +145,7 @@ class AnnoyIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Annoy
+    _HANDLE = _core.Annoy
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
@@ -203,7 +203,7 @@ class HnswIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Hnsw
+    _HANDLE = _core.Hnsw
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -266,7 +266,7 @@ class IvfIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Ivf
+    _HANDLE = _core.Ivf
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
@@ -355,7 +355,7 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.NnDescent
+    _HANDLE = _core.NnDescent
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -427,7 +427,7 @@ class VamanaIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Vamana
+    _HANDLE = _core.Vamana
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -491,7 +491,7 @@ class NsgIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Nsg
+    _HANDLE = _core.Nsg
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search",)
 
     @beartype
@@ -554,7 +554,7 @@ class BallTreeIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.BallTree
+    _HANDLE = _core.BallTree
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
@@ -605,7 +605,7 @@ class KdTreeIndex(BaseAnnIndex):
         not exposed here.
     """
 
-    _HANDLE: ClassVar[type] = _core.KdTree
+    _HANDLE = _core.KdTree
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("search_budget",)
 
     @beartype
@@ -665,7 +665,7 @@ class LshIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.Lsh
+    _HANDLE = _core.Lsh
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("n_probe", "max_candidates")
 
@@ -748,7 +748,7 @@ class SoarIndex(BaseAnnIndex):
         ValueError: On `fit`, if `rule` is not one of the three names.
     """
 
-    _HANDLE: ClassVar[type] = _core.Soar
+    _HANDLE = _core.Soar
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("nprobe",)
 
@@ -828,7 +828,7 @@ class RnnDescentIndex(BaseAnnIndex):
             that lands in the terminal running the kernel.
     """
 
-    _HANDLE: ClassVar[type] = _core.RnnDescent
+    _HANDLE = _core.RnnDescent
     _SEARCH_KNOBS: ClassVar[tuple[str, ...]] = ("ef_search", "k_search")
 
     @beartype
