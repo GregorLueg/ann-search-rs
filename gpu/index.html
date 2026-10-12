@@ -495,6 +495,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#mlx-on-apple-silicon-experimental" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MLX on Apple Silicon (experimental)
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -701,6 +712,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../api/mlx/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    MLX indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../api/base/" class="md-nav__link">
         
   
@@ -849,6 +888,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#mlx-on-apple-silicon-experimental" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MLX on Apple Silicon (experimental)
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -987,6 +1037,111 @@ megabytes matter, build from source without it:</p>
 <p><code>gpu_available()</code> then returns False on any machine, and
 <code>import ann_search.gpu</code> raises with an explanation. Everything on the CPU side
 is untouched.</p>
+<h2 id="mlx-on-apple-silicon-experimental">MLX on Apple Silicon (experimental)<a class="headerlink" href="#mlx-on-apple-silicon-experimental" title="Permanent link">&para;</a></h2>
+<p>On a Mac, wgpu leaves speed on the table. The Rust crate has a second backend
+that drives Metal through <a href="https://github.com/ml-explore/mlx">MLX</a> instead, and
+three estimators mirror the GPU ones: <code>ExhaustiveMlxIndex</code>, <code>IvfMlxIndex</code> and
+<code>CagraMlxIndex</code>. Same recall, less time, on every step:</p>
+<table>
+<thead>
+<tr>
+<th>150k cells, k = 15</th>
+<th style="text-align: right;">32 dims, wgpu</th>
+<th style="text-align: right;">32 dims, MLX</th>
+<th style="text-align: right;">128 dims, wgpu</th>
+<th style="text-align: right;">128 dims, MLX</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Exhaustive, query</td>
+<td style="text-align: right;">178 ms</td>
+<td style="text-align: right;">65 ms</td>
+<td style="text-align: right;">458 ms</td>
+<td style="text-align: right;">122 ms</td>
+</tr>
+<tr>
+<td>Exhaustive, self-kNN</td>
+<td style="text-align: right;">1.74 s</td>
+<td style="text-align: right;">0.64 s</td>
+<td style="text-align: right;">4.53 s</td>
+<td style="text-align: right;">1.24 s</td>
+</tr>
+<tr>
+<td>IVF, fit</td>
+<td style="text-align: right;">123 ms</td>
+<td style="text-align: right;">63 ms</td>
+<td style="text-align: right;">395 ms</td>
+<td style="text-align: right;">149 ms</td>
+</tr>
+<tr>
+<td>IVF, query</td>
+<td style="text-align: right;">52 ms</td>
+<td style="text-align: right;">19 ms</td>
+<td style="text-align: right;">70 ms</td>
+<td style="text-align: right;">39 ms</td>
+</tr>
+<tr>
+<td>IVF, self-kNN</td>
+<td style="text-align: right;">330 ms</td>
+<td style="text-align: right;">171 ms</td>
+<td style="text-align: right;">561 ms</td>
+<td style="text-align: right;">369 ms</td>
+</tr>
+<tr>
+<td>CAGRA, fit</td>
+<td style="text-align: right;">651 ms</td>
+<td style="text-align: right;">582 ms</td>
+<td style="text-align: right;">1.51 s</td>
+<td style="text-align: right;">1.06 s</td>
+</tr>
+<tr>
+<td>CAGRA, query</td>
+<td style="text-align: right;">97 ms</td>
+<td style="text-align: right;">10 ms</td>
+<td style="text-align: right;">132 ms</td>
+<td style="text-align: right;">43 ms</td>
+</tr>
+<tr>
+<td>CAGRA, self-kNN</td>
+<td style="text-align: right;">784 ms</td>
+<td style="text-align: right;">87 ms</td>
+<td style="text-align: right;">935 ms</td>
+<td style="text-align: right;">354 ms</td>
+</tr>
+</tbody>
+</table>
+<p>That's <code>make_cell_embeddings</code> with 15k queries from <code>subsample_queries</code>,
+default parameters, median of three warm calls on an M1 Max. Recall@15 is
+identical between the two backends: 1.0 for exhaustive and CAGRA, 0.9997 to
+0.9999 for IVF. CAGRA's beam search gains the most, about 9x at 32 dimensions,
+but its build barely moves, so that still dominates a one-off self-kNN. For
+scale, the CPU <code>ExhaustiveIndex</code> takes 590 ms for the same 128-dimensional query
+batch, so on this machine wgpu barely beats it and MLX is nearly 5x faster.</p>
+<p>They're not in the wheel. MLX's C API isn't on PyPI, so shipping it would mean
+bundling its dylibs and Metal library into every macOS wheel. Build from source
+instead:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>brew<span class="w"> </span>install<span class="w"> </span>mlx-c
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release<span class="w"> </span>--features<span class="w"> </span>mlx
+</code></pre></div>
+<p>If mlx-c lives somewhere other than <code>/opt/homebrew</code>, point <code>MLX_C_PREFIX</code> at
+it. If it isn't found at all, the build warns and carries on without MLX, so
+check:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">if</span> <span class="n">ann</span><span class="o">.</span><span class="n">mlx_available</span><span class="p">():</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="n">index</span> <span class="o">=</span> <span class="n">ann</span><span class="o">.</span><span class="n">CagraMlxIndex</span><span class="p">(</span><span class="n">n_neighbors</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="n">distances</span><span class="p">,</span> <span class="n">indices</span> <span class="o">=</span> <span class="n">index</span><span class="o">.</span><span class="n">kneighbors</span><span class="p">()</span>
+</code></pre></div>
+<p>Parameters match the GPU estimators, minus <code>quantise_to_f16</code> on IVF and
+<code>retain_gpu</code> on CAGRA. The same three backend constraints apply (float32, no
+persistence, no Manhattan), plus two of MLX's own:</p>
+<ul>
+<li><strong>One thread per index.</strong> MLX streams belong to the thread that made them,
+  so a fitted index raises if touched from any other Python thread. Build and
+  query in the same one.</li>
+<li><strong><code>set_num_threads</code> doesn't reach it.</strong> The host-side work inside the MLX
+  paths runs on rayon's global pool. Set <code>RAYON_NUM_THREADS</code> before import if
+  you need to cap it.</li>
+</ul>
 
 
 

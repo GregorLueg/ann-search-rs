@@ -797,6 +797,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../mlx/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    MLX indices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../base/" class="md-nav__link">
         
   
@@ -2034,7 +2062,7 @@ that lands in the terminal running the kernel.</p>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    <span class="n">n_neighbors</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">=</span> <span class="mi">15</span><span class="p">,</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="n">metric</span><span class="p">:</span> <span class="n"><span title="str">str</span></span> <span class="o">=</span> <span class="s2">"euclidean"</span><span class="p">,</span>
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="n">delta</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">=</span> <span class="mf">0.001</span><span class="p">,</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">diversify_prob</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">diversify_prob</span><span class="p">:</span> <span class="n"><span title="float">float</span></span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">max_iter</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">max_candidates</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">n_trees</span><span class="p">:</span> <span class="n"><span title="int">int</span></span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -2059,12 +2087,14 @@ On the benchmark runs it wins at 128 dimensions, where <code>extract_knn</code>
 reaches recall 1.0 in roughly half the time <code>KmknnIndex</code> needs. At 32
 dimensions <code>KmknnIndex</code> and <code>IvfIndex</code> get there first, exactly. Measure
 both on your data.</p>
-<p><code>diversify_prob</code> prunes redundant edges after descent: <code>0.0</code> disables it,
-<code>1.0</code> prunes whenever the rule fires.</p>
+<p><code>diversify_prob</code> prunes redundant edges from the graph queries walk:
+<code>0.0</code> disables it, <code>1.0</code> prunes whenever the rule fires. On the
+ann-benchmarks runs <code>1.0</code> gives 2.7x the queries per second at equal
+recall on SIFT and GloVe; on easy low-dimensional data it buys nothing and
+costs ~15% more build time.</p>
 <p><code>extract_knn</code> hands back the converged graph instead of searching for it
-again, which is far cheaper than <code>kneighbors(None)</code>. It reads the
-post-pruning graph, so leave <code>diversify_prob</code> at 0 if extraction is the
-point.</p>
+again, which is far cheaper than <code>kneighbors(None)</code>. It reads the full
+kNN graph whatever <code>diversify_prob</code> is.</p>
 
 
 <p><span class="doc-section-title">Parameters:</span></p>
@@ -2140,12 +2170,12 @@ updated edges falls below it.</p>
             <td>
               <div class="doc-md-description">
                 <p>Probability of pruning an edge the occlusion rule
-fires on, after descent. <code>0.0</code> disables pruning, <code>1.0</code> prunes
-every time.</p>
+fires on, in the query graph only. <code>0.0</code> disables pruning,
+<code>1.0</code> prunes every time.</p>
               </div>
             </td>
             <td>
-                  <code>0.0</code>
+                  <code>1.0</code>
             </td>
           </tr>
           <tr class="doc-section-item">
@@ -2193,7 +2223,8 @@ knob on the build; 30 to 60 is the useful range.</p>
             <td>
               <div class="doc-md-description">
                 <p>Random projection trees used to seed the initial graph.
-<code>None</code> defaults to <code>min(5 + round(n ** 0.25), 12)</code>.</p>
+<code>None</code> defaults to <code>min(5 + round(sqrt(n) / 20), 64)</code>, scanpy's
+setting.</p>
               </div>
             </td>
             <td>
