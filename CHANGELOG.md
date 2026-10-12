@@ -31,13 +31,6 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 **Performance**
 
 - GPU NN-Descent drops mutual-neighbour duplicates before the local join.
-- MLX index builds release MLX's buffer cache once they finish. MLX CAGRA on
-  SIFT-1M held 9.7 GB resident after the build, now 3.9 GB.
-- Lower peak memory in the wgpu and MLX NN-Descent builds: the forest
-  projections run in batches instead of materialising every tree, MLX evaluates
-  each batch and drops its cache between phases, host graph buffers go once
-  consumed, and the MLX CAGRA searcher takes the build's device vectors instead
-  of uploading a second copy.
 - GPU forest leaves that filled the shared-memory budget exactly (dim 128 on a
   32 KiB device) ran far slower on Apple Silicon. Staging now keeps one point of
   headroom.
