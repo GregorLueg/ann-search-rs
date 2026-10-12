@@ -30,7 +30,7 @@
 //!    wrong: `index out of bounds: the len is 15000 but the index is
 //!    1109321353`, i.e. `0x4218E949`, the f32 bit pattern of ~38.24 -- a
 //!    distance value leaking into an index slot.
-//! 4. `SharedMemory::new` wants kernel scope, never inside a branch.
+//! 4. `Shared::new_slice` wants kernel scope, never inside a branch.
 
 #![allow(missing_docs)] // complains about cubecl macros...
 

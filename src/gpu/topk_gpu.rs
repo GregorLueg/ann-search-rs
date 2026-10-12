@@ -1525,7 +1525,7 @@ mod host_tests {
     /// The two kernels' footprints must match what they actually allocate.
     ///
     /// Over-allocating shared memory fails silently on this backend, so a
-    /// formula that drifts from the `SharedMemory::new` calls is the worst kind
+    /// formula that drifts from the `Shared::new_slice` calls is the worst kind
     /// of bug available here.
     #[test]
     fn test_smem_formula_matches_allocations() {

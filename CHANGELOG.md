@@ -48,7 +48,15 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Breaking changes**
 
-Only matters if you launch the GPU kernels yourself.
+- CubeCL 0.11 dropped the runtime generic. The GPU builders take a type-erased
+  `cubecl::Device` instead of `R::Device`, so
+  `build_*_gpu::<f32, WgpuRuntime>(..., device)` becomes
+  `build_*_gpu::<f32>(..., device.into())`. Same for `k_means_clusters_gpu`.
+- The `gpu-cpu` feature is gone. The cubecl-cpu runtime in 0.11 caps a cube at
+  `available_parallelism` units, and every kernel here launches 32- or
+  128-wide cubes, which fail silently there.
+
+Only matters if you launch the GPU kernels yourself:
 
 - The Euclidean and cosine kernel pairs merged behind a comptime flag:
   `euclidean_tiled` / `cosine_tiled` are now `dist_tiled`, and likewise
@@ -73,6 +81,7 @@ Only matters if you launch the GPU kernels yourself.
 
 - `wide` floor raised to 1.6.0, which replaced the deprecated `blend` with
   `select`.
+- `cubecl` 0.10 to 0.11, `cubecl-utils-rs` 0.1 to 0.2, `faer` 0.23 to 0.24.
 
 ## 0.10.1
 
