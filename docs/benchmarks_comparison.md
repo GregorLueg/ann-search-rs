@@ -90,7 +90,7 @@ uv run bench.py summarise
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 1.6 | 767 | 429 | 23,525 | 23,525 | 11,610 |
-| annoy | annoy | 4.6 | 502 | 308 | n/a | n/a | n/a |
+| annoy | annoy | 4.5 | 437 | 244 | 10,409 | 6,306 | 3,501 |
 | cagra | **ann_search_mlx** | 4.6 | 762 | 454 | 179,972 | 179,972 | 156,966 |
 | cagra | **ann_search_gpu** | 6.4 | 1,945 | 1,634 | 55,274 | 55,274 | 37,455 |
 | exhaustive | **ann_search_mlx** | 0.0 | 585 | 428 | 66,472 | 66,472 | 66,472 |
@@ -119,7 +119,7 @@ The ann-benchmarks convention.
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 5.8 | 749 | 322 | 4,516 | 4,516 | 2,213 |
-| annoy | annoy | 17.8 | 431 | 251 | n/a | n/a | n/a |
+| annoy | annoy | 18.1 | 424 | 244 | 1,422 | 790 | 435 |
 | exhaustive | faiss | 0.0 | 359 | 180 | 8,776 | 8,776 | 8,776 |
 | exhaustive | **ann_search** | 0.0 | 404 | 225 | 5,166 | 5,166 | 5,166 |
 | hnsw | **ann_search_sq8** | 8.7 | 583 | 53 | 50,327 | 32,368 | 19,967 |
@@ -140,7 +140,7 @@ The ann-benchmarks convention.
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.90 | QPS @ 0.95 | QPS @ 0.99 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 8.0 | 2,422 | 1,186 | 11,885 | 6,720 | 3,180 |
-| annoy | annoy | 18.4 | 1,777 | 1,240 | n/a | n/a | n/a |
+| annoy | annoy | 18.3 | 1,760 | 1,244 | 8,100 | 4,657 | 1,301 |
 | cagra | **ann_search_mlx** | 12.6 | 4,131 | 1,403 | 71,048 | 43,839 | 13,612 |
 | cagra | **ann_search_gpu** | 17.9 | 5,175 | 4,682 | 66,072 | 30,851 | 3,890 |
 | exhaustive | **ann_search_mlx** | 0.1 | 1,470 | 1,364 | 12,899 | 12,899 | 12,899 |
@@ -167,7 +167,7 @@ The ann-benchmarks convention.
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.70 | QPS @ 0.80 | QPS @ 0.90 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 11.6 | 2,388 | 1,182 | 6,844 | 3,065 | 1,648 |
-| annoy | annoy | 25.1 | 1,981 | 1,511 | n/a | n/a | n/a |
+| annoy | annoy | 26.4 | 2,117 | 1,613 | 3,400 | 1,515 | 844 |
 | cagra | **ann_search_mlx** | 17.7 | 4,485 | 1,570 | 60,705 | 34,136 | n/a |
 | cagra | **ann_search_gpu** | 22.3 | 8,470 | 7,703 | 28,725 | 9,880 | n/a |
 | exhaustive | **ann_search_mlx** | 0.1 | 1,356 | 1,356 | 7,254 | 7,254 | 7,254 |
@@ -191,5 +191,5 @@ The ann-benchmarks convention.
 
 ### Runtime info
 
-*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max.*
+*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max. Runs span commits py-v0.5.0-1-g137e44e, py-v0.5.0-dirty, v0.10.1-76-g288b4d6.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
