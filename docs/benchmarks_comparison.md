@@ -167,7 +167,7 @@ The ann-benchmarks convention.
 | Method | Library | Build (s) | Build peak (MiB) | Index (MiB) | QPS @ 0.70 | QPS @ 0.80 | QPS @ 0.90 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | annoy | **ann_search** | 11.6 | 2,388 | 1,182 | 6,844 | 3,065 | 1,648 |
-| annoy | annoy | 26.8 | 2,174 | 1,652 | 3,415 | 1,501 | 851 |
+| annoy | annoy | 26.4 | 2,117 | 1,613 | 3,400 | 1,515 | 844 |
 | cagra | **ann_search_mlx** | 17.7 | 4,485 | 1,570 | 60,705 | 34,136 | n/a |
 | cagra | **ann_search_gpu** | 22.3 | 8,470 | 7,703 | 28,725 | 9,880 | n/a |
 | exhaustive | **ann_search_mlx** | 0.1 | 1,356 | 1,356 | 7,254 | 7,254 | 7,254 |
@@ -191,5 +191,5 @@ The ann-benchmarks convention.
 
 ### Runtime info
 
-*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max. Runs span commits py-v0.5.0-dirty, v0.10.1-76-g288b4d6.*
+*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max. Runs span commits py-v0.5.0-1-g137e44e, py-v0.5.0-dirty, v0.10.1-76-g288b4d6.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
