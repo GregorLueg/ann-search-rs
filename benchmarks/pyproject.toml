@@ -36,6 +36,8 @@ ann-search = { "maturin.build-args" = "--features mlx" }
 # annoy 1.17.3 builds with -ffast-math, which recent clang reads as
 # finite-math-only. Its search queue starts at infinity, so every query then
 # returns a single wrong id. Same flags as its setup.py, plus the opt-out.
+# uv's wheel cache ignores these variables and reinstalls a wheel built without
+# them, so after changing them run `uv cache clean annoy` before syncing.
 [tool.uv.extra-build-variables]
 annoy = { ANNOY_COMPILER_ARGS = "-D_CRT_SECURE_NO_WARNINGS,-fpermissive,-O3,-ffast-math,-fno-associative-math,-fno-finite-math-only,-DANNOYLIB_MULTITHREADED_BUILD,-std=c++14,-mmacosx-version-min=10.12" }
 
