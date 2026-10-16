@@ -270,7 +270,7 @@ where
 
     let n_t = T::from_usize(sample_indices.len().max(1)).unwrap();
     for m in mean.iter_mut() {
-        *m = *m / n_t;
+        *m /= n_t;
     }
 
     mean
@@ -533,7 +533,7 @@ fn itq_rotate_projections<T>(
         for d in 0..dim {
             let mut acc = T::zero();
             for l in 0..k {
-                acc = acc + rotation[(l, j)] * original[l * dim + d];
+                acc += rotation[(l, j)] * original[l * dim + d];
             }
             projections[j * dim + d] = acc;
         }

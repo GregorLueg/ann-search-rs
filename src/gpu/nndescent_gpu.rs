@@ -729,12 +729,14 @@ pub fn local_join_shared<F: Float, N: Size>(
                 let pid = shared_pids[read as usize];
                 let is_new = shared_is_new[read as usize];
                 let mut keep = 0u32;
+                #[allow(clippy::collapsible_if)] // cubecl quirks
                 if is_new == 1u32 {
                     if n_new < cand_cap {
                         keep = 1u32;
                         n_new += 1u32;
                     }
                 }
+                #[allow(clippy::collapsible_if)] // cubecl quirks
                 if is_new == 0u32 {
                     if n_old < cand_cap {
                         keep = 1u32;

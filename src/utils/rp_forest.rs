@@ -241,7 +241,7 @@ pub(crate) fn forest_projections<T: AnnSearchFloat>(
             let norm = num_traits::Float::sqrt(norm_sq);
             if norm > T::zero() {
                 for x in random_vec.iter_mut() {
-                    *x = *x / norm;
+                    *x /= norm;
                 }
             }
             let off = (tree_idx * max_depth + level) * dim_padded;

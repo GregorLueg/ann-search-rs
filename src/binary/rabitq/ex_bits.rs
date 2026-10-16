@@ -546,7 +546,7 @@ where
     let mut ip_sign = T::zero();
     for (d, &q) in query_rotated.iter().enumerate() {
         if encoding.sign_code[d / 8] >> (d % 8) & 1 == 1 {
-            ip_sign = ip_sign + q;
+            ip_sign += q;
         }
     }
 
@@ -554,7 +554,7 @@ where
     if ex_bits > 0 {
         let levels = unpack_excode(&encoding.ex_code, dim, ex_bits);
         for (&level, &q) in levels.iter().zip(query_rotated) {
-            ip_ex = ip_ex + q * T::from_u8(level).unwrap_or_else(T::zero);
+            ip_ex += q * T::from_u8(level).unwrap_or_else(T::zero);
         }
     }
 

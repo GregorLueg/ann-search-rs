@@ -235,7 +235,7 @@ where
                     .sqrt();
                 if norm > T::epsilon() {
                     for i in start..end {
-                        centroids_flat[i] = centroids_flat[i] / norm;
+                        centroids_flat[i] /= norm;
                     }
                 }
             }
@@ -433,7 +433,7 @@ where
                     .sqrt();
                 if norm > T::epsilon() {
                     for i in start..end {
-                        centroids_flat[i] = centroids_flat[i] / norm;
+                        centroids_flat[i] /= norm;
                     }
                 }
             }

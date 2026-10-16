@@ -366,7 +366,7 @@ where
     pub fn offset_dot(&self, code: &[u8]) -> T {
         let mut acc = T::zero();
         for j in 0..self.dim {
-            acc = acc + self.offsets[j] * T::from_u8(code[j]).unwrap();
+            acc += self.offsets[j] * T::from_u8(code[j]).unwrap();
         }
         acc
     }

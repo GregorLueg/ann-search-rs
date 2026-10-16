@@ -259,7 +259,7 @@ where
         for prev in 0..col {
             let mut dot = T::zero();
             for row in 0..dim {
-                dot = dot + b[(row, col)] * b[(row, prev)];
+                dot += b[(row, col)] * b[(row, prev)];
             }
             for row in 0..dim {
                 b[(row, col)] = b[(row, col)] - dot * b[(row, prev)];
@@ -267,12 +267,12 @@ where
         }
         let mut norm_sq = T::zero();
         for row in 0..dim {
-            norm_sq = norm_sq + b[(row, col)] * b[(row, col)];
+            norm_sq += b[(row, col)] * b[(row, col)];
         }
         let norm = norm_sq.sqrt();
         if norm > T::epsilon() {
             for row in 0..dim {
-                b[(row, col)] = b[(row, col)] / norm;
+                b[(row, col)] /= norm;
             }
         }
     }
@@ -431,7 +431,7 @@ where
             let z: f64 = rng.sample(StandardNormal);
             let amp = T::from_f64(z * global_spec[k] * sg).unwrap();
             for j in 0..dim {
-                data[(i, j)] = data[(i, j)] + amp * global_basis[(j, k)];
+                data[(i, j)] += amp * global_basis[(j, k)];
             }
         }
 
@@ -441,7 +441,7 @@ where
             let z: f64 = rng.sample(StandardNormal);
             let amp = T::from_f64(z * spec[k] * sl).unwrap();
             for j in 0..dim {
-                data[(i, j)] = data[(i, j)] + amp * basis[(j, k)];
+                data[(i, j)] += amp * basis[(j, k)];
             }
         }
     }
@@ -463,7 +463,7 @@ where
             let z: f64 = rng.sample(StandardNormal);
             let amp = T::from_f64(z * global_spec[k] * sg).unwrap();
             for j in 0..dim {
-                data[(row, j)] = data[(row, j)] + amp * global_basis[(j, k)];
+                data[(row, j)] += amp * global_basis[(j, k)];
             }
         }
         assignments.push(if t < 0.5 { a } else { b });
@@ -602,7 +602,7 @@ where
         for prev in 0..r {
             let mut dot = T::zero();
             for c in 0..embedding_dim {
-                dot = dot + rotation[(r, c)] * rotation[(prev, c)];
+                dot += rotation[(r, c)] * rotation[(prev, c)];
             }
             for c in 0..embedding_dim {
                 rotation[(r, c)] = rotation[(r, c)] - dot * rotation[(prev, c)];
@@ -610,12 +610,12 @@ where
         }
         let mut norm_sq = T::zero();
         for c in 0..embedding_dim {
-            norm_sq = norm_sq + rotation[(r, c)] * rotation[(r, c)];
+            norm_sq += rotation[(r, c)] * rotation[(r, c)];
         }
         let norm = norm_sq.sqrt();
         if norm > T::epsilon() {
             for c in 0..embedding_dim {
-                rotation[(r, c)] = rotation[(r, c)] / norm;
+                rotation[(r, c)] /= norm;
             }
         }
     }
@@ -626,7 +626,7 @@ where
         for j in 0..embedding_dim {
             let mut sum = T::zero();
             for k in 0..intrinsic_dim {
-                sum = sum + low[(i, k)] * rotation[(k, j)];
+                sum += low[(i, k)] * rotation[(k, j)];
             }
             let noise: f64 = rng.sample(StandardNormal);
             high[(i, j)] = sum + T::from_f64(noise * noise_std).unwrap();
@@ -766,7 +766,7 @@ where
             let z: f64 = rng.sample(StandardNormal);
             let amp = T::from_f64(z * spec[k]).unwrap();
             for j in 0..dim {
-                data[(row, j)] = data[(row, j)] + amp * basis[(j, k)];
+                data[(row, j)] += amp * basis[(j, k)];
             }
         }
         labels.push(leaf);
@@ -797,7 +797,7 @@ where
             let z: f64 = rng.sample(StandardNormal);
             let amp = T::from_f64(z * spec[k]).unwrap();
             for j in 0..dim {
-                data[(row, j)] = data[(row, j)] + amp * basis[(j, k)];
+                data[(row, j)] += amp * basis[(j, k)];
             }
         }
         labels.push(leaf);
