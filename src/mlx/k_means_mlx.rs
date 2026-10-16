@@ -381,6 +381,59 @@ pub fn assign_all_mlx(
     Ok(out)
 }
 
+/// k-means on MLX: train the centroids and assign every point.
+///
+/// The MLX counterpart of `k_means_clusters_gpu`, for callers outside this
+/// crate: it runs on the default GPU stream, so no [`Stream`] crosses the
+/// API, and clears the MLX buffer cache before returning.
+///
+/// ### Params
+///
+/// * `data` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist` - `"euclidean"` or `"cosine"`; an unknown string falls back to
+///   squared Euclidean, `"manhattan"` is rejected
+/// * `n_centroids` - Number of centroids
+/// * `params` - Optional [`KMeansTrainingParams`]; `iters`, `init` and
+///   `balanced` are honoured, `path` is ignored
+/// * `seed` - Seed for the initialisation
+/// * `verbose` - Controls verbosity
+///
+/// ### Returns
+///
+/// `(centroid matrix of shape n_centroids x dim, assignments)`
+pub fn k_means_clusters_mlx(
+    data: impl AnnMatrix<f32>,
+    dist: &str,
+    n_centroids: usize,
+    params: Option<KMeansTrainingParams>,
+    seed: usize,
+    verbose: bool,
+) -> Result<(faer::Mat<f32>, Vec<usize>), AnnSearchErrors> {
+    let metric = parse_ann_dist(dist).unwrap_or_else(|| {
+        println!("Unknown string provided ({dist:?}). Defaulting to Squared Euclidean");
+        Dist::default()
+    });
+    let (data, n, dim) = data.into_row_major();
+    let s = Stream::default_gpu();
+    let centroids = train_centroids_mlx(
+        &data,
+        dim,
+        n,
+        n_centroids,
+        &metric,
+        params,
+        seed,
+        &s,
+        verbose,
+    )?;
+    let assignments = assign_all_mlx(&data, dim, &centroids, n_centroids, &metric, &s)?;
+    crate::mlx::clear_cache()?;
+    let mat = faer::Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
+    Ok((mat, assignments))
+}
+
 ///////////
 // Tests //
 ///////////
@@ -490,6 +543,53 @@ mod tests {
             // Near-ties may flip through the GEMM expansion.
             assert!(agree as f64 / n as f64 > 0.995, "{metric:?}: {agree}/{n}");
         }
+    }
+
+    /// The Stream-free entry gives a full-size centroid matrix, one
+    /// assignment per point and an inertia within 2% of the CPU k-means.
+    #[test]
+    fn test_k_means_clusters_mlx_matches_cpu() {
+        let (n, dim, k) = (4_000, 16, 40);
+        let data = blobs(n, dim, 25, 11);
+        let params = KMeansTrainingParams::new(15, Some(KMeansInit::KMeansParallel), None);
+        let (cent, assign) =
+            k_means_clusters_mlx((&data[..], n, dim), "euclidean", k, Some(params), 7, false)
+                .unwrap();
+        assert_eq!((cent.nrows(), cent.ncols()), (k, dim));
+        assert_eq!(assign.len(), n);
+        let flat: Vec<f32> = (0..k)
+            .flat_map(|i| (0..dim).map(move |j| (i, j)))
+            .map(|(i, j)| cent[(i, j)])
+            .collect();
+
+        let cpu = train_centroids(
+            &data,
+            dim,
+            n,
+            k,
+            &Dist::SquaredEuclidean,
+            Some(params),
+            7,
+            false,
+        )
+        .unwrap();
+        let ones_n = vec![1.0f32; n];
+        let ones_k = vec![1.0f32; k];
+        let cpu_assign = assign_all_parallel(
+            &data,
+            &ones_n,
+            dim,
+            n,
+            &cpu,
+            &ones_k,
+            k,
+            &Dist::SquaredEuclidean,
+        );
+        let (a, b) = (
+            inertia(&data, dim, &flat, &assign),
+            inertia(&data, dim, &cpu, &cpu_assign),
+        );
+        assert!((a - b).abs() / b < 0.02, "mlx {a} vs cpu {b}");
     }
 
     #[test]
