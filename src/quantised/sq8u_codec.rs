@@ -106,7 +106,7 @@ where
             rows.par_chunks_mut(dim).for_each(|row| {
                 let norm = T::calculate_l2_norm(row);
                 if norm > T::epsilon() {
-                    row.iter_mut().for_each(|x| *x = *x / norm);
+                    row.iter_mut().for_each(|x| *x /= norm);
                 }
             });
             owned = rows;

@@ -280,13 +280,13 @@ pub fn compute_medoid<T: AnnSearchFloat>(
     for i in 0..n {
         let offset = i * dim;
         for d in 0..dim {
-            centroid[d] = centroid[d] + vectors_flat[offset + d];
+            centroid[d] += vectors_flat[offset + d];
         }
     }
 
     let n_float = T::from_usize(n).unwrap();
     for d in 0..dim {
-        centroid[d] = centroid[d] / n_float;
+        centroid[d] /= n_float;
     }
 
     // if using Cosine distance, normalise the centroid
@@ -294,7 +294,7 @@ pub fn compute_medoid<T: AnnSearchFloat>(
         let norm = T::calculate_l2_norm(&centroid);
         if norm > T::zero() {
             for d in 0..dim {
-                centroid[d] = centroid[d] / norm;
+                centroid[d] /= norm;
             }
         }
     }

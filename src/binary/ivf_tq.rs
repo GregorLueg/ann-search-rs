@@ -241,7 +241,7 @@ where
                 let norm = compute_l2_norm(&centroids[start..end]);
                 if norm > T::epsilon() {
                     for x in &mut centroids[start..end] {
-                        *x = *x / norm;
+                        *x /= norm;
                     }
                 }
             }

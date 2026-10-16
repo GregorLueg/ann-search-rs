@@ -341,8 +341,8 @@ where
         // Two accumulators so the adds do not form one serial chain.
         let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
         for (row, &byte) in sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
-            sign_lo = sign_lo + row[(byte & 0x0f) as usize];
-            sign_hi = sign_hi + row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
+            sign_lo += row[(byte & 0x0f) as usize];
+            sign_hi += row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
         }
         let ip_sign = sign_lo + sign_hi;
 
@@ -364,7 +364,7 @@ where
             let word = u64::from_le_bytes(buf);
             for j in 0..CODE_GROUP {
                 let level = (word >> (j * w)) & mask;
-                acc[j] = acc[j] + q[j] * T::from_u64(level).unwrap_or_else(T::zero);
+                acc[j] += q[j] * T::from_u64(level).unwrap_or_else(T::zero);
             }
         }
         let ip_ex = acc.iter().fold(T::zero(), |a, &b| a + b);
@@ -419,8 +419,8 @@ where
         let sign = &self.sign_codes[node * n_bytes..(node + 1) * n_bytes];
         let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
         for (row, &byte) in query.sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
-            sign_lo = sign_lo + row[(byte & 0x0f) as usize];
-            sign_hi = sign_hi + row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
+            sign_lo += row[(byte & 0x0f) as usize];
+            sign_hi += row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
         }
         let ip_sign = sign_lo + sign_hi;
 
@@ -703,7 +703,7 @@ where
             flat.par_chunks_mut(dim).for_each(|row| {
                 let norm = compute_l2_norm(row);
                 if norm > T::epsilon() {
-                    row.iter_mut().for_each(|x| *x = *x / norm);
+                    row.iter_mut().for_each(|x| *x /= norm);
                 }
             });
         }

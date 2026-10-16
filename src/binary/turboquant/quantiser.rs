@@ -187,7 +187,7 @@ where
                 }
             }
             // Accumulate <u, x̂> using the level we just chose for this coord.
-            dot_self = dot_self + rotated[d] * self.levels[code as usize];
+            dot_self += rotated[d] * self.levels[code as usize];
             // Bit-plane layout: bit p of `code` lands in plane p of byte
             // (d/8) at position 7-(d%8). High-bit-first ordering matches
             // what the SIMD re-pack expects.

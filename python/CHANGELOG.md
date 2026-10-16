@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.5.1
+
+Requires `ann-search-rs` 0.11.1
+
+- Takes in the minor updates from `ann-search-rs` without any impact on the
+  Python side.
+
 ## 0.5.0
 
 Requires `ann-search-rs` 0.11.0

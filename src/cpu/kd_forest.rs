@@ -196,7 +196,7 @@ where
                 if norm > T::zero() {
                     let start = i * dim;
                     for d in 0..dim {
-                        nv[start + d] = nv[start + d] / norm;
+                        nv[start + d] /= norm;
                     }
                 }
             }

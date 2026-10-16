@@ -419,13 +419,13 @@ fn compute_centroid<T: AnnSearchFloat>(vectors_flat: &[T], n: usize, dim: usize)
     for i in 0..n {
         let base = i * dim;
         for d in 0..dim {
-            centroid[d] = centroid[d] + vectors_flat[base + d];
+            centroid[d] += vectors_flat[base + d];
         }
     }
     if n > 0 {
         let inv_n = T::one() / T::from_usize(n).unwrap();
         for d in 0..dim {
-            centroid[d] = centroid[d] * inv_n;
+            centroid[d] *= inv_n;
         }
     }
     centroid

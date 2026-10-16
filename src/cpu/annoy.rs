@@ -443,8 +443,8 @@ where
                         let val1 = v1[k];
                         let val2 = v2[k];
                         hp.push(val1 - val2);
-                        dot_v1 = dot_v1 + val1 * val1;
-                        dot_v2 = dot_v2 + val2 * val2;
+                        dot_v1 += val1 * val1;
+                        dot_v2 += val2 * val2;
                     }
 
                     let thresh = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();

@@ -1697,7 +1697,7 @@ where
                 s[i] = dist;
             }
         }
-        s[i] = s[i] * half;
+        s[i] *= half;
     }
 
     s
@@ -1867,7 +1867,7 @@ fn hamerly_lloyd<T>(
             .zip(lower.par_iter_mut())
             .zip(assignments.par_iter())
             .for_each(|((u, l), &a)| {
-                *u = *u + deltas[a];
+                *u += deltas[a];
                 let other_max = if a == max_delta_idx {
                     second_max_delta
                 } else {
@@ -3196,7 +3196,7 @@ where
                     // vanishes and the arm falls back to nearest-excluding.
                     let inv_r1 = safe_recip(T::calculate_l2_norm(r1_hat.as_slice()));
                     for v in r1_hat.iter_mut() {
-                        *v = *v * inv_r1;
+                        *v *= inv_r1;
                     }
 
                     // <x, r_hat_1> does not depend on the candidate, so hoist it

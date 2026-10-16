@@ -790,7 +790,7 @@ where
                 *norm_out = norm;
 
                 if normalise && norm > T::epsilon() {
-                    row.iter_mut().for_each(|x| *x = *x / norm);
+                    row.iter_mut().for_each(|x| *x /= norm);
                 }
             });
 

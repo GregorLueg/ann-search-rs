@@ -264,7 +264,7 @@ fn full_lloyd_pq<T>(
                     let vec = &data[i * dim..(i + 1) * dim];
                     let offset = cluster * dim;
                     for d in 0..dim {
-                        sums[offset + d] = sums[offset + d] + vec[d];
+                        sums[offset + d] += vec[d];
                     }
                     (sums, counts)
                 },
@@ -273,7 +273,7 @@ fn full_lloyd_pq<T>(
                 || (vec![T::zero(); k * dim], vec![0usize; k]),
                 |(mut sums1, mut counts1), (sums2, counts2)| {
                     for i in 0..sums1.len() {
-                        sums1[i] = sums1[i] + sums2[i];
+                        sums1[i] += sums2[i];
                     }
                     for i in 0..counts1.len() {
                         counts1[i] += counts2[i];
