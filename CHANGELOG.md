@@ -3,6 +3,12 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.11.1
+
+**Feature**
+
+- `k_means_clusters_mlx()` is a public function now to be used in other crates.
+
 ## 0.11.0
 
 **Features**
