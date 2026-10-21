@@ -3,6 +3,17 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.11.2
+
+**Chore**
+
+- `faer` is pulled in without its default `npy` feature. Nothing here reads
+  `.npy` files, and the feature dragged `npyz` -> `py_literal` -> `pest_derive`
+  -> `stacker` into the build. On Windows ARM64 cross-builds (MSVC host,
+  `aarch64-pc-windows-gnullvm` target) the `stacker` build script fails to find
+  `windows.h`. Dependants have to drop the `npy` default as well, as feature
+  unification brings it back otherwise.
+
 ## 0.11.1
 
 **Feature**
