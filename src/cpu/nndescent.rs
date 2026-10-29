@@ -1156,17 +1156,16 @@ where
         );
         let graph: Vec<(u32, T)> = build_graph
             .into_iter()
-            .map(|nb| (nb.pid() as u32, nb.dist))
+            .map(|nb| (nb.pid(), nb.dist))
             .collect();
 
         // Diversification only shapes what the query walks. Extraction and
         // NSG keep the full kNN graph.
         let query_graph: Vec<u32> = if diversify_prob > T::zero() {
-            let wide: Vec<(usize, T)> = graph.iter().map(|&(p, d)| (p as usize, d)).collect();
             builder
-                .diversify_graph(&wide, k, diversify_prob, seed)
+                .diversify_graph(&graph, k, diversify_prob, seed)
                 .into_iter()
-                .map(|(pid, _)| pid as u32)
+                .map(|(pid, _)| pid)
                 .collect()
         } else {
             graph.iter().map(|&(pid, _)| pid).collect()
@@ -1294,7 +1293,7 @@ where
     ///
     /// Flat graph of size `n * k` with Annoy-seeded initial neighbours
     fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
-        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
         let search_k = k * self.forest().n_trees();
 
@@ -1305,7 +1304,7 @@ where
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
                 self.forest_entries(query, k + 1, search_k, scratch);
                 for (j, &(dist, idx)) in scratch.candidates.iter().skip(1).take(k).enumerate() {
-                    slot[j] = Neighbour::new(idx, dist, true);
+                    slot[j] = Neighbour::new(idx as u32, dist, true);
                 }
             });
 
@@ -1328,7 +1327,7 @@ where
     ///
     /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
     fn init_with_leaf_join(&self, forest: &AnnoyTrees<T>, k: usize) -> Vec<Neighbour<T>> {
-        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
         for tree in 0..forest.n_trees() {
             let leaves: Vec<&[u32]> = forest.tree_leaves(tree).collect();
@@ -1360,8 +1359,8 @@ where
                 for (a, &p) in block.iter().enumerate() {
                     for &q in &block[a + 1..] {
                         let d = self.distance(p as usize, q as usize);
-                        insert_sorted(row(p), q as usize, d);
-                        insert_sorted(row(q), p as usize, d);
+                        insert_sorted(row(p), q, d);
+                        insert_sorted(row(q), p, d);
                     }
                 }
             }
@@ -1397,7 +1396,7 @@ where
     ///
     /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
     fn init_with_streamed_trees(&self, n_trees: usize, seed: usize, k: usize) -> Vec<Neighbour<T>> {
-        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
@@ -1521,7 +1520,7 @@ where
         );
         let graph: Vec<(u32, T)> = graph
             .into_iter()
-            .map(|nb| (nb.pid() as u32, nb.dist))
+            .map(|nb| (nb.pid(), nb.dist))
             .collect();
 
         KnnGraph::from_rows(&graph, n, k, params.include_self, params.return_dist)
@@ -1835,10 +1834,10 @@ where
                             continue;
                         }
                         let j = slot.pid();
-                        if j >= n {
+                        if j as usize >= n {
                             continue;
                         }
-                        let entry = (edge_priority(iter_seed, i as u32, j as u32), j as u32);
+                        let entry = (edge_priority(iter_seed, i as u32, j), j);
                         if slot.is_new() {
                             new_temp.push(entry);
                         } else {
@@ -1892,8 +1891,8 @@ where
                     continue;
                 }
                 let j = slot.pid();
-                if fwd_i.binary_search(&(j as u32)).is_ok()
-                    || cands.new_forward(j).binary_search(&(i as u32)).is_ok()
+                if fwd_i.binary_search(&j).is_ok()
+                    || cands.new_forward(j as usize).binary_search(&(i as u32)).is_ok()
                 {
                     slot.mark_old();
                 }
@@ -2128,17 +2127,17 @@ where
     ///
     /// ### Returns
     ///
-    /// `Vec<Vec<(usize, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
+    /// `Vec<Vec<(u32, T)>>` of length `n`. Entry `v` lists `(u, d(u, v))`
     /// for every source `u` that has `v` in its forward list.
-    fn build_reverse_adjacency(&self, graph: &[(usize, T)], k: usize) -> Vec<Vec<(usize, T)>> {
-        let mut reverse: Vec<Vec<(usize, T)>> = (0..self.n).map(|_| Vec::new()).collect();
+    fn build_reverse_adjacency(&self, graph: &[(u32, T)], k: usize) -> Vec<Vec<(u32, T)>> {
+        let mut reverse: Vec<Vec<(u32, T)>> = (0..self.n).map(|_| Vec::new()).collect();
         for u in 0..self.n {
             let row = &graph[u * k..(u + 1) * k];
             for &(v, d) in row {
-                if v == SENTINEL_PID {
+                if v == SENTINEL_PID as u32 {
                     continue;
                 }
-                reverse[v].push((u, d));
+                reverse[v as usize].push((u as u32, d));
             }
         }
         reverse
@@ -2170,27 +2169,27 @@ where
     /// disconnected components).
     fn diversify_graph(
         &self,
-        graph: &[(usize, T)],
+        graph: &[(u32, T)],
         k: usize,
         prune_prob: T,
         seed: usize,
-    ) -> Vec<(usize, T)> {
+    ) -> Vec<(u32, T)> {
         let reverse = self.build_reverse_adjacency(graph, k);
-        let mut result = vec![(SENTINEL_PID, T::max_value()); self.n * k];
+        let mut result = vec![(SENTINEL_PID as u32, T::max_value()); self.n * k];
         let prune_prob_f64 = prune_prob.to_f64().unwrap();
 
         result
             .par_chunks_mut(k)
             .enumerate()
             .for_each(|(i, out_slot)| {
-                let mut pool: Vec<(usize, T)> = Vec::with_capacity(2 * k);
+                let mut pool: Vec<(u32, T)> = Vec::with_capacity(2 * k);
                 for &entry in &graph[i * k..(i + 1) * k] {
-                    if entry.0 != SENTINEL_PID && entry.0 != i {
+                    if entry.0 != SENTINEL_PID as u32 && entry.0 as usize != i {
                         pool.push(entry);
                     }
                 }
                 for &entry in &reverse[i] {
-                    if entry.0 != i {
+                    if entry.0 as usize != i {
                         pool.push(entry);
                     }
                 }
@@ -2211,15 +2210,15 @@ where
                 });
 
                 let mut rng = SmallRng::seed_from_u64((seed as u64).wrapping_add(i as u64));
-                let mut kept: Vec<(usize, T)> = Vec::with_capacity(k);
-                let mut pruned: Vec<(usize, T)> = Vec::new();
+                let mut kept: Vec<(u32, T)> = Vec::with_capacity(k);
+                let mut pruned: Vec<(u32, T)> = Vec::new();
 
                 kept.push(pool[0]);
 
                 for &(cand_idx, cand_dist) in &pool[1..] {
                     let mut should_keep = true;
                     for &(kept_idx, _) in &kept {
-                        let dist_to_kept = self.distance(cand_idx, kept_idx);
+                        let dist_to_kept = self.distance(cand_idx as usize, kept_idx as usize);
                         if dist_to_kept < cand_dist && rng.random::<f64>() < prune_prob_f64 {
                             should_keep = false;
                             break;
@@ -2449,7 +2448,7 @@ const LEAF_JOIN_BLOCK: usize = 256;
 ///
 /// Whether the row changed.
 #[inline(always)]
-fn insert_sorted<T: AnnSearchFloat>(row: &mut [Neighbour<T>], src: usize, d: T) -> bool {
+fn insert_sorted<T: AnnSearchFloat>(row: &mut [Neighbour<T>], src: u32, d: T) -> bool {
     let k = row.len();
     if d > row[k - 1].dist {
         return false;
@@ -2525,7 +2524,7 @@ impl<T: AnnSearchFloat> ApplySortedUpdates<T> for NNDescent<T> {
                     if update.dist > cutoff {
                         continue;
                     }
-                    if insert_sorted(row, update.source as usize, update.dist) {
+                    if insert_sorted(row, update.source, update.dist) {
                         cutoff = row[k - 1].dist;
                         edge_updates += 1;
                     }
@@ -3507,7 +3506,7 @@ mod tests {
         let graph: Vec<Neighbour<f32>> = index
             .graph
             .iter()
-            .map(|&(pid, d)| Neighbour::new(pid as usize, d, true))
+            .map(|&(pid, d)| Neighbour::new(pid, d, true))
             .collect();
         index.build_candidates(&graph, index.k, max_candidates, 42, &mut cands);
 

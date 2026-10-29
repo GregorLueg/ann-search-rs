@@ -31,7 +31,7 @@ const PARALLEL_BUCKET_THRESHOLD: usize = 100;
 /////////////
 
 /// Type alias for the Neighbour updates
-pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
+pub type NeighbourUpdates<T> = Vec<(u32, Vec<(OrderedFloat<T>, u32)>)>;
 
 impl<T: Ord> Default for SortedBuffer<T> {
     fn default() -> Self {
@@ -319,9 +319,9 @@ where
         // empty graph would be a no-op.
         let ep = self.entry_point as usize;
 
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.max_layer as usize + 1];
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.max_layer as usize + 1];
         for node in (0..self.n).filter(|&id| id != ep) {
-            buckets[self.layer_assignments[node] as usize].push(node);
+            buckets[self.layer_assignments[node] as usize].push(node as u32);
         }
 
         if verbose {
@@ -341,10 +341,10 @@ where
             let bucket_start = Instant::now();
             let parallel = bucket.len() > PARALLEL_BUCKET_THRESHOLD;
 
-            let insert = |node: usize| {
+            let insert = |node: u32| {
                 Self::with_build_state(|state_cell| {
                     let mut state = state_cell.borrow_mut();
-                    self.insert_node(node, graph, &mut state);
+                    self.insert_node(node as usize, graph, &mut state);
                 });
             };
 

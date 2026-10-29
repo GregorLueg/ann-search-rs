@@ -434,8 +434,8 @@ where
 
                 for update in segment {
                     let d = update.dist;
-                    let src = update.source as usize;
-                    if src == target {
+                    let src = update.source;
+                    if src as usize == target {
                         continue;
                     }
                     if degree == k && d > row[k - 1].dist {
@@ -622,7 +622,7 @@ where
         };
 
         // Working flat graph in Neighbour<T> form during build.
-        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
         let mut build_graph = vec![sentinel; n * params.r];
 
         // One grouper for the whole build: every pass reuses its cursor array
@@ -730,7 +730,7 @@ where
             with_dist.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
 
             for (i, (d, v)) in with_dist.into_iter().enumerate() {
-                slot[i] = Neighbour::new(v, d, true);
+                slot[i] = Neighbour::new(v as u32, d, true);
             }
         });
     }
@@ -827,16 +827,18 @@ where
                                 continue;
                             }
 
-                            let v_row = &flat[v * dim..v * dim + dim];
+                            let v_row = &flat[v as usize * dim..v as usize * dim + dim];
                             let mut pruned = false;
                             for t in 0..j {
                                 let w = slot[t].pid();
-                                let w_row = &flat[w * dim..w * dim + dim];
-                                let d_vw = Self::row_distance(v_row, w_row, norms, v, w, metric);
+                                let w_row = &flat[w as usize * dim..w as usize * dim + dim];
+                                let d_vw = Self::row_distance(
+                                    v_row, w_row, norms, v as usize, w as usize, metric,
+                                );
                                 // RNG prune rule from Alg. 4.
                                 if v_dist >= d_vw {
-                                    emitted.push(Update::new(w as u32, v as u32, d_vw));
-                                    counts[w].fetch_add(1, AtomicOrdering::Relaxed);
+                                    emitted.push(Update::new(w, v, d_vw));
+                                    counts[w as usize].fetch_add(1, AtomicOrdering::Relaxed);
                                     pruned = true;
                                     break;
                                 }
@@ -852,7 +854,7 @@ where
                         // everything from the old degree onwards is already
                         // sentinel.
                         for i in j..degree {
-                            slot[i] = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+                            slot[i] = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
                         }
 
                         local_emits.append(emitted);
@@ -938,8 +940,8 @@ where
                     }
                     // Reverse edge: target = entry.pid, source = u.
                     let pid = entry.pid();
-                    local.push(Update::new(pid as u32, u as u32, entry.dist));
-                    counts[pid].fetch_add(1, AtomicOrdering::Relaxed);
+                    local.push(Update::new(pid, u as u32, entry.dist));
+                    counts[pid as usize].fetch_add(1, AtomicOrdering::Relaxed);
                 }
                 local
             })

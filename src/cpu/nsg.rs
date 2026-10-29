@@ -1309,10 +1309,10 @@ where
     /// * `verbose` - Print progress
     fn dfs_connectivity_fix(&self, build_graph: &NsgConstructionGraph<T>, verbose: bool) {
         let mut reachable = vec![false; self.n];
-        let mut stack: Vec<usize> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
         let np = self.navigating_node as usize;
         reachable[np] = true;
-        stack.push(np);
+        stack.push(self.navigating_node);
 
         let mut patch_count = 0usize;
         let mut cursor = 0usize;
@@ -1322,12 +1322,12 @@ where
             // edges. Persistent reachable[] means restarts don't retraverse.
             while let Some(node) = stack.pop() {
                 // SAFETY: sequential phase.
-                let nbrs = unsafe { build_graph.get_neighbours_slice(node) };
+                let nbrs = unsafe { build_graph.get_neighbours_slice(node as usize) };
                 for &(nbr, _) in nbrs {
                     let n_idx = nbr as usize;
                     if !reachable[n_idx] {
                         reachable[n_idx] = true;
-                        stack.push(n_idx);
+                        stack.push(nbr);
                     }
                 }
             }
@@ -1352,7 +1352,7 @@ where
             // Mark u reachable and restart DFS from u so its outgoing
             // subtree flood-fills in the next iteration.
             reachable[u] = true;
-            stack.push(u);
+            stack.push(u as u32);
             patch_count += 1;
         }
 

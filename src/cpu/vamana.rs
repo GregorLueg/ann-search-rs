@@ -520,10 +520,11 @@ where
 
         for (alpha, l_build) in passes {
             // random permutation of nodes for unbiased parallel updates
-            let mut permutation: Vec<usize> = (0..n).collect();
+            let mut permutation: Vec<u32> = (0..n as u32).collect();
             permutation.shuffle(&mut rng());
 
             permutation.par_iter().for_each(|&p| {
+                let p = p as usize;
                 // thread-local search state
                 Self::with_build_state(|state_cell| {
                     let mut state = state_cell.borrow_mut();
