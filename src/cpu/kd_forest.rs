@@ -3,6 +3,9 @@
 //! Uses a forest of randomised Kd-trees for approximate nearest neighbour
 //! search. Each tree splits along coordinate axes selected randomly from
 //! the top highest-spread dimensions, providing diversity across trees.
+//!
+//! As with Annoy, the trees ([`KdTrees`]) are kept apart from the vectors and
+//! each tree partitions one `u32` permutation in place.
 
 use faer::RowRef;
 use fixedbitset::FixedBitSet;
@@ -33,41 +36,18 @@ use crate::utils::*;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-struct KdFlatNode<T> {
+pub(crate) struct KdFlatNode<T> {
     /// `1` for leaf, `2` for split node
     n_descendants: u32,
-    /// For split: left child index; For leaf: start index in leaf_indices
+    /// Split: left child index. Leaf: start within its tree's permutation
     child_a: u32,
-    /// For split: right child index; For leaf: count of items
+    /// Split: right child index. Leaf: number of items
     child_b: u32,
-    /// Dimension along which the split occurs (split only)
-    split_dim: u16,
-    /// Explicit padding
-    _pad: u16,
+    /// Split: dimension along which the split occurs. Leaf: the tree it
+    /// belongs to, so the leaf start stays tree-local
+    split_dim: u32,
     /// Threshold value for the split (split only)
     split_val: T,
-}
-
-/// Build-time node representation
-///
-/// Temporary structure used during tree construction, later flattened
-/// into KdFlatNode format for better cache performance during queries.
-#[derive(Clone)]
-enum BuildNode<T> {
-    Split {
-        /// Dimension index for the split
-        split_dim: usize,
-        /// Threshold value along that dimension
-        split_val: T,
-        /// Index of left child in build tree
-        left: usize,
-        /// Index of right child in build tree
-        right: usize,
-    },
-    Leaf {
-        /// Original data indices in this leaf
-        items: Vec<usize>,
-    },
 }
 
 /// Number of top-spread dimensions to randomly select from. Provides diversity
@@ -77,6 +57,482 @@ const TOP_K_DIMS: usize = 3;
 /// Maximum sample size for spread estimation and approximate median
 /// computation. Keeps build cost per node O(1) rather than O(n).
 const SUBSAMPLE_SIZE: usize = 128;
+
+/// Per-tree build scratch, reused across every node of the tree.
+struct KdScratch<T> {
+    /// Subsampled ids for spread and median estimation
+    sample: Vec<u32>,
+    /// Sample values along the candidate dimension
+    vals: Vec<T>,
+    /// Staging for the right-hand items during the stable partition
+    right: Vec<u32>,
+}
+
+/////////////
+// KdTrees //
+/////////////
+
+/// The Kd forest of a [`KdTreeIndex`], without the vectors.
+///
+/// Tree `t` owns `leaf_indices[t * n..(t + 1) * n]`. For Cosine the trees are
+/// built on normalised vectors, so [`Self::visit`] wants a normalised query.
+#[derive(Clone)]
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) struct KdTrees<T> {
+    /// Flattened tree structure containing all split and leaf nodes
+    nodes: Vec<KdFlatNode<T>>,
+    /// Starting node of each tree in the forest
+    roots: Vec<u32>,
+    /// Point ids stored in the leaves, `n` per tree
+    leaf_indices: Vec<u32>,
+    /// Number of points each tree partitions
+    n: usize,
+    /// Metric the margin lower bound is taken in
+    metric: Dist,
+}
+
+impl<T> KdTrees<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Build the forest in parallel, one tree per task.
+    ///
+    /// ### Params
+    ///
+    /// * `build_vectors` - Flattened vector data, normalised for Cosine
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality of vectors
+    /// * `n_trees` - Number of trees to build
+    /// * `metric` - Distance metric, used for the query-time bound
+    /// * `seed` - Random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// The forest, with ids in the order of `build_vectors`.
+    pub(crate) fn build(
+        build_vectors: &[T],
+        n: usize,
+        dim: usize,
+        n_trees: usize,
+        metric: Dist,
+        seed: usize,
+    ) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed as u64);
+        let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
+
+        let mut leaf_indices = vec![0u32; n_trees * n];
+        let parts: Vec<Vec<KdFlatNode<T>>> = leaf_indices
+            .par_chunks_mut(n.max(1))
+            .zip(seeds.into_par_iter())
+            .map(|(perm, tree_seed)| Self::build_tree(build_vectors, dim, tree_seed, perm))
+            .collect();
+
+        let total_nodes: usize = parts.iter().map(|t| t.len()).sum();
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut roots = Vec::with_capacity(n_trees);
+
+        for (tree, part) in parts.into_iter().enumerate() {
+            let root_offset = nodes.len() as u32;
+            roots.push(root_offset);
+            nodes.extend(part.into_iter().map(|mut node| {
+                if node.n_descendants == 1 {
+                    node.split_dim = tree as u32;
+                } else {
+                    node.child_a += root_offset;
+                    node.child_b += root_offset;
+                }
+                node
+            }));
+        }
+
+        Self {
+            nodes,
+            roots,
+            leaf_indices,
+            n,
+            metric,
+        }
+    }
+
+    /// Build one tree by partitioning `perm` in place.
+    ///
+    /// ### Params
+    ///
+    /// * `build_vectors` - Flattened vector data, normalised for Cosine
+    /// * `dim` - Dimensionality of vectors
+    /// * `seed` - Seed for this tree
+    /// * `perm` - Length `n`, overwritten with the tree's leaf order
+    ///
+    /// ### Returns
+    ///
+    /// The tree's nodes in pre-order, indexed from its root.
+    pub(crate) fn build_tree(
+        build_vectors: &[T],
+        dim: usize,
+        seed: u64,
+        perm: &mut [u32],
+    ) -> Vec<KdFlatNode<T>> {
+        for (i, p) in perm.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scratch = KdScratch {
+            sample: Vec::with_capacity(SUBSAMPLE_SIZE),
+            vals: Vec::with_capacity(SUBSAMPLE_SIZE),
+            right: Vec::with_capacity(perm.len()),
+        };
+        let mut nodes = Vec::new();
+        Self::build_node(
+            build_vectors,
+            dim,
+            perm,
+            0,
+            &mut nodes,
+            &mut scratch,
+            &mut rng,
+        );
+        nodes
+    }
+
+    /// Recursively build a node (split or leaf) over `items`.
+    ///
+    /// Selects a split dimension randomly from the top highest-spread
+    /// dimensions (computed on a subsample for efficiency), then splits
+    /// at the approximate median. The partition is stable.
+    ///
+    /// Falls back to a leaf if the node is small enough, the data is
+    /// degenerate (zero spread on all dimensions), or no candidate
+    /// dimension produces a split where both children are strictly
+    /// smaller than the parent.
+    ///
+    /// ### Params
+    ///
+    /// * `build_vectors` - Flattened vector data (normalised for Cosine)
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - This node's slice of the tree permutation
+    /// * `start` - Offset of `items` within the permutation
+    /// * `nodes` - Accumulator for built nodes
+    /// * `scratch` - Tree scratch
+    /// * `rng` - Random number generator
+    ///
+    /// ### Returns
+    ///
+    /// Index of the created node in `nodes`
+    fn build_node(
+        build_vectors: &[T],
+        dim: usize,
+        items: &mut [u32],
+        start: usize,
+        nodes: &mut Vec<KdFlatNode<T>>,
+        scratch: &mut KdScratch<T>,
+        rng: &mut StdRng,
+    ) -> usize {
+        let leaf = |nodes: &mut Vec<KdFlatNode<T>>, len: usize| {
+            nodes.push(KdFlatNode {
+                n_descendants: 1,
+                child_a: start as u32,
+                child_b: len as u32,
+                split_dim: 0,
+                split_val: T::zero(),
+            });
+            nodes.len() - 1
+        };
+
+        if items.len() <= LEAF_MIN_MEMBERS {
+            return leaf(nodes, items.len());
+        }
+
+        scratch.sample.clear();
+        if items.len() > SUBSAMPLE_SIZE {
+            for _ in 0..SUBSAMPLE_SIZE {
+                scratch.sample.push(items[rng.random_range(0..items.len())]);
+            }
+        } else {
+            scratch.sample.extend_from_slice(items);
+        }
+
+        let top_dims = Self::top_spread_dims(build_vectors, dim, &scratch.sample);
+
+        if top_dims.is_empty() {
+            return leaf(nodes, items.len());
+        }
+
+        // Shuffle top dims so we try them in random order
+        let mut candidate_dims = top_dims;
+        for i in (1..candidate_dims.len()).rev() {
+            let j = rng.random_range(0..=i);
+            candidate_dims.swap(i, j);
+        }
+
+        for &(split_dim, _) in &candidate_dims {
+            // compute approximate median from the sample
+            scratch.vals.clear();
+            scratch.vals.extend(
+                scratch
+                    .sample
+                    .iter()
+                    .map(|&idx| build_vectors[idx as usize * dim + split_dim]),
+            );
+            scratch
+                .vals
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let split_val = scratch.vals[scratch.vals.len() / 2];
+            let is_left = |item: u32| build_vectors[item as usize * dim + split_dim] < split_val;
+
+            let n_left = items.iter().filter(|&&item| is_left(item)).count();
+
+            // both children must be non-empty
+            if n_left == 0 || n_left == items.len() {
+                continue;
+            }
+
+            // Stable partition: lefts compact forwards in place, rights wait
+            // in scratch and land behind them.
+            scratch.right.clear();
+            let mut write = 0;
+            for read in 0..items.len() {
+                let item = items[read];
+                if is_left(item) {
+                    items[write] = item;
+                    write += 1;
+                } else {
+                    scratch.right.push(item);
+                }
+            }
+            items[n_left..].copy_from_slice(&scratch.right);
+
+            let node_idx = nodes.len();
+            nodes.push(KdFlatNode {
+                n_descendants: 2,
+                child_a: 0,
+                child_b: 0,
+                split_dim: split_dim as u32,
+                split_val,
+            });
+
+            let (left_items, right_items) = items.split_at_mut(n_left);
+            let left_idx =
+                Self::build_node(build_vectors, dim, left_items, start, nodes, scratch, rng);
+            let right_idx = Self::build_node(
+                build_vectors,
+                dim,
+                right_items,
+                start + n_left,
+                nodes,
+                scratch,
+                rng,
+            );
+
+            nodes[node_idx].child_a = left_idx as u32;
+            nodes[node_idx].child_b = right_idx as u32;
+            return node_idx;
+        }
+
+        // No dimension produced a valid split -- fall back to leaf
+        leaf(nodes, items.len())
+    }
+
+    /// Find the top-k dimensions by spread (max - min)
+    ///
+    /// Evaluates the range of values along each dimension for the given
+    /// sample. Returns up to TOP_K_DIMS dimensions with the largest
+    /// spread, excluding any with zero spread.
+    ///
+    /// ### Params
+    ///
+    /// * `build_vectors` - Flattened vector data
+    /// * `dim` - Dimensionality
+    /// * `sample` - Subsampled indices to evaluate
+    ///
+    /// ### Returns
+    ///
+    /// Up to TOP_K_DIMS `(dimension_index, spread)` pairs sorted descending by
+    /// spread
+    fn top_spread_dims(build_vectors: &[T], dim: usize, sample: &[u32]) -> Vec<(usize, T)> {
+        let mut spreads: Vec<(usize, T)> = (0..dim)
+            .map(|d| {
+                let mut min_val = T::infinity();
+                let mut max_val = T::neg_infinity();
+                for &idx in sample {
+                    let val = build_vectors[idx as usize * dim + d];
+                    if val < min_val {
+                        min_val = val;
+                    }
+                    if val > max_val {
+                        max_val = val;
+                    }
+                }
+                (d, max_val - min_val)
+            })
+            .collect();
+
+        spreads.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let k = TOP_K_DIMS.min(dim);
+        spreads.truncate(k);
+        spreads.retain(|&(_, s)| s > T::zero());
+
+        spreads
+    }
+
+    /// Number of trees in the forest.
+    ///
+    /// ### Returns
+    ///
+    /// The tree count.
+    pub(crate) fn n_trees(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// Items of a leaf node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - A leaf node of this forest
+    ///
+    /// ### Returns
+    ///
+    /// The leaf's ids.
+    #[inline(always)]
+    fn leaf_items(&self, node: &KdFlatNode<T>) -> &[u32] {
+        let start = node.split_dim as usize * self.n + node.child_a as usize;
+        // SAFETY: leaf ranges are built inside their tree's chunk
+        unsafe {
+            self.leaf_indices
+                .get_unchecked(start..start + node.child_b as usize)
+        }
+    }
+
+    /// Leaves of one tree.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree index, below `n_trees`
+    ///
+    /// ### Returns
+    ///
+    /// Iterator over the tree's leaves as id slices.
+    pub(crate) fn tree_leaves(&self, tree: usize) -> impl Iterator<Item = &[u32]> {
+        let lo = self.roots[tree] as usize;
+        let hi = self
+            .roots
+            .get(tree + 1)
+            .map_or(self.nodes.len(), |&r| r as usize);
+        self.nodes[lo..hi]
+            .iter()
+            .filter(|node| node.n_descendants == 1)
+            .map(|node| self.leaf_items(node))
+    }
+
+    /// Best-first walk over all trees, handing each reached leaf to `on_leaf`.
+    ///
+    /// Explores the unexplored branch with the smallest margin first. Stops
+    /// once `limit` leaf items have been handed out, or once the margin
+    /// lower bound of the next branch exceeds the bound `on_leaf` returned.
+    ///
+    /// ### Params
+    ///
+    /// * `split_query` - Query in the build space (normalised for Cosine)
+    /// * `limit` - Budget of leaf items to visit
+    /// * `pq` - Reusable backtracking frontier, left empty on return
+    /// * `on_leaf` - Called once per reached leaf with its ids. Returns the
+    ///   current kth-best distance, or infinity while no bound exists yet
+    #[inline]
+    pub(crate) fn visit(
+        &self,
+        split_query: &[T],
+        limit: usize,
+        pq: &mut BinaryHeap<BacktrackEntry>,
+        mut on_leaf: impl FnMut(&[u32]) -> f64,
+    ) {
+        let mut visited_count = 0;
+        let mut bound = f64::INFINITY;
+        pq.clear();
+        pq.reserve(self.roots.len() * 2);
+        for &root in &self.roots {
+            pq.push(BacktrackEntry {
+                margin: f64::MAX,
+                node_idx: root,
+            });
+        }
+
+        while visited_count < limit {
+            let Some(entry) = pq.pop() else { break };
+
+            // priority queue pruning: margin-based lower bound vs kth distance.
+            if entry.margin != f64::MAX {
+                let abs_margin = -entry.margin;
+                // Squared Euclidean: one axis of the difference, so >= margin^2.
+                // Cosine: splits live in normalised space where
+                // ||a - b||^2 = 2 * cos_dist, so cos_dist >= margin^2 / 2.
+                let lower_bound = match self.metric {
+                    Dist::SquaredEuclidean => abs_margin * abs_margin,
+                    Dist::Cosine => abs_margin * abs_margin * 0.5,
+                    Dist::Manhattan => abs_margin,
+                };
+                if lower_bound > bound {
+                    break;
+                }
+            }
+
+            let mut current_idx = entry.node_idx;
+
+            loop {
+                // SAFETY: Tree structure is static and verified at build
+                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
+
+                if node.n_descendants == 1 {
+                    visited_count += node.child_b as usize;
+                    bound = on_leaf(self.leaf_items(node));
+                    break;
+                }
+
+                let margin = (split_query[node.split_dim as usize] - node.split_val)
+                    .to_f64()
+                    .unwrap();
+
+                // Left child (child_a) holds items below split_val,
+                // right child (child_b) holds items at or above
+                let (closer, farther) = if margin < 0.0 {
+                    (node.child_a, node.child_b)
+                } else {
+                    (node.child_b, node.child_a)
+                };
+
+                pq.push(BacktrackEntry {
+                    margin: -margin.abs(),
+                    node_idx: farther,
+                });
+
+                current_idx = closer;
+            }
+        }
+        pq.clear();
+    }
+
+    /// Rewrite every leaf id through `old_to_new`.
+    ///
+    /// ### Params
+    ///
+    /// * `old_to_new` - New id for each old id
+    fn remap(&mut self, old_to_new: &[u32]) {
+        self.leaf_indices
+            .par_iter_mut()
+            .for_each(|id| *id = old_to_new[*id as usize]);
+    }
+
+    /// Returns the size of the forest in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Forest size in bytes
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.nodes.capacity() * std::mem::size_of::<KdFlatNode<T>>()
+            + self.roots.capacity() * std::mem::size_of::<u32>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<u32>()
+    }
+}
 
 /////////////////
 // KdTreeIndex //
@@ -103,12 +559,8 @@ pub struct KdTreeIndex<T> {
     norms: Vec<T>,
     /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    /// Flattened tree structure containing all split and leaf nodes
-    nodes: Vec<KdFlatNode<T>>,
-    /// Starting indices for each tree in the forest
-    roots: Vec<u32>,
-    /// Actual data indices stored in leaf nodes
-    leaf_indices: Vec<usize>,
+    /// The forest, in the reordered id space of `vectors_flat`
+    trees: KdTrees<T>,
     /// Number of trees in the forest
     pub n_trees: usize,
     /// Original indices for remapping after memory layout optimisation
@@ -151,6 +603,34 @@ impl<T> DimensionValidation for KdTreeIndex<T> {
 // Index build //
 /////////////////
 
+/// Unit-normalised copy of the vectors, the space Kd trees split for Cosine.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Flattened vector data
+/// * `norms` - L2 norm per row
+/// * `dim` - Dimensionality
+///
+/// ### Returns
+///
+/// The normalised copy; zero rows stay zero.
+pub(crate) fn normalised_copy<T: AnnSearchFloat>(
+    vectors_flat: &[T],
+    norms: &[T],
+    dim: usize,
+) -> Vec<T> {
+    let mut nv = vectors_flat.to_vec();
+    for (i, &norm) in norms.iter().enumerate() {
+        if norm > T::zero() {
+            let start = i * dim;
+            for d in 0..dim {
+                nv[start + d] /= norm;
+            }
+        }
+    }
+    nv
+}
+
 impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -172,7 +652,6 @@ where
     ///
     /// Constructed index ready for querying
     pub fn new(data: impl AnnMatrix<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
-        let mut rng = StdRng::seed_from_u64(seed as u64);
         let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
@@ -189,81 +668,15 @@ where
 
         // for cosine, build trees on normalised vectors so that axis-aligned
         // splits approximate angular partitions.
-        let normalised = if metric == Dist::Cosine {
-            let mut nv = vectors_flat.clone();
-            for i in 0..n {
-                let norm = norms[i];
-                if norm > T::zero() {
-                    let start = i * dim;
-                    for d in 0..dim {
-                        nv[start + d] /= norm;
-                    }
-                }
-            }
-            Some(nv)
+        let trees = if metric == Dist::Cosine {
+            let normalised = normalised_copy(&vectors_flat, &norms, dim);
+            KdTrees::build(&normalised, n, dim, n_trees, metric, seed)
         } else {
-            None
+            KdTrees::build(&vectors_flat, n, dim, n_trees, metric, seed)
         };
-        let build_vectors = normalised.as_deref().unwrap_or(&vectors_flat);
-
-        let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
-
-        let forest: Vec<Vec<BuildNode<T>>> = seeds
-            .into_par_iter()
-            .map(|tree_seed| {
-                let mut tree_rng = StdRng::seed_from_u64(tree_seed);
-                Self::build_tree_recursive(build_vectors, dim, (0..n).collect(), &mut tree_rng)
-            })
-            .collect();
-
-        let total_nodes: usize = forest.iter().map(|t| t.len()).sum();
-        let mut nodes = Vec::with_capacity(total_nodes);
-        let mut roots = Vec::with_capacity(n_trees);
-        let mut leaf_indices = Vec::new();
-
-        for tree in forest {
-            let root_offset = nodes.len() as u32;
-            roots.push(root_offset);
-
-            for node in tree {
-                match node {
-                    BuildNode::Split {
-                        split_dim,
-                        split_val,
-                        left,
-                        right,
-                    } => {
-                        nodes.push(KdFlatNode {
-                            n_descendants: 2,
-                            child_a: root_offset + left as u32,
-                            child_b: root_offset + right as u32,
-                            split_dim: split_dim as u16,
-                            _pad: 0,
-                            split_val,
-                        });
-                    }
-                    BuildNode::Leaf { items } => {
-                        let start = leaf_indices.len() as u32;
-                        let len = items.len() as u32;
-                        leaf_indices.extend(items);
-
-                        nodes.push(KdFlatNode {
-                            n_descendants: 1,
-                            child_a: start,
-                            child_b: len,
-                            split_dim: 0,
-                            _pad: 0,
-                            split_val: T::zero(),
-                        });
-                    }
-                }
-            }
-        }
 
         let mut idx = KdTreeIndex {
-            nodes,
-            roots,
-            leaf_indices,
+            trees,
             vectors_flat,
             dim,
             n_trees,
@@ -279,192 +692,6 @@ where
         idx
     }
 
-    /// Build a single tree recursively
-    ///
-    /// Wrapper that initialises the node vector and starts the recursive
-    /// splitting process.
-    ///
-    /// ### Params
-    ///
-    /// * `build_vectors` - Flattened vector data (normalised for Cosine)
-    /// * `dim` - Dimensionality of vectors
-    /// * `items` - Indices of items to partition
-    /// * `rng` - Random number generator for this tree
-    ///
-    /// ### Returns
-    ///
-    /// Vector of BuildNodes representing the complete tree
-    fn build_tree_recursive(
-        build_vectors: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        rng: &mut StdRng,
-    ) -> Vec<BuildNode<T>> {
-        let mut nodes = Vec::with_capacity(items.len());
-        Self::build_node(build_vectors, dim, items, &mut nodes, rng);
-        nodes
-    }
-
-    /// Recursively build a node (split or leaf)
-    ///
-    /// Selects a split dimension randomly from the top highest-spread
-    /// dimensions (computed on a subsample for efficiency), then splits
-    /// at the approximate median.
-    ///
-    /// Falls back to a leaf if the node is small enough, the data is
-    /// degenerate (zero spread on all dimensions), or no candidate
-    /// dimension produces a split where both children are strictly
-    /// smaller than the parent.
-    ///
-    /// ### Params
-    ///
-    /// * `build_vectors` - Flattened vector data (normalised for Cosine)
-    /// * `dim` - Dimensionality of vectors
-    /// * `items` - Indices to partition in this node
-    /// * `nodes` - Accumulator for built nodes
-    /// * `rng` - Random number generator
-    ///
-    /// ### Returns
-    ///
-    /// Index of the created node in `nodes`
-    fn build_node(
-        build_vectors: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        nodes: &mut Vec<BuildNode<T>>,
-        rng: &mut StdRng,
-    ) -> usize {
-        if items.len() <= LEAF_MIN_MEMBERS {
-            let node_idx = nodes.len();
-            nodes.push(BuildNode::Leaf { items });
-            return node_idx;
-        }
-
-        // Subsample for spread estimation and median computation
-        let owned_sample: Vec<usize>;
-        let sample: &[usize] = if items.len() > SUBSAMPLE_SIZE {
-            owned_sample = (0..SUBSAMPLE_SIZE)
-                .map(|_| items[rng.random_range(0..items.len())])
-                .collect();
-            &owned_sample
-        } else {
-            &items
-        };
-
-        // Find top-k dimensions by spread
-        let top_dims = Self::top_spread_dims(build_vectors, dim, sample);
-
-        if top_dims.is_empty() {
-            let node_idx = nodes.len();
-            nodes.push(BuildNode::Leaf { items });
-            return node_idx;
-        }
-
-        // Shuffle top dims so we try them in random order
-        let mut candidate_dims = top_dims.clone();
-        for i in (1..candidate_dims.len()).rev() {
-            let j = rng.random_range(0..=i);
-            candidate_dims.swap(i, j);
-        }
-
-        for &(split_dim, _) in &candidate_dims {
-            // compute approximate median from the sample
-            let mut vals: Vec<T> = sample
-                .iter()
-                .map(|&idx| build_vectors[idx * dim + split_dim])
-                .collect();
-            vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let split_val = vals[vals.len() / 2];
-            let mut left_items = Vec::new();
-            let mut right_items = Vec::new();
-
-            for &item in &items {
-                let val = build_vectors[item * dim + split_dim];
-                if val < split_val {
-                    left_items.push(item);
-                } else {
-                    right_items.push(item);
-                }
-            }
-
-            // both children must be non-empty
-            if left_items.is_empty() || right_items.is_empty() {
-                continue;
-            }
-
-            let node_idx = nodes.len();
-            nodes.push(BuildNode::Split {
-                split_dim,
-                split_val,
-                left: 0,
-                right: 0,
-            });
-
-            let left_idx = Self::build_node(build_vectors, dim, left_items, nodes, rng);
-            let right_idx = Self::build_node(build_vectors, dim, right_items, nodes, rng);
-
-            if let BuildNode::Split {
-                ref mut left,
-                ref mut right,
-                ..
-            } = nodes[node_idx]
-            {
-                *left = left_idx;
-                *right = right_idx;
-            }
-
-            return node_idx;
-        }
-
-        // No dimension produced a valid split -- fall back to leaf
-        let node_idx = nodes.len();
-        nodes.push(BuildNode::Leaf { items });
-        node_idx
-    }
-
-    /// Find the top-k dimensions by spread (max - min)
-    ///
-    /// Evaluates the range of values along each dimension for the given
-    /// sample. Returns up to TOP_K_DIMS dimensions with the largest
-    /// spread, excluding any with zero spread.
-    ///
-    /// ### Params
-    ///
-    /// * `build_vectors` - Flattened vector data
-    /// * `dim` - Dimensionality
-    /// * `sample` - Subsampled indices to evaluate
-    ///
-    /// ### Returns
-    ///
-    /// Up to TOP_K_DIMS `(dimension_index, spread)` pairs sorted descending by
-    /// spread
-    fn top_spread_dims(build_vectors: &[T], dim: usize, sample: &[usize]) -> Vec<(usize, T)> {
-        let mut spreads: Vec<(usize, T)> = (0..dim)
-            .map(|d| {
-                let mut min_val = T::infinity();
-                let mut max_val = T::neg_infinity();
-                for &idx in sample {
-                    let val = build_vectors[idx * dim + d];
-                    if val < min_val {
-                        min_val = val;
-                    }
-                    if val > max_val {
-                        max_val = val;
-                    }
-                }
-                (d, max_val - min_val)
-            })
-            .collect();
-
-        spreads.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let k = TOP_K_DIMS.min(dim);
-        spreads.truncate(k);
-        spreads.retain(|&(_, s)| s > T::zero());
-
-        spreads
-    }
-
     /// Reorders vectors in memory to match the DFS layout of Tree 0
     ///
     /// Places vectors that co-occur in leaves adjacent in memory, for cache
@@ -474,38 +701,20 @@ where
     ///
     /// New-to-old index mapping
     fn optimise_memory_layout(&mut self) -> Vec<usize> {
-        if self.roots.is_empty() || self.n == 0 {
+        if self.n_trees == 0 || self.n == 0 {
             return Vec::new();
         }
 
-        let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![usize::MAX; self.n];
-        let mut visited = vec![false; self.n];
-
-        let mut stack = vec![self.roots[0]];
-        while let Some(node_idx) = stack.pop() {
-            let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
-
-            if node.n_descendants == 1 {
-                let start = node.child_a as usize;
-                let len = node.child_b as usize;
-                let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                for &old_id in leaf_items {
-                    if !visited[old_id] {
-                        visited[old_id] = true;
-                        old_to_new[old_id] = new_to_old.len();
-                        new_to_old.push(old_id);
-                    }
-                }
-            } else {
-                stack.push(node.child_b);
-                stack.push(node.child_a);
-            }
+        // Tree 0's permutation is its leaves in DFS order and covers every
+        // item exactly once.
+        let new_to_old: Vec<usize> = self.trees.leaf_indices[..self.n]
+            .iter()
+            .map(|&i| i as usize)
+            .collect();
+        let mut old_to_new = vec![0u32; self.n];
+        for (new_id, &old_id) in new_to_old.iter().enumerate() {
+            old_to_new[old_id] = new_id as u32;
         }
-
-        // Every tree partitions all items, so tree 0 alone covers them.
-        debug_assert_eq!(new_to_old.len(), self.n);
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
         let mut new_norms = if self.norms.is_empty() {
@@ -524,10 +733,7 @@ where
             }
         }
 
-        for id_ref in self.leaf_indices.iter_mut() {
-            *id_ref = old_to_new[*id_ref];
-        }
-
+        self.trees.remap(&old_to_new);
         self.vectors_flat = new_vectors_flat;
         self.norms = new_norms;
 
@@ -543,9 +749,7 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<KdFlatNode<T>>()
-            + self.roots.capacity() * std::mem::size_of::<u32>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
+            + self.trees.memory_usage_bytes()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
 }
@@ -589,7 +793,6 @@ where
         self.check_dim(query_vec.len())?;
 
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
-        let mut visited_count = 0;
 
         let mut visited = FixedBitSet::with_capacity(self.n);
 
@@ -613,91 +816,33 @@ where
         let mut kth_dist = T::infinity();
         let mut pq = BinaryHeap::with_capacity(self.n_trees * 2);
 
-        for &root in &self.roots {
-            pq.push(BacktrackEntry {
-                margin: f64::MAX,
-                node_idx: root,
-            });
-        }
+        self.trees.visit(split_query, limit, &mut pq, |leaf_items| {
+            for &item in leaf_items {
+                let item = item as usize;
+                if visited.contains(item) {
+                    continue;
+                }
+                visited.insert(item);
 
-        while visited_count < limit {
-            let Some(entry) = pq.pop() else { break };
-
-            // priority queue pruning: margin-based lower bound vs kth distance.
-            if top_k.len() == k && entry.margin != f64::MAX {
-                let abs_margin = -entry.margin;
-                // Squared Euclidean: one axis of the difference, so >= margin^2.
-                // Cosine: splits live in normalised space where
-                // ||a - b||^2 = 2 * cos_dist, so cos_dist >= margin^2 / 2.
-                let lower_bound = match self.metric {
-                    Dist::SquaredEuclidean => abs_margin * abs_margin,
-                    Dist::Cosine => abs_margin * abs_margin * 0.5,
-                    Dist::Manhattan => abs_margin,
+                let dist = match self.metric {
+                    Dist::SquaredEuclidean => self.euclidean_distance_to_query(item, query_vec),
+                    Dist::Cosine => self.cosine_distance_to_query(item, query_vec, query_norm),
+                    Dist::Manhattan => self.manhattan_distance_to_query(item, query_vec),
                 };
-                if lower_bound > kth_dist.to_f64().unwrap() {
-                    break;
-                }
-            }
 
-            let mut current_idx = entry.node_idx;
-
-            loop {
-                // SAFETY: Tree structure is static and verified at build
-                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
-
-                if node.n_descendants == 1 {
-                    let start = node.child_a as usize;
-                    let len = node.child_b as usize;
-                    visited_count += len;
-
-                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                    for &item in leaf_items {
-                        if visited.contains(item) {
-                            continue;
-                        }
-                        visited.insert(item);
-
-                        let dist = match self.metric {
-                            Dist::SquaredEuclidean => {
-                                self.euclidean_distance_to_query(item, query_vec)
-                            }
-                            Dist::Cosine => {
-                                self.cosine_distance_to_query(item, query_vec, query_norm)
-                            }
-                            Dist::Manhattan => self.manhattan_distance_to_query(item, query_vec),
-                        };
-
-                        if dist < kth_dist || top_k.len() < k {
-                            top_k.insert((OrderedFloat(dist), item), k);
-                            if top_k.len() == k {
-                                kth_dist = top_k.top().unwrap().0 .0;
-                            }
-                        }
+                if dist < kth_dist || top_k.len() < k {
+                    top_k.insert((OrderedFloat(dist), item), k);
+                    if top_k.len() == k {
+                        kth_dist = top_k.top().unwrap().0 .0;
                     }
-                    break;
-                } else {
-                    let margin = (split_query[node.split_dim as usize] - node.split_val)
-                        .to_f64()
-                        .unwrap();
-
-                    // Left child (child_a) holds items below split_val,
-                    // right child (child_b) holds items at or above
-                    let (closer, farther) = if margin < 0.0 {
-                        (node.child_a, node.child_b)
-                    } else {
-                        (node.child_b, node.child_a)
-                    };
-
-                    pq.push(BacktrackEntry {
-                        margin: -margin.abs(),
-                        node_idx: farther,
-                    });
-
-                    current_idx = closer;
                 }
             }
-        }
+            if top_k.len() == k {
+                kth_dist.to_f64().unwrap()
+            } else {
+                f64::INFINITY
+            }
+        });
 
         let results: Vec<(usize, T)> = top_k
             .data()
@@ -889,6 +1034,29 @@ mod tests {
         let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
 
         // just verify it doesn't panic
+    }
+
+    #[test]
+    fn test_kd_trees_leaves_partition_every_tree() {
+        let (n, dim) = (3000, 8);
+        let mut rng = StdRng::seed_from_u64(3);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random::<f32>() - 0.5).collect();
+        for metric in [Dist::SquaredEuclidean, Dist::Manhattan] {
+            let trees = KdTrees::<f32>::build(&data, n, dim, 4, metric, 7);
+            assert_eq!(trees.n_trees(), 4);
+            for tree in 0..4 {
+                let mut seen = vec![false; n];
+                let mut total = 0;
+                for leaf in trees.tree_leaves(tree) {
+                    for &id in leaf {
+                        assert!(!seen[id as usize], "id {id} in two leaves of tree {tree}");
+                        seen[id as usize] = true;
+                    }
+                    total += leaf.len();
+                }
+                assert_eq!(total, n);
+            }
+        }
     }
 
     #[test]
