@@ -819,30 +819,6 @@ where
             + self.trees.memory_usage_bytes()
             + self.original_ids.capacity() * std::mem::size_of::<usize>()
     }
-
-    /// Leaves of one tree, as original ids.
-    ///
-    /// The leaves of a tree partition the points, which is what lets a caller
-    /// process them in parallel while writing per-point state.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree index, below `n_trees`
-    ///
-    /// ### Returns
-    ///
-    /// One id list per leaf
-    pub(crate) fn tree_leaves(&self, tree: usize) -> Vec<Vec<u32>> {
-        self.trees
-            .tree_leaves(tree)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|&i| self.original_ids[i as usize] as u32)
-                    .collect()
-            })
-            .collect()
-    }
 }
 
 ///////////

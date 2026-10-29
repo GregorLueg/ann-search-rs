@@ -21,6 +21,7 @@ use crate::cpu::annoy::*;
 use crate::cpu::kd_forest::*;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::*;
+use crate::utils::tree_utils::BacktrackEntry;
 use crate::utils::*;
 
 ///////////////////
@@ -51,8 +52,8 @@ thread_local! {
 
     /// Forest-search scratch for the query-time entry points, so the per-query
     /// tree descent does not allocate an `n`-bit visited set each time.
-    static QUERY_FOREST_F32: RefCell<AnnoyScratch<f32>> = RefCell::new(AnnoyScratch::new());
-    static QUERY_FOREST_F64: RefCell<AnnoyScratch<f64>> = RefCell::new(AnnoyScratch::new());
+    static QUERY_FOREST_F32: RefCell<EntryScratch<f32>> = RefCell::new(EntryScratch::new());
+    static QUERY_FOREST_F64: RefCell<EntryScratch<f64>> = RefCell::new(EntryScratch::new());
 }
 
 ///////////
@@ -688,17 +689,17 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
 // Forest //
 ////////////
 
-/// Wrapper over the two forest types usable as an NNDescent initialiser.
+/// The forest NNDescent seeds from and routes queries through.
 ///
-/// Annoy gives better init quality but can't handle Manhattan; KdForest
-/// handles all three metrics including Manhattan. Selection is automatic
-/// based on the metric.
+/// Holds only the trees: leaf ids are original ids and every distance is
+/// taken against the index's own vectors, so the data is not stored twice.
+/// Annoy trees serve Euclidean and Cosine, Kd trees Manhattan.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 enum Forest<T> {
-    /// Annoy version
-    Annoy(AnnoyIndex<T>),
-    /// KdForest version
-    Kd(KdTreeIndex<T>),
+    /// Random projection trees
+    Annoy(AnnoyTrees<T>),
+    /// Kd trees
+    Kd(KdTrees<T>),
 }
 
 impl<T> Forest<T>
@@ -709,7 +710,9 @@ where
     ///
     /// ### Params
     ///
-    /// * `data` - The underlying data
+    /// * `vectors_flat` - Flattened vector data, row-major
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality
     /// * `n_trees` - The number of trees to use in the forest
     /// * `metric` - The distance metric to use, see [Dist].
     /// * `seed` - The random seed for reproducibility
@@ -718,14 +721,25 @@ where
     ///
     /// The [Forest].
     fn new(
-        data: impl AnnMatrix<T>,
+        vectors_flat: &[T],
+        n: usize,
+        dim: usize,
         n_trees: usize,
         metric: Dist,
         seed: usize,
-    ) -> Result<Self, AnnSearchErrors> {
+    ) -> Self {
         match metric {
-            Dist::Manhattan => Ok(Forest::Kd(KdTreeIndex::new(data, n_trees, metric, seed))),
-            _ => Ok(Forest::Annoy(AnnoyIndex::new(data, n_trees, metric, seed)?)),
+            Dist::Manhattan => {
+                Forest::Kd(KdTrees::build(vectors_flat, n, dim, n_trees, metric, seed))
+            }
+            _ => Forest::Annoy(AnnoyTrees::build(
+                vectors_flat,
+                n,
+                dim,
+                n_trees,
+                metric,
+                seed,
+            )),
         }
     }
 
@@ -737,41 +751,8 @@ where
     /// The number of trees.
     fn n_trees(&self) -> usize {
         match self {
-            Forest::Annoy(f) => f.n_trees,
-            Forest::Kd(f) => f.n_trees,
-        }
-    }
-
-    /// Query into reusable scratch, leaving `(distance, id)` pairs sorted
-    /// nearest-first in `scratch.candidates`.
-    ///
-    /// Only the Annoy arm has an allocation-free form; the Kd arm falls back to
-    /// the allocating query and copies its result across.
-    ///
-    /// ### Params
-    ///
-    /// * `query_vec` - The query vector
-    /// * `k` - Number of neighbours to return
-    /// * `search_k` - The budget
-    /// * `scratch` - Reusable buffers, reset on entry
-    ///
-    /// ### Returns
-    ///
-    /// `Ok(())`, with results left in `scratch.candidates`.
-    fn query_into(
-        &self,
-        query_vec: &[T],
-        k: usize,
-        search_k: Option<usize>,
-        scratch: &mut AnnoyScratch<T>,
-    ) -> Result<(), AnnSearchErrors> {
-        match self {
-            Forest::Annoy(f) => f.query_into(query_vec, k, search_k, scratch),
-            Forest::Kd(f) => {
-                let (ids, dists) = f.query(query_vec, k, search_k)?;
-                scratch.set_candidates(ids.into_iter().zip(dists).map(|(i, d)| (d, i)));
-                Ok(())
-            }
+            Forest::Annoy(f) => f.n_trees(),
+            Forest::Kd(f) => f.n_trees(),
         }
     }
 
@@ -784,6 +765,37 @@ where
         match self {
             Forest::Annoy(f) => f.memory_usage_bytes(),
             Forest::Kd(f) => f.memory_usage_bytes(),
+        }
+    }
+}
+
+/// Reusable per-query scratch for the forest entry search.
+///
+/// `visited` is cleared by unsetting only the bits the last search touched,
+/// which `candidates` lists, so reset cost is bounded by the budget, not `n`.
+struct EntryScratch<T> {
+    /// One bit per point, marking what the current search has already scored
+    visited: FixedBitSet,
+    /// Every scored point as `(distance, id)`; the sorted entries on return
+    candidates: Vec<(T, usize)>,
+    /// Backtracking frontier over unexplored branches
+    pq: BinaryHeap<BacktrackEntry>,
+    /// Running top-k for the Kd search, which prunes on the kth distance
+    top_k: SortedBuffer<(OrderedFloat<T>, usize)>,
+}
+
+impl<T: AnnSearchFloat> EntryScratch<T> {
+    /// Create empty scratch. Buffers size themselves on first use.
+    ///
+    /// ### Returns
+    ///
+    /// Scratch with no allocation yet.
+    fn new() -> Self {
+        Self {
+            visited: FixedBitSet::new(),
+            candidates: Vec::new(),
+            pq: BinaryHeap::new(),
+            top_k: SortedBuffer::new(),
         }
     }
 }
@@ -891,7 +903,8 @@ pub struct NNDescent<T> {
     /// Distance metric of the index
     metric: Dist,
     /// Forest used for graph initialisation and query entry points. Annoy for
-    /// Euclidean/Cosine, KdForest for Manhattan.
+    /// Euclidean/Cosine, Kd for Manhattan. Trees only: leaf ids are original
+    /// ids and distances use `vectors_flat`.
     forest: Forest<T>,
     /// Flat kNN graph of size `n * k`, sorted per node, undiversified. What
     /// `extract_knn`, `graph()` and NSG read.
@@ -1009,7 +1022,7 @@ where
         let max_candidates = max_candidates.unwrap_or(k.min(60));
 
         let start = Instant::now();
-        let forest = Forest::new((&vectors_flat[..], n, dim), n_trees, metric, seed)?;
+        let forest = Forest::new(&vectors_flat, n, dim, n_trees, metric, seed);
         let forest_time = start.elapsed();
         if verbose {
             println!("Built forest: {forest_time:.2?}");
@@ -1176,25 +1189,23 @@ where
     /// ### Returns
     ///
     /// Flat graph of size `n * k` with Annoy-seeded initial neighbours
-    fn init_with_forest(&self, k: usize) -> Result<Vec<Neighbour<T>>, AnnSearchErrors> {
+    fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
         let search_k = k * self.forest.n_trees();
 
-        graph.par_chunks_mut(k).enumerate().try_for_each_init(
-            AnnoyScratch::<T>::new,
-            |scratch, (i, slot)| -> Result<(), AnnSearchErrors> {
+        graph
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each_init(EntryScratch::<T>::new, |scratch, (i, slot)| {
                 let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                self.forest
-                    .query_into(query, k + 1, Some(search_k), scratch)?;
-                for (j, &(dist, idx)) in scratch.results().iter().skip(1).take(k).enumerate() {
+                self.forest_entries(query, k + 1, search_k, scratch);
+                for (j, &(dist, idx)) in scratch.candidates.iter().skip(1).take(k).enumerate() {
                     slot[j] = Neighbour::new(idx, dist, true);
                 }
-                Ok(())
-            },
-        )?;
+            });
 
-        Ok(graph)
+        graph
     }
 
     /// Initialise the flat k-NN graph by joining every forest leaf exhaustively
@@ -1212,36 +1223,157 @@ where
     /// ### Returns
     ///
     /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
-    fn init_with_leaf_join(&self, forest: &AnnoyIndex<T>, k: usize) -> Vec<Neighbour<T>> {
+    fn init_with_leaf_join(&self, forest: &AnnoyTrees<T>, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
-        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
+        for tree in 0..forest.n_trees() {
+            let leaves: Vec<&[u32]> = forest.tree_leaves(tree).collect();
+            self.join_leaves(&mut graph, &leaves, k);
+        }
+        graph
+    }
 
-        for tree in 0..forest.n_trees {
-            forest.tree_leaves(tree).par_iter().for_each(|leaf| {
-                #[allow(clippy::redundant_locals)]
-                let graph_ptr = graph_ptr;
-                // SAFETY: the leaves of one tree partition the points and
-                // trees run one after another, so this leaf is the only
-                // writer of its members' rows.
-                let row = |p: u32| unsafe {
-                    std::slice::from_raw_parts_mut(graph_ptr.0.add(p as usize * k), k)
-                };
-                // A split that never balanced leaves an oversized leaf; join it
-                // in blocks rather than all pairs.
-                for block in leaf.chunks(LEAF_JOIN_BLOCK) {
-                    for (a, &p) in block.iter().enumerate() {
-                        for &q in &block[a + 1..] {
-                            let d = self.distance(p as usize, q as usize);
-                            insert_sorted(row(p), q as usize, d);
-                            insert_sorted(row(q), p as usize, d);
-                        }
+    /// Score every pair inside each leaf of one tree into the graph.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Flat `n * k` graph, rows sorted ascending
+    /// * `leaves` - The leaves of a single tree, which partition the points
+    /// * `k` - Neighbours per node
+    fn join_leaves(&self, graph: &mut [Neighbour<T>], leaves: &[&[u32]], k: usize) {
+        let graph_ptr = UnsafeMutPtr(graph.as_mut_ptr());
+        leaves.par_iter().for_each(|leaf| {
+            #[allow(clippy::redundant_locals)]
+            let graph_ptr = graph_ptr;
+            // SAFETY: the leaves of one tree partition the points, so this
+            // leaf is the only writer of its members' rows.
+            let row = |p: u32| unsafe {
+                std::slice::from_raw_parts_mut(graph_ptr.0.add(p as usize * k), k)
+            };
+            // A split that never balanced leaves an oversized leaf; join it
+            // in blocks rather than all pairs.
+            for block in leaf.chunks(LEAF_JOIN_BLOCK) {
+                for (a, &p) in block.iter().enumerate() {
+                    for &q in &block[a + 1..] {
+                        let d = self.distance(p as usize, q as usize);
+                        insert_sorted(row(p), q as usize, d);
+                        insert_sorted(row(q), p as usize, d);
                     }
                 }
-            });
-        }
+            }
+        });
+    }
 
-        graph
+    /// Forest search for entry points, scored against the index's vectors.
+    ///
+    /// Annoy: best-first over all trees until `limit` leaf items are seen,
+    /// then the `k` closest. Kd: the same walk with the kth-distance margin
+    /// prune. Both mirror what the standalone indices return.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - The query vector
+    /// * `k` - Number of entries to return
+    /// * `limit` - Leaf item budget
+    /// * `scratch` - Reusable buffers, reset on entry
+    ///
+    /// The entries are left in `scratch.candidates` as `(distance, id)`,
+    /// nearest first.
+    fn forest_entries(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        limit: usize,
+        scratch: &mut EntryScratch<T>,
+    ) {
+        if scratch.visited.len() < self.n {
+            scratch.visited.grow(self.n);
+        }
+        scratch.candidates.clear();
+        let EntryScratch {
+            visited,
+            candidates,
+            pq,
+            top_k,
+        } = scratch;
+
+        match &self.forest {
+            Forest::Annoy(trees) => {
+                candidates.reserve(limit);
+                // Same norm as the Annoy query, so entry selection is unchanged.
+                let query_norm = if self.metric == Dist::Cosine {
+                    query_vec
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |acc, x| acc + x)
+                        .sqrt()
+                } else {
+                    T::one()
+                };
+                trees.visit(query_vec, limit, pq, |leaf_items| {
+                    for &item in leaf_items {
+                        let item = item as usize;
+                        if visited.contains(item) {
+                            continue;
+                        }
+                        visited.insert(item);
+                        let dist = match self.metric {
+                            Dist::Cosine => {
+                                self.cosine_distance_to_query(item, query_vec, query_norm)
+                            }
+                            _ => self.euclidean_distance_to_query(item, query_vec),
+                        };
+                        candidates.push((dist, item));
+                    }
+                });
+                for &(_, item) in candidates.iter() {
+                    visited.remove(item);
+                }
+                if candidates.len() > k {
+                    candidates.select_nth_unstable_by(k - 1, |a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    candidates.truncate(k);
+                }
+                candidates.sort_unstable_by(|a, b| {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            // Kd trees are only built for Manhattan, which splits in the raw
+            // space, so the query needs no normalising.
+            Forest::Kd(trees) => {
+                top_k.clear();
+                let mut kth_dist = T::infinity();
+                trees.visit(query_vec, limit, pq, |leaf_items| {
+                    for &item in leaf_items {
+                        let item = item as usize;
+                        if visited.contains(item) {
+                            continue;
+                        }
+                        visited.insert(item);
+                        // `candidates` doubles as the list of bits to clear.
+                        candidates.push((T::zero(), item));
+                        let dist = self.manhattan_distance_to_query(item, query_vec);
+                        if dist < kth_dist || top_k.len() < k {
+                            top_k.insert((OrderedFloat(dist), item), k);
+                            if top_k.len() == k {
+                                kth_dist = top_k.top().unwrap().0 .0;
+                            }
+                        }
+                    }
+                    if top_k.len() == k {
+                        kth_dist.to_f64().unwrap()
+                    } else {
+                        f64::INFINITY
+                    }
+                });
+                for &(_, item) in candidates.iter() {
+                    visited.remove(item);
+                }
+                candidates.clear();
+                candidates.extend(top_k.data().iter().map(|&(OrderedFloat(d), i)| (d, i)));
+            }
+        }
     }
 
     /// Run the main NN-Descent algorithm with chunked updates
@@ -1295,7 +1427,7 @@ where
         let start = Instant::now();
         let mut graph = match &self.forest {
             Forest::Annoy(forest) => self.init_with_leaf_join(forest, k),
-            Forest::Kd(_) => self.init_with_forest(k)?,
+            Forest::Kd(_) => self.init_with_forest(k),
         };
         timings.seed = start.elapsed();
 
@@ -2230,13 +2362,8 @@ macro_rules! impl_nndescent_query {
                 let search_k = init_candidates * 3;
                 $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
                     let mut scratch = cell.borrow_mut();
-                    self.forest.query_into(
-                        query_vec,
-                        init_candidates,
-                        Some(search_k),
-                        &mut scratch,
-                    )?;
-                    for &(_, entry_idx) in scratch.results() {
+                    self.forest_entries(query_vec, init_candidates, search_k, &mut scratch);
+                    for &(_, entry_idx) in scratch.candidates.iter() {
                         if entry_idx >= self.n || visited.contains(entry_idx) {
                             continue;
                         }
@@ -2313,13 +2440,8 @@ macro_rules! impl_nndescent_query {
                 let search_k = init_candidates * 3;
                 $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
                     let mut scratch = cell.borrow_mut();
-                    self.forest.query_into(
-                        query_vec,
-                        init_candidates,
-                        Some(search_k),
-                        &mut scratch,
-                    )?;
-                    for &(_, entry_idx) in scratch.results() {
+                    self.forest_entries(query_vec, init_candidates, search_k, &mut scratch);
+                    for &(_, entry_idx) in scratch.candidates.iter() {
                         if entry_idx >= self.n || visited.contains(entry_idx) {
                             continue;
                         }
@@ -2397,13 +2519,8 @@ macro_rules! impl_nndescent_query {
                 let search_k = init_candidates * 3;
                 $forest_tls.with(|cell| -> Result<(), AnnSearchErrors> {
                     let mut scratch = cell.borrow_mut();
-                    self.forest.query_into(
-                        query_vec,
-                        init_candidates,
-                        Some(search_k),
-                        &mut scratch,
-                    )?;
-                    for &(_, entry_idx) in scratch.results() {
+                    self.forest_entries(query_vec, init_candidates, search_k, &mut scratch);
+                    for &(_, entry_idx) in scratch.candidates.iter() {
                         if entry_idx >= self.n || visited.contains(entry_idx) {
                             continue;
                         }
