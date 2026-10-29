@@ -77,31 +77,31 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     vectors_flat: &[T],
     dim: usize,
     n: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     nlist: usize,
-) -> (Vec<T>, Vec<usize>, Vec<usize>) {
+) -> (Vec<T>, Vec<u32>, Vec<u32>) {
     // Count vectors per cluster
-    let mut counts = vec![0usize; nlist];
+    let mut counts = vec![0u32; nlist];
     for &cluster in assignments {
-        counts[cluster] += 1;
+        counts[cluster as usize] += 1;
     }
 
     // Build offsets
-    let mut offsets = vec![0usize; nlist + 1];
+    let mut offsets = vec![0u32; nlist + 1];
     for i in 0..nlist {
         offsets[i + 1] = offsets[i] + counts[i];
     }
 
     let mut vectors_reorg = vec![T::zero(); n * dim];
-    let mut indices_reorg = vec![0usize; n];
+    let mut indices_reorg = vec![0u32; n];
     let mut write_pos = offsets.clone();
 
     for vec_idx in 0..n {
-        let cluster = assignments[vec_idx];
-        let pos = write_pos[cluster];
+        let cluster = assignments[vec_idx] as usize;
+        let pos = write_pos[cluster] as usize;
         write_pos[cluster] += 1;
 
-        indices_reorg[pos] = vec_idx;
+        indices_reorg[pos] = vec_idx as u32;
 
         let src_start = vec_idx * dim;
         let dst_start = pos * dim;
@@ -144,9 +144,9 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat> {
     /// `generate_knn` without a GPU readback
     vectors_cpu: Vec<T>,
     /// Maps reorganised position -> original index
-    original_indices: Vec<usize>,
+    original_indices: Vec<u32>,
     /// CSR-style offsets into `vectors_gpu` per cluster; length `nlist + 1`
-    cluster_offsets: Vec<usize>,
+    cluster_offsets: Vec<u32>,
     /// Centroids kept on the GPU
     centroids_gpu: GpuTensor<T>,
     /// Dimensionality of the index
@@ -277,7 +277,10 @@ where
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist);
 
         let sorted_size_prefix = {
-            let mut sizes: Vec<usize> = cluster_offsets.windows(2).map(|w| w[1] - w[0]).collect();
+            let mut sizes: Vec<usize> = cluster_offsets
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as usize)
+                .collect();
             sizes.sort_unstable();
             let mut prefix = Vec::with_capacity(sizes.len() + 1);
             prefix.push(0usize);
@@ -549,9 +552,9 @@ where
         };
 
         for (reorg_idx, orig_idx) in self.original_indices.iter().enumerate() {
-            indices[*orig_idx] = indices_reorg[reorg_idx].clone();
+            indices[*orig_idx as usize] = indices_reorg[reorg_idx].clone();
             if return_dist {
-                dist[*orig_idx] = dist_reorg[reorg_idx].clone();
+                dist[*orig_idx as usize] = dist_reorg[reorg_idx].clone();
             }
         }
 
@@ -569,8 +572,8 @@ where
     /// `(RAM bytes, VRAM bytes)`
     pub fn memory_usage_bytes(&self) -> (usize, usize) {
         let ram = std::mem::size_of_val(self)
-            + self.original_indices.capacity() * std::mem::size_of::<usize>()
-            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
+            + self.original_indices.capacity() * std::mem::size_of::<u32>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<u32>();
 
         let scratch_vram = self
             .scratch
@@ -736,7 +739,7 @@ where
                         for &c in row {
                             let c = c as usize;
                             chosen.push(c);
-                            reachable += self.cluster_offsets[c + 1] - self.cluster_offsets[c];
+                            reachable += (self.cluster_offsets[c + 1] - self.cluster_offsets[c]) as usize;
                             if chosen.len() >= nprobe && reachable >= k {
                                 break;
                             }
@@ -746,7 +749,6 @@ where
                     .collect()
             } else {
                 let centroid_dists = centroid_dists_gpu.read(client)?;
-                let offsets_u32: Vec<u32> = self.cluster_offsets.iter().map(|&o| o as u32).collect();
                 (0..n_queries)
                     .into_par_iter()
                     .map(|q| {
@@ -754,7 +756,7 @@ where
                         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                             .map(|c| (centroid_dists[row_start + c], c))
                             .collect();
-                        select_probed_clusters(&mut cluster_dists, &offsets_u32, nprobe, k)
+                        select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
                     })
                     .collect()
             };
@@ -794,14 +796,14 @@ where
         for q_idx in 0..n_queries {
             for &c in &probe_lists[q_idx] {
                 let start = self.cluster_offsets[c];
-                let count = self.cluster_offsets[c + 1] - start;
+                let count = (self.cluster_offsets[c + 1] - start) as usize;
 
                 if count > 0 {
                     let slot = cursor[c] as usize;
                     cursor[c] += 1;
 
                     task_q_idx[slot] = q_idx as u32;
-                    task_db_start[slot] = start as u32;
+                    task_db_start[slot] = start;
                     task_write_offset[slot] = cpu_write_pointers[q_idx];
                     task_db_count[slot] = count as u32;
 
@@ -852,7 +854,7 @@ where
                 let t0 = cluster_task_start[c] as usize;
                 let t1 = cursor[c] as usize;
                 let c_start = self.cluster_offsets[c];
-                let c_count = self.cluster_offsets[c + 1] - c_start;
+                let c_count = (self.cluster_offsets[c + 1] - c_start) as usize;
                 let mut t = t0;
                 while t < t1 {
                     let n_t = wg_y.min(t1 - t);
@@ -862,7 +864,7 @@ where
                         tiles.extend_from_slice(&[
                             t as u32,
                             n_t as u32,
-                            c_start as u32,
+                            c_start,
                             off as u32,
                             n_db as u32,
                         ]);
@@ -997,7 +999,7 @@ where
                 let d = final_dists[start + i];
                 if d < T::from_f32(f32::MAX).unwrap() {
                     let reorg_idx = final_indices[start + i] as usize;
-                    row_idx.push(self.original_indices[reorg_idx]);
+                    row_idx.push(self.original_indices[reorg_idx] as usize);
                     // Cosine can round a self-distance to just under zero.
                     row_dist.push(if d < T::zero() { T::zero() } else { d });
                 }
@@ -1285,7 +1287,7 @@ mod tests {
         let mut sizes: Vec<usize> = index
             .cluster_offsets
             .windows(2)
-            .map(|w| w[1] - w[0])
+                .map(|w| (w[1] - w[0]) as usize)
             .collect();
         sizes.sort_unstable();
 
@@ -1307,7 +1309,7 @@ mod tests {
         let vectors: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
-        let assignments = vec![0, 1, 0, 1];
+        let assignments = vec![0u32, 1, 0, 1];
 
         let (reorg, indices, offsets) = reorganise_by_cluster(&vectors, 4, 4, &assignments, 2);
 

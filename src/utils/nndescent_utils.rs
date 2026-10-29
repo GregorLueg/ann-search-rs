@@ -26,29 +26,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// ~2 billion.
 pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
-/// A stored neighbour id
-///
-/// Only [`compact_knn_rows`](crate::utils::rp_forest::compact_knn_rows) is
-/// still generic over it: a GPU test reads its output as `usize`.
-pub trait GraphPid: Copy + Send + Sync {
-    /// The id from a 31-bit device id.
-    fn from_u32(pid: u32) -> Self;
-}
-
-impl GraphPid for usize {
-    #[inline(always)]
-    fn from_u32(pid: u32) -> Self {
-        pid as usize
-    }
-}
-
-impl GraphPid for u32 {
-    #[inline(always)]
-    fn from_u32(pid: u32) -> Self {
-        pid
-    }
-}
-
 ////////////////
 // Neighbours //
 ////////////////

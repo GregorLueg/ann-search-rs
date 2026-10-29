@@ -932,10 +932,10 @@ mod tests {
 
             // And it is never worse than the compaction, which spends slots on
             // repeats because it does not deduplicate.
-            let compact_ids: Vec<usize> = compacted[i * k..(i + 1) * k]
+            let compact_ids: Vec<u32> = compacted[i * k..(i + 1) * k]
                 .iter()
                 .map(|e| e.0)
-                .filter(|&j| j != SENTINEL_PID)
+                .filter(|&j| j != SENTINEL)
                 .collect();
             let mut distinct = compact_ids.clone();
             distinct.sort_unstable();

@@ -489,27 +489,30 @@ fn normalise_rows(data: &mut [f32], dim: usize) {
 fn reorganise_by_cluster(
     vectors_flat: &[f32],
     dim: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     nlist: usize,
-) -> (Vec<f32>, Vec<usize>, Vec<usize>) {
-    let mut offsets = vec![0usize; nlist + 1];
+) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; nlist + 1];
     for &c in assignments {
-        offsets[c + 1] += 1;
+        offsets[c as usize + 1] += 1;
     }
     for i in 0..nlist {
         offsets[i + 1] += offsets[i];
     }
     let mut cursor = offsets.clone();
-    let mut original = vec![0usize; assignments.len()];
+    let mut original = vec![0u32; assignments.len()];
     for (i, &c) in assignments.iter().enumerate() {
-        original[cursor[c]] = i;
-        cursor[c] += 1;
+        original[cursor[c as usize] as usize] = i as u32;
+        cursor[c as usize] += 1;
     }
     let mut reordered = vec![0f32; vectors_flat.len()];
     reordered
         .par_chunks_exact_mut(dim)
         .zip(original.par_iter())
-        .for_each(|(dst, &src)| dst.copy_from_slice(&vectors_flat[src * dim..(src + 1) * dim]));
+        .for_each(|(dst, &src)| {
+            let src = src as usize;
+            dst.copy_from_slice(&vectors_flat[src * dim..(src + 1) * dim]);
+        });
     (reordered, original, offsets)
 }
 
@@ -526,9 +529,9 @@ pub struct IvfIndexMlx {
     /// self query reads its queries from here.
     vectors_flat: Vec<f32>,
     /// Maps cluster-order position -> original index
-    original_indices: Vec<usize>,
+    original_indices: Vec<u32>,
     /// CSR offsets per cluster into the cluster-ordered vectors; `nlist + 1`
-    cluster_offsets: Vec<usize>,
+    cluster_offsets: Vec<u32>,
     /// Prefix sums of the cluster sizes in ascending order; `nlist + 1`. The
     /// smallest `m` with `sorted_size_prefix[m] >= k` is a probe count that
     /// reaches `k` points whichever clusters are probed.
@@ -649,7 +652,10 @@ impl IvfIndexMlx {
             normalise_rows(&mut vectors_flat, dim);
         }
 
-        let mut sizes: Vec<usize> = cluster_offsets.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut sizes: Vec<usize> = cluster_offsets
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .collect();
         sizes.sort_unstable();
         let mut sorted_size_prefix = Vec::with_capacity(nlist + 1);
         sorted_size_prefix.push(0);
@@ -668,8 +674,7 @@ impl IvfIndexMlx {
             .map(|r| f32::dot_simd(r, r))
             .collect();
         let xn = Array::from_f32(&xn_host, &[n as i32]);
-        let offsets_u32: Vec<u32> = cluster_offsets.iter().map(|&o| o as u32).collect();
-        let offsets = Array::from_u32(&offsets_u32, &[nlist as i32 + 1]);
+        let offsets = Array::from_u32(&cluster_offsets, &[nlist as i32 + 1]);
         let c = Array::from_f32(&centroids, &[nlist as i32, dim as i32]);
         let centroid_ops = CentroidOperands::new(&c, nlist, &metric, &stream)?;
         eval_all(
@@ -789,7 +794,11 @@ impl IvfIndexMlx {
             self.query_prepared(&queries, n_query, k, nprobe, nquery, verbose)?;
         let indices = indices
             .into_iter()
-            .map(|row| row.into_iter().map(|p| self.original_indices[p]).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(|p| self.original_indices[p] as usize)
+                    .collect()
+            })
             .collect();
         Ok((indices, dists))
     }
@@ -828,8 +837,11 @@ impl IvfIndexMlx {
             Vec::new()
         };
         for (pos, (row, drow)) in idx_reorg.into_iter().zip(dist_reorg).enumerate() {
-            let orig = self.original_indices[pos];
-            indices[orig] = row.into_iter().map(|p| self.original_indices[p]).collect();
+            let orig = self.original_indices[pos] as usize;
+            indices[orig] = row
+                .into_iter()
+                .map(|p| self.original_indices[p] as usize)
+                .collect();
             if return_dist {
                 dists[orig] = drow;
             }
@@ -1188,10 +1200,9 @@ impl IvfIndexMlx {
     pub fn memory_usage_bytes(&self) -> (usize, usize) {
         let host = std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * size_of::<f32>()
-            + (self.original_indices.capacity()
-                + self.cluster_offsets.capacity()
-                + self.sorted_size_prefix.capacity())
-                * size_of::<usize>();
+            + (self.original_indices.capacity() + self.cluster_offsets.capacity())
+                * size_of::<u32>()
+            + self.sorted_size_prefix.capacity() * size_of::<usize>();
         let device = (self.n * self.dim + self.nlist * self.dim + self.nlist) * size_of::<f32>()
             + (self.nlist + 1) * size_of::<u32>();
         (host, device)

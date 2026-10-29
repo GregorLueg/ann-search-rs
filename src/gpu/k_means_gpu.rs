@@ -1765,7 +1765,7 @@ fn run_kmeans_loop<S, A>(
     params: &KMeansGpuParams,
     seed: usize,
     verbose: bool,
-) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
 where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float,
@@ -1923,11 +1923,7 @@ where
         dist,
     )?;
 
-    let assignments: Vec<usize> = assign_gpu
-        .read(client)?
-        .into_iter()
-        .map(|x| x as usize)
-        .collect();
+    let assignments = assign_gpu.read(client)?;
 
     let final_cents = cent_gpu.clone().read(client)?;
 
@@ -1986,7 +1982,7 @@ fn init_and_run<S, A>(
     init_method: KMeansInit,
     seed: usize,
     verbose: bool,
-) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
 where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
@@ -2135,6 +2131,8 @@ where
 
     let centroid_mat = Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
 
+    // Public signature stays usize for external callers.
+    let assignments = assignments.into_iter().map(|a| a as usize).collect();
     Ok((centroid_mat, assignments))
 }
 
@@ -2168,7 +2166,7 @@ fn kmeans_cpu_fallback<T>(
     params: &KMeansGpuParams,
     seed: usize,
     verbose: bool,
-) -> Result<(Vec<T>, Vec<usize>), AnnSearchErrors>
+) -> Result<(Vec<T>, Vec<u32>), AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
@@ -2210,7 +2208,7 @@ where
         metric,
     );
 
-    Ok((centroids, assignments.into_iter().map(|a| a as usize).collect()))
+    Ok((centroids, assignments))
 }
 
 /// Train k-means centroids on the GPU from a flat row-major buffer.
@@ -2255,7 +2253,7 @@ pub fn k_means_gpu_flat<T>(
     seed: usize,
     client: &Client,
     verbose: bool,
-) -> Result<(Vec<T>, Vec<usize>), AnnSearchErrors>
+) -> Result<(Vec<T>, Vec<u32>), AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
@@ -2498,7 +2496,7 @@ pub fn assign_all_gpu<T>(
     n_centroids: usize,
     metric: &Dist,
     client: &Client,
-) -> Result<Vec<usize>, AnnSearchErrors>
+) -> Result<Vec<u32>, AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
@@ -2555,8 +2553,7 @@ where
         metric,
     )?;
 
-    let raw = assign_gpu.read(client)?;
-    Ok(raw.into_iter().map(|c| c as usize).collect())
+    Ok(assign_gpu.read(client)?)
 }
 
 ///////////
@@ -2607,7 +2604,7 @@ mod entry_point_tests {
 
         assert_eq!(centroids.len(), k * dim);
         assert_eq!(assignments.len(), n);
-        assert!(assignments.iter().all(|&c| c < k));
+        assert!(assignments.iter().all(|&c| (c as usize) < k));
     }
 
     #[test]
@@ -2750,7 +2747,7 @@ mod entry_point_tests {
             &Dist::SquaredEuclidean,
         );
 
-        assert_eq!(gpu, cpu.iter().map(|&c| c as usize).collect::<Vec<_>>());
+        assert_eq!(gpu, cpu);
     }
 }
 
@@ -2933,7 +2930,7 @@ mod tests {
 
     fn cpu_centroid_means(
         data: &[f32],
-        assignments: &[usize],
+        assignments: &[u32],
         init: &[f32],
         n: usize,
         k: usize,
@@ -2942,7 +2939,7 @@ mod tests {
         let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0usize; k];
         for i in 0..n {
-            let c = assignments[i];
+            let c = assignments[i] as usize;
             counts[c] += 1;
             for j in 0..dim {
                 sums[c * dim + j] += data[i * dim + j];
@@ -3076,7 +3073,7 @@ mod tests {
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
         let want = cpu_centroid_means(
             &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+            &assignments,
             &init,
             n,
             k,
@@ -3145,7 +3142,7 @@ mod tests {
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
         let want = cpu_centroid_means(
             &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+            &assignments,
             &init,
             n,
             k,
@@ -3182,7 +3179,7 @@ mod tests {
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
         let want = cpu_centroid_means(
             &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+            &assignments,
             &init,
             n,
             k,
@@ -3247,7 +3244,7 @@ mod tests {
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
         let want = cpu_centroid_means(
             &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+            &assignments,
             &init,
             n,
             k,

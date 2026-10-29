@@ -173,12 +173,12 @@ fn upload_tiles(data: &[f32], dim: usize, tile: usize) -> Vec<(Array, usize)> {
 ///
 /// The within-cluster sum of squares
 #[cfg(test)]
-pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: &[usize]) -> f64 {
+pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: &[u32]) -> f64 {
     data.par_chunks_exact(dim)
         .zip(assignments.par_iter())
         .map(|(x, &c)| {
             x.iter()
-                .zip(&centroids[c * dim..(c + 1) * dim])
+                .zip(&centroids[c as usize * dim..(c as usize + 1) * dim])
                 .map(|(a, b)| ((a - b) * (a - b)) as f64)
                 .sum::<f64>()
         })
@@ -356,7 +356,7 @@ pub fn assign_all_mlx(
     n_centroids: usize,
     metric: &Dist,
     s: &Stream,
-) -> Result<Vec<usize>, AnnSearchErrors> {
+) -> Result<Vec<u32>, AnnSearchErrors> {
     if *metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
     }
@@ -376,7 +376,7 @@ pub fn assign_all_mlx(
     let mut out = Vec::with_capacity(data.len() / dim.max(1));
     for a in &pending {
         eval_all(&[a], false)?;
-        out.extend(a.as_u32()?.iter().map(|&v| v as usize));
+        out.extend_from_slice(a.as_u32()?);
     }
     Ok(out)
 }
@@ -431,6 +431,8 @@ pub fn k_means_clusters_mlx(
     let assignments = assign_all_mlx(&data, dim, &centroids, n_centroids, &metric, &s)?;
     crate::mlx::clear_cache()?;
     let mat = faer::Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
+    // Public signature stays usize for external callers.
+    let assignments = assignments.into_iter().map(|a| a as usize).collect();
     Ok((mat, assignments))
 }
 
@@ -502,7 +504,6 @@ mod tests {
             k,
             &Dist::SquaredEuclidean,
         );
-        let cpu_assign: Vec<usize> = cpu_assign.iter().map(|&a| a as usize).collect();
 
         let (a, b) = (
             inertia(&data, dim, &mlx, &mlx_assign),
@@ -540,7 +541,6 @@ mod tests {
                 (vec![1.0; n], vec![1.0; k])
             };
             let cpu = assign_all_parallel(&data, &dn, dim, n, &cents, &cn, k, &metric);
-            let cpu: Vec<usize> = cpu.iter().map(|&a| a as usize).collect();
             let agree = mlx.iter().zip(&cpu).filter(|(a, b)| a == b).count();
             // Near-ties may flip through the GEMM expansion.
             assert!(agree as f64 / n as f64 > 0.995, "{metric:?}: {agree}/{n}");
@@ -559,6 +559,7 @@ mod tests {
                 .unwrap();
         assert_eq!((cent.nrows(), cent.ncols()), (k, dim));
         assert_eq!(assign.len(), n);
+        let assign_u32: Vec<u32> = assign.iter().map(|&a| a as u32).collect();
         let flat: Vec<f32> = (0..k)
             .flat_map(|i| (0..dim).map(move |j| (i, j)))
             .map(|(i, j)| cent[(i, j)])
@@ -587,9 +588,8 @@ mod tests {
             k,
             &Dist::SquaredEuclidean,
         );
-        let cpu_assign: Vec<usize> = cpu_assign.iter().map(|&a| a as usize).collect();
         let (a, b) = (
-            inertia(&data, dim, &flat, &assign),
+            inertia(&data, dim, &flat, &assign_u32),
             inertia(&data, dim, &cpu, &cpu_assign),
         );
         assert!((a - b).abs() / b < 0.02, "mlx {a} vs cpu {b}");

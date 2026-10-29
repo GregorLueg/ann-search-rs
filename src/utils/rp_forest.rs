@@ -11,7 +11,7 @@ use std::collections::BinaryHeap;
 
 use crate::prelude::*;
 use crate::utils::heap_structs::OrderedFloat;
-use crate::utils::nndescent_utils::{GraphPid, SENTINEL_PID};
+use crate::utils::nndescent_utils::SENTINEL_PID;
 
 /// CSR leaves of one tree: `(leaf_points, leaf_offsets, n_leaves)`.
 pub(crate) type LeafStructure = (Vec<u32>, Vec<u32>, usize);
@@ -60,17 +60,15 @@ pub fn default_forest_trees(n: usize) -> usize {
 /// ### Returns
 ///
 /// Flat `n * k` graph, row `i` at `[i * k, (i + 1) * k)`, unfilled slots left
-/// as `(SENTINEL_PID, T::max_value())`. The id type is the caller's: `usize`
-/// for the handoff structs, `u32` for the indices that keep the graph.
-pub fn compact_knn_rows<P, T>(
+/// as `(SENTINEL_PID as u32, T::max_value())`.
+pub fn compact_knn_rows<T>(
     graph_idx: &[u32],
     graph_dist: &[T],
     n: usize,
     k: usize,
     build_k: usize,
-) -> Vec<(P, T)>
+) -> Vec<(u32, T)>
 where
-    P: GraphPid,
     T: AnnSearchFloat,
 {
     let pid_mask = SENTINEL_PID as u32;
@@ -78,7 +76,7 @@ where
 
     let mut knn_graph = vec![
         (
-            P::from_u32(SENTINEL_PID as u32),
+            SENTINEL_PID as u32,
             <T as num_traits::Float>::max_value()
         );
         n * k
@@ -95,7 +93,7 @@ where
                 }
                 let pid = (graph_idx[i * build_k + j] & pid_mask) as usize;
                 if pid < n && pid != i && pid != sentinel {
-                    slot[written] = (P::from_u32(pid as u32), graph_dist[i * build_k + j]);
+                    slot[written] = (pid as u32, graph_dist[i * build_k + j]);
                     written += 1;
                 }
             }
