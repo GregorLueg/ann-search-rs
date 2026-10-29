@@ -4226,6 +4226,81 @@ where
 }
 
 #[cfg(feature = "gpu")]
+/// Build a kNN graph with NN-Descent on the GPU and return only the graph.
+///
+/// Matrix in, graph out. Goes through [`build_clustered_knn_graph_gpu`], so a
+/// dataset past the device's per-binding limit is built in balanced batches
+/// and one that fits takes the unbatched path. Nothing but the graph is
+/// returned.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric string
+/// * `params` - Optional [`crate::gpu::nndescent_gpu::NNDescentGpuKnnParams`];
+///   `None` uses the defaults
+/// * `cluster_params` - Optional
+///   [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`]; `None`
+///   plans the cluster count from the device limits
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// The flat [`KnnGraph`], rows sorted by distance ascending.
+///
+/// ### Note
+///
+/// The GPU graph is not reproducible run to run, even with a fixed seed.
+pub fn build_knn_graph_nndescent_gpu<T>(
+    mat: impl AnnMatrix<T>,
+    dist_metric: &str,
+    params: Option<crate::gpu::nndescent_gpu::NNDescentGpuKnnParams>,
+    cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
+    seed: usize,
+    verbose: bool,
+    device: Device,
+) -> Result<KnnGraph<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + CubeclFloat,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    let p = params.unwrap_or_default();
+
+    let KnnGraphGpu {
+        n, k, knn_graph, ..
+    } = crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T>(
+        mat.into_row_major(),
+        metric,
+        Some(p.k),
+        p.build_k,
+        p.max_iters,
+        p.n_trees,
+        p.delta,
+        p.rho,
+        p.refine_knn,
+        cluster_params,
+        seed,
+        verbose,
+        device,
+    )?;
+
+    Ok(KnnGraph::from_rows(
+        &knn_graph,
+        n,
+        k,
+        p.include_self,
+        p.return_dist,
+    ))
+}
+
+#[cfg(feature = "gpu")]
 /// Build an NSG index from a slim GPU-built kNN graph.
 ///
 /// For callers that used [`build_knn_graph_gpu`] or

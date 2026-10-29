@@ -103,7 +103,7 @@ fn count_filled(graph: &KnnGraphGpu<f32>) -> usize {
     graph
         .knn_graph
         .iter()
-        .filter(|&&(pid, _)| pid != SENTINEL_PID)
+        .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
         .count()
 }
 

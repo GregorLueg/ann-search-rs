@@ -669,20 +669,13 @@ where
         seed: usize,
         verbose: bool,
     ) -> Result<Self, AnnSearchErrors> {
-        // NN-Descent stores u32 ids; NSG's build walks usize. One transient
-        // copy against a build that dwarfs it.
-        let knn_graph: Vec<(usize, T)> = nnd
-            .graph()
-            .iter()
-            .map(|&(pid, d)| (pid as usize, d))
-            .collect();
         Self::build_from_knn(
             nnd.vectors_flat.to_owned(),
             nnd.n,
             nnd.dim,
             nnd.norms.to_owned(),
             nnd.metric(),
-            &knn_graph,
+            nnd.graph(),
             nnd.k,
             params,
             seed,
@@ -750,7 +743,7 @@ where
         dim: usize,
         norms: Vec<T>,
         metric: Dist,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         params: NsgBuildParams,
         seed: usize,
@@ -911,6 +904,7 @@ where
                 }
                 let base = v * knn_k;
                 for &(nbr, dist) in &knn_graph[base..base + knn_k] {
+                    let nbr = nbr as usize;
                     if slot.len() >= params.r {
                         break;
                     }
@@ -979,7 +973,7 @@ where
     /// Index of the data point nearest to the centroid.
     fn pick_navigating_node(
         &self,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         seed: usize,
@@ -1027,6 +1021,7 @@ where
 
                 let base = current_id * knn_k;
                 for &(nbr, _) in &knn_graph[base..base + knn_k] {
+                    let nbr = nbr as usize;
                     if nbr == SENTINEL_PID || nbr >= self.n {
                         continue;
                     }
@@ -1091,7 +1086,7 @@ where
         &self,
         v: usize,
         np: usize,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         c: usize,
@@ -1122,7 +1117,7 @@ where
         &self,
         v: usize,
         np: usize,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         c: usize,
@@ -1150,6 +1145,7 @@ where
         // Seed with np's kNN neighbours as extra beam entries.
         let np_base = np * knn_k;
         for &(nbr, _) in &knn_graph[np_base..np_base + knn_k] {
+            let nbr = nbr as usize;
             if nbr == SENTINEL_PID || nbr >= self.n || state.is_visited(nbr) {
                 continue;
             }
@@ -1176,6 +1172,7 @@ where
 
             let base = current_id * knn_k;
             for &(nbr, _) in &knn_graph[base..base + knn_k] {
+                let nbr = nbr as usize;
                 if nbr == SENTINEL_PID || nbr >= self.n {
                     continue;
                 }
@@ -1208,6 +1205,7 @@ where
         // Union in v's kNN neighbours to guarantee NNG ⊂ NSG.
         let vk_base = v * knn_k;
         for &(nbr, _) in &knn_graph[vk_base..vk_base + knn_k] {
+            let nbr = nbr as usize;
             if nbr == SENTINEL_PID || nbr >= self.n || nbr == v {
                 continue;
             }

@@ -1361,7 +1361,7 @@ pub struct KnnGraphMlx {
     /// Distance metric
     pub metric: Dist,
     /// Flat kNN graph of size `n * k`, sorted per row ascending by distance
-    pub knn_graph: Vec<(usize, f32)>,
+    pub knn_graph: Vec<(u32, f32)>,
     /// Whether NN-Descent hit the delta convergence threshold
     pub converged: bool,
 }
@@ -1404,7 +1404,7 @@ impl KnnGraphMlx {
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * size_of::<f32>()
             + self.norms.capacity() * size_of::<f32>()
-            + self.knn_graph.capacity() * size_of::<(usize, f32)>()
+            + self.knn_graph.capacity() * size_of::<(u32, f32)>()
     }
 }
 

@@ -2318,7 +2318,7 @@ where
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.nav_graph.capacity() * std::mem::size_of::<u32>()
-            + self.knn_graph.capacity() * std::mem::size_of::<(usize, T)>()
+            + self.knn_graph.capacity() * std::mem::size_of::<(u32, T)>()
     }
 
     /// Extract the kNN graph as index/distance vectors.
@@ -2524,9 +2524,85 @@ pub struct KnnGraphGpu<T> {
     /// Distance metric
     pub metric: Dist,
     /// Flat kNN graph of size `n * k`, sorted per row ascending by distance
-    pub knn_graph: Vec<(usize, T)>,
+    pub knn_graph: Vec<(u32, T)>,
     /// Whether NNDescent hit the delta convergence threshold
     pub converged: bool,
+}
+
+/// Parameters for the GPU kNN-only build,
+/// [`crate::build_knn_graph_nndescent_gpu`].
+#[derive(Clone, Copy, Debug)]
+pub struct NNDescentGpuKnnParams {
+    /// Neighbours per node found by the descent, the self-edge not counted
+    pub k: usize,
+    /// Internal NN-Descent working degree; `None` gives `1.5 * k`
+    pub build_k: Option<usize>,
+    /// Maximum NN-Descent iterations; `None` gives 15
+    pub max_iters: Option<usize>,
+    /// Forest size for the device init; `None` sizes it from `n`
+    pub n_trees: Option<usize>,
+    /// Convergence threshold; `None` gives 0.001
+    pub delta: Option<f32>,
+    /// Local-join sampling rate; `None` gives 1.0, no sampling
+    pub rho: Option<f32>,
+    /// 2-hop refinement sweeps after the main loop; `None` gives 0
+    pub refine_knn: Option<usize>,
+    /// Prepend each point to its own row with distance zero, as UMAP expects
+    pub include_self: bool,
+    /// Keep the distances
+    pub return_dist: bool,
+}
+
+impl NNDescentGpuKnnParams {
+    /// Create new parameters.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours per node, the self-edge not counted
+    /// * `build_k` - Working degree (`None` for the default)
+    /// * `max_iters` - Maximum iterations (`None` for the default)
+    /// * `n_trees` - Init forest size (`None` for the default)
+    /// * `delta` - Convergence threshold (`None` for the default)
+    /// * `rho` - Local-join sampling rate (`None` for the default)
+    /// * `refine_knn` - 2-hop refinement sweeps (`None` for the default)
+    /// * `include_self` - Prepend the self-edge to every row
+    /// * `return_dist` - Keep the distances
+    ///
+    /// ### Returns
+    ///
+    /// The parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        k: usize,
+        build_k: Option<usize>,
+        max_iters: Option<usize>,
+        n_trees: Option<usize>,
+        delta: Option<f32>,
+        rho: Option<f32>,
+        refine_knn: Option<usize>,
+        include_self: bool,
+        return_dist: bool,
+    ) -> Self {
+        Self {
+            k,
+            build_k,
+            max_iters,
+            n_trees,
+            delta,
+            rho,
+            refine_knn,
+            include_self,
+            return_dist,
+        }
+    }
+}
+
+impl Default for NNDescentGpuKnnParams {
+    /// `k = 30` and the builder defaults, with distances kept and no
+    /// self-edge.
+    fn default() -> Self {
+        Self::new(30, None, None, None, None, None, None, false, true)
+    }
 }
 
 impl<T> KnnGraphGpu<T>
@@ -3382,7 +3458,7 @@ mod tests {
             )
             .unwrap();
             for (i, row) in graph.knn_graph.chunks_exact(graph.k).enumerate() {
-                let mut ids: Vec<usize> = row.iter().map(|&(pid, _)| pid).collect();
+                let mut ids: Vec<usize> = row.iter().map(|&(pid, _)| pid as usize).collect();
                 ids.sort_unstable();
                 ids.dedup();
                 assert_eq!(ids.len(), graph.k, "seed {seed}, row {i} has duplicates");
@@ -4680,6 +4756,7 @@ mod kernel_tests {
 
         for i in 0..n {
             for &(pid, stored) in &graph.knn_graph[i * k..(i + 1) * k] {
+                let pid = pid as usize;
                 if pid >= n {
                     continue;
                 }

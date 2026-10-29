@@ -53,7 +53,7 @@ fn check_graph(label: &str, graph: &KnnGraphGpu<f32>) {
     let filled = graph
         .knn_graph
         .iter()
-        .filter(|&&(pid, _)| pid != SENTINEL_PID)
+        .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
         .count();
     let expected = graph.n * graph.k;
     let ratio = filled as f64 / expected as f64;

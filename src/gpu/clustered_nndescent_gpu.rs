@@ -31,6 +31,9 @@ use crate::utils::k_means_utils::{
 };
 use crate::utils::nndescent_utils::SENTINEL_PID;
 
+/// [`SENTINEL_PID`] as stored in the `u32` global graph.
+const SENTINEL: u32 = SENTINEL_PID as u32;
+
 ////////////
 // Consts //
 ////////////
@@ -218,14 +221,14 @@ pub fn plan_cluster_count(
 /// time, and within one cluster every member is a distinct global node, so no
 /// two rayon tasks ever touch the same `g * k` block. Same argument and same
 /// shape as [`crate::utils::nndescent_utils::UnsafeGraphPtr`], which cannot be
-/// reused directly here because the global graph is a `(usize, T)` pair buffer
+/// reused directly here because the global graph is a `(u32, T)` pair buffer
 /// rather than a `Neighbour<T>` one.
 ///
 /// ### Fields
 #[derive(Copy, Clone)]
 struct UnsafeRowPtr<T>(
     /// Raw mutable pointer to the flat `(id, distance)` buffer
-    *mut (usize, T),
+    *mut (u32, T),
 );
 
 unsafe impl<T> Send for UnsafeRowPtr<T> {}
@@ -251,7 +254,7 @@ unsafe impl<T> Sync for UnsafeRowPtr<T> {}
 /// * `graph_dist` - Matching distances, `m * build_k`
 /// * `build_k` - Working degree the cluster ran at
 fn merge_cluster_into_global<T>(
-    global: &mut [(usize, T)],
+    global: &mut [(u32, T)],
     k: usize,
     members: &[u32],
     graph_idx: &[u32],
@@ -273,14 +276,14 @@ fn merge_cluster_into_global<T>(
             return;
         }
 
-        let mut merged: Vec<(usize, T)> = Vec::with_capacity(k + build_k);
+        let mut merged: Vec<(u32, T)> = Vec::with_capacity(k + build_k);
 
         // Existing global row.
         for slot in 0..k {
             // SAFETY: `g` is unique within this cluster, so this row is not
             // touched by any other task in this loop.
             let entry = unsafe { *rows.0.add(g * k + slot) };
-            if entry.0 != SENTINEL_PID {
+            if entry.0 != SENTINEL {
                 merged.push(entry);
             }
         }
@@ -291,8 +294,8 @@ fn merge_cluster_into_global<T>(
             if local_pid >= m || local_pid == local {
                 continue;
             }
-            let cand = members[local_pid] as usize;
-            if cand != g {
+            let cand = members[local_pid];
+            if cand as usize != g {
                 merged.push((cand, graph_dist[local * build_k + j]));
             }
         }
@@ -314,7 +317,7 @@ fn merge_cluster_into_global<T>(
             let value = merged
                 .get(slot)
                 .copied()
-                .unwrap_or((SENTINEL_PID, <T as num_traits::Float>::max_value()));
+                .unwrap_or((SENTINEL, <T as num_traits::Float>::max_value()));
             // SAFETY: as above, `g * k + slot` is owned by this task alone.
             unsafe { *rows.0.add(g * k + slot) = value };
         }
@@ -537,7 +540,7 @@ where
 
     // ---- Per-cluster NN-Descent ----
 
-    let mut global = vec![(SENTINEL_PID, <T as num_traits::Float>::max_value()); n * k];
+    let mut global = vec![(SENTINEL, <T as num_traits::Float>::max_value()); n * k];
     let mut converged = true;
 
     for c in 0..n_clusters {
@@ -624,7 +627,7 @@ where
     }
 
     if verbose {
-        let filled = global.iter().filter(|e| e.0 != SENTINEL_PID).count();
+        let filled = global.iter().filter(|e| e.0 != SENTINEL).count();
         println!(
             "  Total build time: {:.2?} ({} of {} graph slots filled)",
             start.elapsed(),
@@ -741,7 +744,7 @@ mod tests {
     #[test]
     fn test_merge_into_empty_global_takes_the_cluster_rows() {
         let (k, build_k, n) = (2usize, 2usize, 4usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         // Cluster holds global nodes 1 and 3, two apart on the line.
         let members = vec![1u32, 3];
         let graph_idx = vec![1u32, 0x7FFFFFFF, 0u32, 0x7FFFFFFF];
@@ -750,17 +753,17 @@ mod tests {
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
 
         assert_eq!(global[k], (3, 4.0));
-        assert_eq!(global[k + 1].0, SENTINEL_PID);
+        assert_eq!(global[k + 1].0, SENTINEL);
         assert_eq!(global[3 * k], (1, 4.0));
         // Untouched rows stay sentinel.
-        assert_eq!(global[0].0, SENTINEL_PID);
-        assert_eq!(global[2 * k].0, SENTINEL_PID);
+        assert_eq!(global[0].0, SENTINEL);
+        assert_eq!(global[2 * k].0, SENTINEL);
     }
 
     #[test]
     fn test_merge_keeps_best_k_and_dedups_across_clusters() {
         let (k, build_k, n) = (2usize, 2usize, 3usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         // Node 0 already knows node 2, four away.
         global[0] = (2, 4.0);
 
@@ -781,7 +784,7 @@ mod tests {
         // The merge ranks across two subgraphs, so it must sort rather than
         // take rows in the order the device happened to lay them out.
         let (k, build_k, n) = (2usize, 2usize, 4usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         let members: Vec<u32> = (0..n as u32).collect();
         // Row 0 offers node 3 (nine away) first and node 1 (one away) second.
         let graph_idx = vec![
@@ -904,7 +907,7 @@ mod tests {
 
         let compacted = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
 
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
 
         for i in 0..n {
@@ -922,8 +925,8 @@ mod tests {
 
             let got: Vec<(usize, f32)> = global[i * k..(i + 1) * k]
                 .iter()
-                .filter(|e| e.0 != SENTINEL_PID)
-                .copied()
+                .filter(|e| e.0 != SENTINEL)
+                .map(|&(j, d)| (j as usize, d))
                 .collect();
             assert_eq!(got, cands, "row {i}");
 
@@ -1035,10 +1038,10 @@ mod device_tests {
     }
 
     /// Fraction of the true k neighbours a flat `n * k` graph recovered.
-    fn recall_at_k(got: &[(usize, f32)], truth: &[Vec<usize>], n: usize, k: usize) -> f64 {
+    fn recall_at_k(got: &[(u32, f32)], truth: &[Vec<usize>], n: usize, k: usize) -> f64 {
         let mut hits = 0usize;
         for i in 0..n {
-            let row: Vec<usize> = got[i * k..(i + 1) * k].iter().map(|e| e.0).collect();
+            let row: Vec<usize> = got[i * k..(i + 1) * k].iter().map(|e| e.0 as usize).collect();
             hits += truth[i].iter().filter(|t| row.contains(t)).count();
         }
         hits as f64 / (n * k) as f64
@@ -1114,6 +1117,76 @@ mod device_tests {
         );
     }
 
+    /// The matrix-in, graph-out wrapper keeps the direct build's quality and
+    /// lays the rows out flat with the self-edge first.
+    #[test]
+    fn test_knn_graph_fast_path_layout_and_quality() {
+        let Some(device) = try_device() else { return };
+        let k = 5;
+        let (mat, n) = blob_data(4, 40, 8);
+        let truth = brute_force_knn(&mat, k);
+
+        let params = crate::gpu::nndescent_gpu::NNDescentGpuKnnParams::new(
+            k,
+            Some(10),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+        );
+        let g = crate::build_knn_graph_nndescent_gpu::<f32>(
+            mat.as_ref(),
+            "euclidean",
+            Some(params),
+            None,
+            7,
+            false,
+            device.clone().into(),
+        )
+        .unwrap();
+        let dists = g.distances.as_ref().unwrap();
+        assert_eq!((g.n, g.k), (n, k + 1));
+        for i in 0..n {
+            assert_eq!(g.row(i)[0], i as u32);
+            assert_eq!(dists[i * g.k], 0.0);
+            assert!(!g.row(i)[1..].contains(&(i as u32)), "row {i} repeats itself");
+            let row_d = &dists[i * g.k..(i + 1) * g.k];
+            assert!(row_d.windows(2).all(|w| w[0] <= w[1]), "row {i} unsorted");
+        }
+
+        let direct = build_knn_graph_gpu::<f32>(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(k),
+            Some(10),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            7,
+            false,
+            device.clone().into(),
+        )
+        .unwrap();
+        let mut flat: Vec<(u32, f32)> = Vec::with_capacity(n * k);
+        for i in 0..n {
+            for j in 1..=k {
+                flat.push((g.indices[i * g.k + j], dists[i * g.k + j]));
+            }
+        }
+        let fast_recall = recall_at_k(&flat, &truth, n, k);
+        let direct_recall = recall_at_k(&direct.knn_graph, &truth, n, k);
+        // Same tolerance and reason as the single-cluster test above.
+        assert!(
+            (fast_recall - direct_recall).abs() < 0.12,
+            "fast path diverged from direct: {fast_recall:.3} vs {direct_recall:.3}"
+        );
+    }
+
     /// The batched machinery, driven by hand for a "cluster" that is the whole
     /// dataset at the same seed, must land on the same quality as the direct
     /// build. Isolates `nndescent_core` plus the merge from the partitioning
@@ -1186,7 +1259,7 @@ mod device_tests {
         } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false).unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
         let merged_recall = recall_at_k(&global, &truth, n, k);
 
@@ -1247,7 +1320,7 @@ mod device_tests {
             let filled = graph
                 .knn_graph
                 .iter()
-                .filter(|e| e.0 != SENTINEL_PID)
+                .filter(|e| e.0 != SENTINEL)
                 .count();
             assert_eq!(
                 filled,
@@ -1259,7 +1332,7 @@ mod device_tests {
                 .filter(|&i| {
                     let mut ids: Vec<usize> = graph.knn_graph[i * k..(i + 1) * k]
                         .iter()
-                        .map(|e| e.0)
+                        .map(|e| e.0 as usize)
                         .collect();
                     ids.sort_unstable();
                     let before = ids.len();
@@ -1281,7 +1354,7 @@ mod device_tests {
                         .filter(|(j, d)| {
                             let true_d: f32 = (0..dim)
                                 .map(|c| {
-                                    let diff = mat[(i, c)] - mat[(*j, c)];
+                                    let diff = mat[(i, c)] - mat[(*j as usize, c)];
                                     diff * diff
                                 })
                                 .sum();
@@ -1335,14 +1408,14 @@ mod device_tests {
         let filled = graph
             .knn_graph
             .iter()
-            .filter(|e| e.0 != SENTINEL_PID)
+            .filter(|e| e.0 != SENTINEL)
             .count();
         assert_eq!(filled, n * k);
         // Rows stay sorted ascending, which the merge is responsible for.
         for i in 0..n {
             let row = &graph.knn_graph[i * k..(i + 1) * k];
             assert!(row.windows(2).all(|w| w[0].1 <= w[1].1), "row {i} unsorted");
-            assert!(row.iter().all(|e| e.0 != i), "row {i} contains itself");
+            assert!(row.iter().all(|e| e.0 as usize != i), "row {i} contains itself");
         }
     }
 }

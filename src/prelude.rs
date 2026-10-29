@@ -35,7 +35,7 @@ pub use crate::gpu::k_means_gpu::KMeansGpuParams;
 // `extract_knn_graph_gpu`, so leaving it out forces callers to name the module
 // path by hand.
 #[cfg(feature = "gpu")]
-pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu};
+pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu, NNDescentGpuKnnParams};
 #[cfg(feature = "gpu")]
 pub use cubecl_utils_rs::CubeclFloat;
 
