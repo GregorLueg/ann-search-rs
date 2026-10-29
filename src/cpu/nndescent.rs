@@ -1134,10 +1134,7 @@ where
         };
 
         let start = Instant::now();
-        let seeded = match builder.forest() {
-            Forest::Annoy(forest) => builder.init_with_leaf_join(forest, k),
-            Forest::Kd(_) => builder.init_with_forest(k),
-        };
+        let seeded = builder.init_with_leaf_join(builder.forest(), k);
         let timings = BuildTimings {
             forest: forest_time,
             seed: start.elapsed(),
@@ -1278,39 +1275,6 @@ where
         next.clamp(lo, hi)
     }
 
-    /// Initialise the flat k-NN graph using the Annoy forest
-    ///
-    /// Each node queries Annoy for `k+1` candidates, skips the self-match,
-    /// and takes the next `k`. Results are marked new so they participate
-    /// in the first iteration's local joins. Unused trailing slots are
-    /// padded with sentinels.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Neighbours per node
-    ///
-    /// ### Returns
-    ///
-    /// Flat graph of size `n * k` with Annoy-seeded initial neighbours
-    fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
-        let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
-        let mut graph = vec![sentinel; self.n * k];
-        let search_k = k * self.forest().n_trees();
-
-        graph
-            .par_chunks_mut(k)
-            .enumerate()
-            .for_each_init(EntryScratch::<T>::new, |scratch, (i, slot)| {
-                let query = &self.vectors_flat[i * self.dim..(i + 1) * self.dim];
-                self.forest_entries(query, k + 1, search_k, scratch);
-                for (j, &(dist, idx)) in scratch.candidates.iter().skip(1).take(k).enumerate() {
-                    slot[j] = Neighbour::new(idx as u32, dist, true);
-                }
-            });
-
-        graph
-    }
-
     /// Initialise the flat k-NN graph by joining every forest leaf exhaustively
     ///
     /// pynndescent's seeding: every pair inside a leaf is scored once and
@@ -1320,17 +1284,20 @@ where
     ///
     /// ### Params
     ///
-    /// * `forest` - The Annoy forest the leaves come from
+    /// * `forest` - The forest the leaves come from
     /// * `k` - Neighbours per node
     ///
     /// ### Returns
     ///
     /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
-    fn init_with_leaf_join(&self, forest: &AnnoyTrees<T>, k: usize) -> Vec<Neighbour<T>> {
+    fn init_with_leaf_join(&self, forest: &Forest<T>, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID as u32, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
         for tree in 0..forest.n_trees() {
-            let leaves: Vec<&[u32]> = forest.tree_leaves(tree).collect();
+            let leaves: Vec<&[u32]> = match forest {
+                Forest::Annoy(f) => f.tree_leaves(tree).collect(),
+                Forest::Kd(f) => f.tree_leaves(tree).collect(),
+            };
             self.join_leaves(&mut graph, &leaves, k);
         }
         graph
@@ -1446,9 +1413,9 @@ where
     /// Seeds by leaf co-membership from trees that are dropped as soon as
     /// they are joined (see [`Self::init_with_streamed_trees`]), runs the
     /// descent and returns the graph flat. No forest, query graph or index
-    /// survives the call. Euclidean and Cosine seed from Annoy trees, which
-    /// gives the same graph as [`Self::new`] with the same seed and trees;
-    /// Manhattan seeds from Kd trees, also by leaf join.
+    /// survives the call. The seeding matches [`Self::new`], Annoy trees for
+    /// Euclidean and Cosine and Kd trees for Manhattan, so the same seed and
+    /// trees give the same graph.
     ///
     /// ### Params
     ///
@@ -3248,7 +3215,7 @@ mod tests {
     fn test_knn_graph_matches_index_extract() {
         let (n, dim, k) = (2000, 8, 10);
         let data = random_flat(n, dim, 11);
-        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine, Dist::Manhattan] {
             let index = NNDescent::<f32>::new(
                 (&data[..], n, dim),
                 metric,

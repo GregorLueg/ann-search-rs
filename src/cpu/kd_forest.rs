@@ -424,7 +424,6 @@ where
     /// ### Returns
     ///
     /// Iterator over the tree's leaves as id slices.
-    #[cfg(test)]
     pub(crate) fn tree_leaves(&self, tree: usize) -> impl Iterator<Item = &[u32]> {
         let lo = self.roots[tree] as usize;
         let hi = self
