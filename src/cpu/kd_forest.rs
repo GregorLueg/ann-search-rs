@@ -50,6 +50,18 @@ pub(crate) struct KdFlatNode<T> {
     split_val: T,
 }
 
+impl<T> KdFlatNode<T> {
+    /// Tree-local `(start, len)` of a leaf, as [`KdTrees::build_tree`]
+    /// returns it.
+    ///
+    /// ### Returns
+    ///
+    /// The range for a leaf, `None` for a split node.
+    pub(crate) fn leaf_range(&self) -> Option<(usize, usize)> {
+        (self.n_descendants == 1).then_some((self.child_a as usize, self.child_b as usize))
+    }
+}
+
 /// Number of top-spread dimensions to randomly select from. Provides diversity
 /// across trees in the forest without picking completely arbitrary axes.
 const TOP_K_DIMS: usize = 3;
@@ -412,6 +424,7 @@ where
     /// ### Returns
     ///
     /// Iterator over the tree's leaves as id slices.
+    #[cfg(test)]
     pub(crate) fn tree_leaves(&self, tree: usize) -> impl Iterator<Item = &[u32]> {
         let lo = self.roots[tree] as usize;
         let hi = self

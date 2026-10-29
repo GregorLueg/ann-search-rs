@@ -56,6 +56,18 @@ pub(crate) struct FlatNode {
     split_idx: u32,
 }
 
+impl FlatNode {
+    /// Tree-local `(start, len)` of a leaf, as [`AnnoyTrees::build_tree`]
+    /// returns it.
+    ///
+    /// ### Returns
+    ///
+    /// The range for a leaf, `None` for a split node.
+    pub(crate) fn leaf_range(&self) -> Option<(usize, usize)> {
+        (self.n_descendants == 1).then_some((self.child_a as usize, self.child_b as usize))
+    }
+}
+
 /// Per-tree build scratch, reused across every node of the tree.
 struct SplitScratch<T> {
     /// Side of each item of the node under the candidate hyperplane
@@ -96,7 +108,7 @@ impl<T: AnnSearchFloat> SplitScratch<T> {
 /// hyperplanes. The leaves live in the permutation the tree partitioned.
 pub(crate) struct TreeParts<T> {
     /// Nodes in pre-order, children indexed from the tree root
-    nodes: Vec<FlatNode>,
+    pub(crate) nodes: Vec<FlatNode>,
     /// `dim + 1` values per split node: normal then offset
     split_data: Vec<T>,
 }

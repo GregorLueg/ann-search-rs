@@ -1476,6 +1476,52 @@ where
     Ok(index.extract_knn(k, include_self, return_dist))
 }
 
+/// Build a kNN graph with NN-Descent and return only the graph.
+///
+/// Matrix in, graph out: the seeding trees are built in batches and dropped
+/// once joined, and no forest, query graph or index is kept, so peak memory
+/// stays near the vectors plus the graph. Use [`build_nndescent_index`] when
+/// the graph also has to answer queries.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan".
+/// * `params` - Optional [`NNDescentKnnParams`]; `None` uses the defaults
+/// * `seed` - Random seed for reproducibility
+/// * `verbose` - Controls verbosity of the algorithm
+///
+/// ### Returns
+///
+/// The flat [`KnnGraph`], rows sorted by distance ascending.
+pub fn build_knn_graph_nndescent<T>(
+    mat: impl AnnMatrix<T>,
+    dist_metric: &str,
+    params: Option<NNDescentKnnParams>,
+    seed: usize,
+    verbose: bool,
+) -> Result<KnnGraph<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat,
+    NNDescent<T>: ApplySortedUpdates<T>,
+    NNDescent<T>: NNDescentQuery<T>,
+{
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+
+    Ok(NNDescent::knn_graph(
+        mat.into_row_major(),
+        metric,
+        params.unwrap_or_default(),
+        seed,
+        verbose,
+    ))
+}
+
 ////////////
 // Vamana //
 ////////////

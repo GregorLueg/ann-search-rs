@@ -862,6 +862,106 @@ pub trait NNDescentQuery<T> {
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
 }
 
+////////////////////
+// kNN graph build //
+////////////////////
+
+/// Parameters for [`NNDescent::knn_graph`], the build that returns only the
+/// kNN graph.
+#[derive(Clone, Copy, Debug)]
+pub struct NNDescentKnnParams {
+    /// Neighbours per node found by the descent, the self-edge not counted
+    pub k: usize,
+    /// Maximum iterations; `None` gives `log2(n).round().max(5)`
+    pub max_iter: Option<usize>,
+    /// Cap on sampled candidates per node per iteration; `None` gives
+    /// `k.min(60)`
+    pub max_candidates: Option<usize>,
+    /// Trees seeding the graph; `None` gives `5 + sqrt(n) / 20`, capped at 64
+    pub n_trees: Option<usize>,
+    /// Convergence threshold on the fraction of edges updated per iteration
+    pub delta: f64,
+    /// Prepend each point to its own row with distance zero, as UMAP expects
+    pub include_self: bool,
+    /// Keep the distances
+    pub return_dist: bool,
+}
+
+impl NNDescentKnnParams {
+    /// Create new parameters.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours per node, the self-edge not counted
+    /// * `max_iter` - Maximum iterations (`None` for the default)
+    /// * `max_candidates` - Candidate cap per node (`None` for the default)
+    /// * `n_trees` - Seeding trees (`None` for the default)
+    /// * `delta` - Convergence threshold
+    /// * `include_self` - Prepend the self-edge to every row
+    /// * `return_dist` - Keep the distances
+    ///
+    /// ### Returns
+    ///
+    /// The parameters.
+    pub fn new(
+        k: usize,
+        max_iter: Option<usize>,
+        max_candidates: Option<usize>,
+        n_trees: Option<usize>,
+        delta: f64,
+        include_self: bool,
+        return_dist: bool,
+    ) -> Self {
+        Self {
+            k,
+            max_iter,
+            max_candidates,
+            n_trees,
+            delta,
+            include_self,
+            return_dist,
+        }
+    }
+}
+
+impl Default for NNDescentKnnParams {
+    /// The same defaults as [`NNDescent::new`], with distances kept and no
+    /// self-edge.
+    fn default() -> Self {
+        Self::new(30, None, None, None, 0.001, false, true)
+    }
+}
+
+/// Resolve the optional build parameters shared by both NN-Descent builds.
+///
+/// ### Params
+///
+/// * `n` - Number of points
+/// * `k` - Neighbours per node (default 30)
+/// * `max_iter` - Maximum iterations (default `log2(n).round().max(5)`)
+/// * `max_candidates` - Candidate cap (default `k.min(60)`)
+/// * `n_trees` - Seeding trees (default `5 + sqrt(n) / 20`, capped at 64)
+///
+/// ### Returns
+///
+/// `(k, max_iter, max_candidates, n_trees)`
+fn resolve_build_params(
+    n: usize,
+    k: Option<usize>,
+    max_iter: Option<usize>,
+    max_candidates: Option<usize>,
+    n_trees: Option<usize>,
+) -> (usize, usize, usize, usize) {
+    // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
+    // trees well past where the old per-point query saturated.
+    let n_trees =
+        n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
+    let max_iter = max_iter.unwrap_or_else(|| (((n as f64).log2().round()) as usize).max(5));
+    let k = k.unwrap_or(30);
+    let max_candidates = max_candidates.unwrap_or(k.min(60));
+    (k, max_iter, max_candidates, n_trees)
+}
+
 //////////
 // Main //
 //////////
@@ -904,8 +1004,9 @@ pub struct NNDescent<T> {
     metric: Dist,
     /// Forest used for graph initialisation and query entry points. Annoy for
     /// Euclidean/Cosine, Kd for Manhattan. Trees only: leaf ids are original
-    /// ids and distances use `vectors_flat`.
-    forest: Forest<T>,
+    /// ids and distances use `vectors_flat`. `None` only inside
+    /// [`NNDescent::knn_graph`], which never hands the struct out.
+    forest: Option<Forest<T>>,
     /// Flat kNN graph of size `n * k`, sorted per node, undiversified. What
     /// `extract_knn`, `graph()` and NSG read.
     graph: Vec<(u32, T)>,
@@ -1008,18 +1109,8 @@ where
             Vec::new()
         };
 
-        // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
-        // trees well past where the old per-point query saturated.
-        let n_trees =
-            n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
-
-        let max_iter = max_iter.unwrap_or_else(|| {
-            let calculated = ((n as f64).log2().round()) as usize;
-            calculated.max(5)
-        });
-
-        let k = k.unwrap_or(30);
-        let max_candidates = max_candidates.unwrap_or(k.min(60));
+        let (k, max_iter, max_candidates, n_trees) =
+            resolve_build_params(n, k, max_iter, max_candidates, n_trees);
 
         let start = Instant::now();
         let forest = Forest::new(&vectors_flat, n, dim, n_trees, metric, seed);
@@ -1038,35 +1129,48 @@ where
             graph: Vec::new(),
             query_graph: Vec::new(),
             converged: false,
-            forest,
+            forest: Some(forest),
             original_ids: (0..n).collect(),
         };
 
+        let start = Instant::now();
+        let seeded = match builder.forest() {
+            Forest::Annoy(forest) => builder.init_with_leaf_join(forest, k),
+            Forest::Kd(_) => builder.init_with_forest(k),
+        };
+        let timings = BuildTimings {
+            forest: forest_time,
+            seed: start.elapsed(),
+            ..Default::default()
+        };
+
         let (build_graph, converged) = builder.generate_index(
+            seeded,
             k,
             max_iter,
             delta,
             max_candidates,
             seed,
-            forest_time,
+            timings,
             verbose,
-        )?;
+        );
+        let graph: Vec<(u32, T)> = build_graph
+            .into_iter()
+            .map(|nb| (nb.pid() as u32, nb.dist))
+            .collect();
 
         // Diversification only shapes what the query walks. Extraction and
         // NSG keep the full kNN graph.
         let query_graph: Vec<u32> = if diversify_prob > T::zero() {
+            let wide: Vec<(usize, T)> = graph.iter().map(|&(p, d)| (p as usize, d)).collect();
             builder
-                .diversify_graph(&build_graph, k, diversify_prob, seed)
+                .diversify_graph(&wide, k, diversify_prob, seed)
                 .into_iter()
                 .map(|(pid, _)| pid as u32)
                 .collect()
         } else {
-            build_graph.iter().map(|&(pid, _)| pid as u32).collect()
+            graph.iter().map(|&(pid, _)| pid).collect()
         };
-        let graph: Vec<(u32, T)> = build_graph
-            .into_iter()
-            .map(|(pid, d)| (pid as u32, d))
-            .collect();
 
         Ok(NNDescent {
             vectors_flat: builder.vectors_flat,
@@ -1192,7 +1296,7 @@ where
     fn init_with_forest(&self, k: usize) -> Vec<Neighbour<T>> {
         let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
         let mut graph = vec![sentinel; self.n * k];
-        let search_k = k * self.forest.n_trees();
+        let search_k = k * self.forest().n_trees();
 
         graph
             .par_chunks_mut(k)
@@ -1264,6 +1368,165 @@ where
         });
     }
 
+    /// The forest of a built index.
+    ///
+    /// ### Returns
+    ///
+    /// The forest.
+    fn forest(&self) -> &Forest<T> {
+        self.forest
+            .as_ref()
+            .expect("a returned NNDescent index always holds its forest")
+    }
+
+    /// Seed the graph from trees built, joined and dropped in batches.
+    ///
+    /// The kNN-only build has no queries to route, so no tree outlives its
+    /// leaf join. A batch of trees is built in parallel, each into its own
+    /// permutation, then joined one after another; the permutations are reused
+    /// for the next batch. The tree seeds match [`AnnoyTrees::build`], so the
+    /// result equals the index build's seeding.
+    ///
+    /// ### Params
+    ///
+    /// * `n_trees` - Trees to seed from
+    /// * `seed` - Forest seed
+    /// * `k` - Neighbours per node
+    ///
+    /// ### Returns
+    ///
+    /// Flat graph of size `n * k`, rows sorted ascending, sentinel-padded
+    fn init_with_streamed_trees(&self, n_trees: usize, seed: usize, k: usize) -> Vec<Neighbour<T>> {
+        let sentinel = Neighbour::new(SENTINEL_PID, T::max_value(), false);
+        let mut graph = vec![sentinel; self.n * k];
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
+        let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
+        let batch = n_trees.min(rayon::current_num_threads()).max(1);
+        let mut perms: Vec<Vec<u32>> = (0..batch).map(|_| vec![0u32; self.n]).collect();
+
+        for chunk in seeds.chunks(batch) {
+            let ranges: Vec<Vec<(usize, usize)>> = perms
+                .par_iter_mut()
+                .zip(chunk.par_iter())
+                .map(|(perm, &tree_seed)| match self.metric {
+                    Dist::Manhattan => {
+                        KdTrees::build_tree(&self.vectors_flat, self.dim, tree_seed, perm)
+                            .iter()
+                            .filter_map(|node| node.leaf_range())
+                            .collect()
+                    }
+                    _ => AnnoyTrees::build_tree(
+                        &self.vectors_flat,
+                        self.dim,
+                        self.metric,
+                        tree_seed,
+                        perm,
+                    )
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.leaf_range())
+                    .collect(),
+                })
+                .collect();
+
+            for (perm, tree) in perms.iter().zip(&ranges) {
+                let leaves: Vec<&[u32]> = tree
+                    .iter()
+                    .map(|&(start, len)| &perm[start..start + len])
+                    .collect();
+                self.join_leaves(&mut graph, &leaves, k);
+            }
+        }
+
+        graph
+    }
+
+    /// Build only the kNN graph: matrix in, graph out, nothing retained.
+    ///
+    /// Seeds by leaf co-membership from trees that are dropped as soon as
+    /// they are joined (see [`Self::init_with_streamed_trees`]), runs the
+    /// descent and returns the graph flat. No forest, query graph or index
+    /// survives the call. Euclidean and Cosine seed from Annoy trees, which
+    /// gives the same graph as [`Self::new`] with the same seed and trees;
+    /// Manhattan seeds from Kd trees, also by leaf join.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (samples x features)
+    /// * `metric` - Distance metric
+    /// * `params` - Build parameters
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// The flat kNN graph.
+    pub fn knn_graph(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        params: NNDescentKnnParams,
+        seed: usize,
+        verbose: bool,
+    ) -> KnnGraph<T> {
+        let (vectors_flat, n, dim) = data.into_row_major();
+        let norms = if metric == Dist::Cosine {
+            (0..n)
+                .map(|i| T::calculate_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (k, max_iter, max_candidates, n_trees) = resolve_build_params(
+            n,
+            Some(params.k),
+            params.max_iter,
+            params.max_candidates,
+            params.n_trees,
+        );
+
+        let builder = NNDescent {
+            vectors_flat,
+            dim,
+            n,
+            k,
+            metric,
+            norms,
+            graph: Vec::new(),
+            query_graph: Vec::new(),
+            converged: false,
+            forest: None,
+            original_ids: Vec::new(),
+        };
+
+        let start = Instant::now();
+        let seeded = builder.init_with_streamed_trees(n_trees, seed, k);
+        let timings = BuildTimings {
+            seed: start.elapsed(),
+            ..Default::default()
+        };
+        if verbose {
+            println!("Seeded graph from streamed trees: {:.2?}", timings.seed);
+        }
+
+        let (graph, _) = builder.generate_index(
+            seeded,
+            k,
+            max_iter,
+            T::from_f64(params.delta).unwrap(),
+            max_candidates,
+            seed,
+            timings,
+            verbose,
+        );
+        let graph: Vec<(u32, T)> = graph
+            .into_iter()
+            .map(|nb| (nb.pid() as u32, nb.dist))
+            .collect();
+
+        KnnGraph::from_rows(&graph, n, k, params.include_self, params.return_dist)
+    }
+
     /// Forest search for entry points, scored against the index's vectors.
     ///
     /// Annoy: best-first over all trees until `limit` leaf items are seen,
@@ -1297,7 +1560,7 @@ where
             top_k,
         } = scratch;
 
-        match &self.forest {
+        match self.forest() {
             Forest::Annoy(trees) => {
                 candidates.reserve(limit);
                 // Same norm as the Annoy query, so entry selection is unchanged.
@@ -1390,25 +1653,25 @@ where
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `max_candidates` - Max candidates sampled per node per iteration
     /// * `seed` - Random seed for per-iteration sampling
-    /// * `forest_time` - Time already spent building the RP forest, so the
-    ///   verbose breakdown can account for the whole build rather than just
-    ///   the part after the forest
+    /// * `timings` - Forest and seeding time already spent, so the verbose
+    ///   breakdown accounts for the whole build
     /// * `verbose` - Print progress information
     ///
     /// ### Returns
     ///
-    /// Tuple of (flat graph as `(pid, dist)` pairs, converged flag)
+    /// Tuple of (flat graph, converged flag)
     #[allow(clippy::too_many_arguments)]
     fn generate_index(
         &self,
+        mut graph: Vec<Neighbour<T>>,
         k: usize,
         max_iter: usize,
         delta: T,
         max_candidates: usize,
         seed: usize,
-        forest_time: Duration,
+        mut timings: BuildTimings,
         verbose: bool,
-    ) -> Result<(Vec<(usize, T)>, bool), AnnSearchErrors> {
+    ) -> (Vec<Neighbour<T>>, bool) {
         if verbose {
             println!(
                 "Running NN-Descent: {} samples, max_candidates={}",
@@ -1418,18 +1681,6 @@ where
         }
 
         let mut converged = false;
-
-        let mut timings = BuildTimings {
-            forest: forest_time,
-            ..Default::default()
-        };
-
-        let start = Instant::now();
-        let mut graph = match &self.forest {
-            Forest::Annoy(forest) => self.init_with_leaf_join(forest, k),
-            Forest::Kd(_) => self.init_with_forest(k),
-        };
-        timings.seed = start.elapsed();
 
         if verbose {
             println!("Seeded graph from forest: {:.2?}", timings.seed);
@@ -1529,9 +1780,7 @@ where
             timings.report(self.n, k);
         }
 
-        let res = graph.into_iter().map(|n| (n.pid(), n.dist)).collect();
-
-        Ok((res, converged))
+        (graph, converged)
     }
 
     /// Sample the forward candidate lists and build their reverse adjacency.
@@ -2169,7 +2418,7 @@ where
 
         total += self.vectors_flat.capacity() * std::mem::size_of::<T>();
         total += self.norms.capacity() * std::mem::size_of::<T>();
-        total += self.forest.memory_usage_bytes();
+        total += self.forest.as_ref().map_or(0, Forest::memory_usage_bytes);
         total += self.graph.capacity() * std::mem::size_of::<(u32, T)>();
         total += self.query_graph.capacity() * std::mem::size_of::<u32>();
 
@@ -2969,6 +3218,112 @@ mod tests {
         let nbrs_10 = neighbours(&index, 10);
         let in_cluster_2 = nbrs_10.iter().filter(|(idx, _)| *idx >= 10).count();
         assert!(in_cluster_2 >= 3);
+    }
+
+    /// Random uniform data, row-major.
+    fn random_flat(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..n * dim).map(|_| rng.random::<f32>()).collect()
+    }
+
+    /// Exact neighbours of row `i`, self excluded.
+    fn brute_force(data: &[f32], dim: usize, i: usize, k: usize, metric: Dist) -> Vec<usize> {
+        let n = data.len() / dim;
+        let a = &data[i * dim..(i + 1) * dim];
+        let mut d: Vec<(f32, usize)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| {
+                let b = &data[j * dim..(j + 1) * dim];
+                let dist = match metric {
+                    Dist::Manhattan => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
+                    _ => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+                };
+                (dist, j)
+            })
+            .collect();
+        d.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        d.into_iter().take(k).map(|(_, j)| j).collect()
+    }
+
+    #[test]
+    fn test_knn_graph_matches_index_extract() {
+        let (n, dim, k) = (2000, 8, 10);
+        let data = random_flat(n, dim, 11);
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let index = NNDescent::<f32>::new(
+                (&data[..], n, dim),
+                metric,
+                Some(k),
+                None,
+                None,
+                Some(6),
+                0.001,
+                0.0,
+                42,
+                false,
+            )
+            .unwrap();
+            let (ids, dists) = index.extract_knn(None, false, true);
+
+            let params = NNDescentKnnParams::new(k, None, None, Some(6), 0.001, false, true);
+            let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), metric, params, 42, false);
+            let gd = g.distances.as_ref().unwrap();
+
+            assert_eq!((g.n, g.k), (n, k));
+            for i in 0..n {
+                let row: Vec<usize> = g
+                    .row(i)
+                    .iter()
+                    .filter(|&&p| p != KNN_GRAPH_EMPTY)
+                    .map(|&p| p as usize)
+                    .collect();
+                assert_eq!(row, ids[i], "row {i} differs for {metric:?}");
+                assert_eq!(&gd[i * k..i * k + row.len()], &dists.as_ref().unwrap()[i][..]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_knn_graph_include_self_and_no_dist() {
+        let (n, dim, k) = (500, 4, 5);
+        let data = random_flat(n, dim, 5);
+        let params = NNDescentKnnParams::new(k, None, None, None, 0.001, true, false);
+        let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::SquaredEuclidean, params, 1, false);
+        assert_eq!(g.k, k + 1);
+        assert!(g.distances.is_none());
+        for i in 0..n {
+            assert_eq!(g.row(i)[0], i as u32);
+            assert!(!g.row(i)[1..].contains(&(i as u32)));
+        }
+    }
+
+    #[test]
+    fn test_knn_graph_reproducible() {
+        let (n, dim) = (1000, 6);
+        let data = random_flat(n, dim, 9);
+        let params = NNDescentKnnParams::default();
+        let a = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::Manhattan, params, 3, false);
+        let b = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::Manhattan, params, 3, false);
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.distances, b.distances);
+    }
+
+    #[test]
+    fn test_knn_graph_recall_manhattan_and_euclidean() {
+        let (n, dim, k) = (2000, 8, 10);
+        let data = random_flat(n, dim, 21);
+        for metric in [Dist::Manhattan, Dist::SquaredEuclidean] {
+            let params = NNDescentKnnParams::new(k, None, None, None, 0.001, false, false);
+            let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), metric, params, 7, false);
+            let mut hits = 0;
+            let probe: Vec<usize> = (0..n).step_by(20).collect();
+            for &i in &probe {
+                let truth = brute_force(&data, dim, i, k, metric);
+                hits += g.row(i).iter().filter(|&&p| truth.contains(&(p as usize))).count();
+            }
+            let recall = hits as f64 / (probe.len() * k) as f64;
+            assert!(recall > 0.95, "{metric:?} recall {recall}");
+        }
     }
 
     #[test]

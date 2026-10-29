@@ -251,6 +251,116 @@ pub fn unpack_knn_graph<P: GraphPid, T: Copy + Send + Sync + num_traits::Zero + 
     crate::utils::pack_knn_results(rows, return_dist)
 }
 
+//////////////
+// KnnGraph //
+//////////////
+
+/// Id of an empty slot in a [`KnnGraph`] row.
+pub const KNN_GRAPH_EMPTY: u32 = u32::MAX;
+
+/// A flat kNN graph, the output of the matrix-in, graph-out builders.
+///
+/// Row `i` is `indices[i * k..(i + 1) * k]`, sorted by distance ascending.
+/// A row the descent could not fill ends in [`KNN_GRAPH_EMPTY`] ids, with
+/// `T::max_value()` distances when distances are kept.
+#[derive(Clone, Debug)]
+pub struct KnnGraph<T> {
+    /// Neighbour ids, `n * k`, row-major
+    pub indices: Vec<u32>,
+    /// Distances matching `indices`, when requested. Squared for Euclidean
+    pub distances: Option<Vec<T>>,
+    /// Number of rows
+    pub n: usize,
+    /// Row length, the self-edge included when it was asked for
+    pub k: usize,
+}
+
+impl<T> KnnGraph<T>
+where
+    T: num_traits::Float + Send + Sync,
+{
+    /// Flatten a sentinel-padded `(pid, dist)` graph of `n * k_in` entries.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Rows sorted ascending, empty slots at [`SENTINEL_PID`]
+    /// * `n` - Number of rows
+    /// * `k_in` - Row length of `graph`
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, so rows are
+    ///   `k_in + 1` long
+    /// * `return_dist` - Keep the distances
+    ///
+    /// ### Returns
+    ///
+    /// The flat graph.
+    pub fn from_rows<P: GraphPid>(
+        graph: &[(P, T)],
+        n: usize,
+        k_in: usize,
+        include_self: bool,
+        return_dist: bool,
+    ) -> Self {
+        let self_slot = usize::from(include_self);
+        let k = k_in + self_slot;
+        let mut indices = vec![KNN_GRAPH_EMPTY; n * k];
+        indices
+            .par_chunks_mut(k.max(1))
+            .enumerate()
+            .for_each(|(i, row)| {
+                let mut j = 0;
+                if include_self {
+                    row[0] = i as u32;
+                    j = 1;
+                }
+                for &(pid, _) in &graph[i * k_in..(i + 1) * k_in] {
+                    let pid = pid.pid();
+                    if pid != SENTINEL_PID {
+                        row[j] = pid as u32;
+                        j += 1;
+                    }
+                }
+            });
+
+        let distances = return_dist.then(|| {
+            let mut dists = vec![T::max_value(); n * k];
+            dists.par_chunks_mut(k.max(1)).enumerate().for_each(|(i, row)| {
+                let mut j = 0;
+                if include_self {
+                    row[0] = T::zero();
+                    j = 1;
+                }
+                for &(pid, dist) in &graph[i * k_in..(i + 1) * k_in] {
+                    if pid.pid() != SENTINEL_PID {
+                        row[j] = dist;
+                        j += 1;
+                    }
+                }
+            });
+            dists
+        });
+
+        Self {
+            indices,
+            distances,
+            n,
+            k,
+        }
+    }
+
+    /// One row's ids.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Row index
+    ///
+    /// ### Returns
+    ///
+    /// The `k` ids of row `i`, padding included.
+    pub fn row(&self, i: usize) -> &[u32] {
+        &self.indices[i * self.k..(i + 1) * self.k]
+    }
+}
+
 ///////////////
 // Graph ptr //
 ///////////////
