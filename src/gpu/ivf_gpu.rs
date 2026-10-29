@@ -746,6 +746,7 @@ where
                     .collect()
             } else {
                 let centroid_dists = centroid_dists_gpu.read(client)?;
+                let offsets_u32: Vec<u32> = self.cluster_offsets.iter().map(|&o| o as u32).collect();
                 (0..n_queries)
                     .into_par_iter()
                     .map(|q| {
@@ -753,7 +754,7 @@ where
                         let mut cluster_dists: Vec<(T, usize)> = (0..self.nlist)
                             .map(|c| (centroid_dists[row_start + c], c))
                             .collect();
-                        select_probed_clusters(&mut cluster_dists, &self.cluster_offsets, nprobe, k)
+                        select_probed_clusters(&mut cluster_dists, &offsets_u32, nprobe, k)
                     })
                     .collect()
             };

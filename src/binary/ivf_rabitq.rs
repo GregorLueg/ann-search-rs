@@ -557,7 +557,7 @@ where
 
                 if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
                     for (j, &dist) in block[..take].iter().enumerate() {
-                        let global_idx = indices[local_idx + j];
+                        let global_idx = indices[local_idx + j] as usize;
 
                         if heap.len() < k {
                             heap.push((OrderedFloat(dist), global_idx));

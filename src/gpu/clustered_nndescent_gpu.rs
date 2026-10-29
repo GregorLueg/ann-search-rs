@@ -527,7 +527,7 @@ where
 
     if verbose {
         let sizes: Vec<usize> = (0..n_clusters)
-            .map(|c| offsets[c + 1] - offsets[c])
+            .map(|c| (offsets[c + 1] - offsets[c]) as usize)
             .collect();
         println!(
             "  Partitioned in {:.2?}: cluster sizes {} .. {} (mean {})",
@@ -544,7 +544,7 @@ where
     let mut converged = true;
 
     for c in 0..n_clusters {
-        let member_ids = &members[offsets[c]..offsets[c + 1]];
+        let member_ids = &members[offsets[c] as usize..offsets[c + 1] as usize];
         let m = member_ids.len();
 
         // A cluster too small to hold a graph contributes nothing. At the
@@ -846,7 +846,7 @@ mod tests {
         );
 
         for i in 0..n {
-            assert_eq!(top2[i * 2] as usize, single[i], "point {i}");
+            assert_eq!(top2[i * 2], single[i], "point {i}");
             assert_ne!(top2[i * 2 + 1], top2[i * 2], "runner-up must differ");
         }
     }
@@ -955,9 +955,9 @@ mod tests {
         let assignments = vec![0u32, 1, 1, 2, 0, 2, 2, 0, 1, 1];
         let (members, offsets) = invert_assignments_csr(&assignments, n, m, k);
 
-        assert_eq!(offsets[k], n * m);
+        assert_eq!(offsets[k] as usize, n * m);
         for c in 0..k {
-            for &g in &members[offsets[c]..offsets[c + 1]] {
+            for &g in &members[offsets[c] as usize..offsets[c + 1] as usize] {
                 assert!(
                     assignments[g as usize * m..(g as usize + 1) * m].contains(&(c as u32)),
                     "point {g} landed in cluster {c} it never joined"

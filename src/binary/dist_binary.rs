@@ -747,7 +747,7 @@ where
         let q_dist = query.dist_to_centroid;
         let q_dist_sq = q_dist * q_dist;
 
-        let global_start = storage.offsets[cluster_idx] + local_start;
+        let global_start = storage.offsets[cluster_idx] as usize + local_start;
         let mut min = T::infinity();
 
         for (j, slot) in out.iter_mut().enumerate() {

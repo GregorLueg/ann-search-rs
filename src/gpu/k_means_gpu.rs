@@ -2210,7 +2210,7 @@ where
         metric,
     );
 
-    Ok((centroids, assignments))
+    Ok((centroids, assignments.into_iter().map(|a| a as usize).collect()))
 }
 
 /// Train k-means centroids on the GPU from a flat row-major buffer.
@@ -2750,7 +2750,7 @@ mod entry_point_tests {
             &Dist::SquaredEuclidean,
         );
 
-        assert_eq!(gpu, cpu);
+        assert_eq!(gpu, cpu.iter().map(|&c| c as usize).collect::<Vec<_>>());
     }
 }
 
@@ -3044,21 +3044,19 @@ mod tests {
         let idx = all_indices.read(&client).unwrap();
         let off = offsets.read(&client).unwrap();
 
-        let (cpu_idx, cpu_off) = crate::utils::k_means_utils::build_csr_layout(
-            assignments.iter().map(|&c| c as usize).collect(),
-            n,
-            k,
-        );
+        let (cpu_idx, cpu_off) =
+            crate::utils::k_means_utils::build_csr_layout(assignments.clone(), n, k);
 
-        assert_eq!(off.iter().map(|&o| o as usize).collect::<Vec<_>>(), cpu_off);
+        assert_eq!(off, cpu_off);
 
         for c in 0..k {
             let s = off[c] as usize;
             let e = off[c + 1] as usize;
             let got: std::collections::HashSet<u32> = idx[s..e].iter().copied().collect();
-            let want: std::collections::HashSet<u32> = cpu_idx[cpu_off[c]..cpu_off[c + 1]]
+            let want: std::collections::HashSet<u32> = cpu_idx
+                [cpu_off[c] as usize..cpu_off[c + 1] as usize]
                 .iter()
-                .map(|&i| i as u32)
+                .copied()
                 .collect();
             assert_eq!(got, want, "cluster {} membership mismatch", c);
         }

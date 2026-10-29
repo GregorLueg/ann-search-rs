@@ -45,9 +45,9 @@ where
     /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (in a flat structure)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets of the elements of each inverted list.
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of k-means clusters.
     nlist: usize,
     /// Original indices
@@ -237,10 +237,8 @@ where
         // permuting the codes and every precomputed per-vector term with them.
         let mut original_ids: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            original_ids.extend(
-                all_indices[offsets[cluster]..offsets[cluster + 1]]
-                    .iter()
-                    .map(|&i| i as u32),
+            original_ids.extend_from_slice(
+                &all_indices[offsets[cluster] as usize..offsets[cluster + 1] as usize],
             );
         }
 
@@ -374,7 +372,7 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         for &cluster_idx in probed {
-            for vec_idx in self.offsets[cluster_idx]..self.offsets[cluster_idx + 1] {
+            for vec_idx in self.offsets[cluster_idx] as usize..self.offsets[cluster_idx + 1] as usize {
                 let s = score(vec_idx);
                 if heap.len() < k {
                     heap.push((OrderedFloat(s), vec_idx));
@@ -497,8 +495,8 @@ where
             + self.codec.memory_usage_bytes()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }

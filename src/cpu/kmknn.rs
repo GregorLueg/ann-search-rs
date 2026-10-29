@@ -38,7 +38,7 @@ pub struct KmknnIndex<T> {
     /// Cluster centres (nlist * dim elements)
     centroids: Vec<T>,
     /// CSR offsets into `vectors_flat` per cluster (length nlist + 1)
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of clusters
     nlist: usize,
     /// Mapping from internal position to original sample index
@@ -202,9 +202,7 @@ where
 
         let mut new_to_old = Vec::with_capacity(n);
         for c in 0..nlist {
-            for &old_id in &all_indices[offsets[c]..offsets[c + 1]] {
-                new_to_old.push(old_id as u32);
-            }
+            new_to_old.extend_from_slice(&all_indices[offsets[c] as usize..offsets[c + 1] as usize]);
         }
         let mut new_vectors_flat = Vec::with_capacity(n * dim);
         for &old_id in &new_to_old {
@@ -220,7 +218,7 @@ where
         for c in 0..nlist {
             let cent = &centroids[c * dim..(c + 1) * dim];
             let mut max_d_sq = T::zero();
-            for pos in offsets[c]..offsets[c + 1] {
+            for pos in offsets[c] as usize..offsets[c + 1] as usize {
                 let v = &new_vectors_flat[pos * dim..(pos + 1) * dim];
                 let d_sq = euclidean_distance_static(v, cent);
                 point_to_centroid_sq[pos] = d_sq;
@@ -258,7 +256,7 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.original_ids.capacity() * std::mem::size_of::<u32>()
             + self.point_to_centroid_sq.capacity() * std::mem::size_of::<T>()
             + self.cluster_radii_sq.capacity() * std::mem::size_of::<T>()
@@ -315,8 +313,8 @@ where
                 continue;
             }
 
-            let start = self.offsets[c];
-            let end = self.offsets[c + 1];
+            let start = self.offsets[c] as usize;
+            let end = self.offsets[c + 1] as usize;
 
             for pos in start..end {
                 let d_pc = self.point_to_centroid_sq[pos].sqrt();

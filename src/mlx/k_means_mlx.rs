@@ -299,9 +299,9 @@ pub fn train_centroids_mlx(
             let mut wait: Vec<&Array> = vec![&c, &counts];
             wait.extend(assigns.iter());
             eval_all(&wait, false)?;
-            let assignments: Vec<usize> = assigns
+            let assignments: Vec<u32> = assigns
                 .iter()
-                .map(|a| Ok(a.as_u32()?.iter().map(|&v| v as usize)))
+                .map(|a| Ok(a.as_u32()?.iter().copied()))
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?
                 .into_iter()
                 .flatten()
@@ -502,6 +502,7 @@ mod tests {
             k,
             &Dist::SquaredEuclidean,
         );
+        let cpu_assign: Vec<usize> = cpu_assign.iter().map(|&a| a as usize).collect();
 
         let (a, b) = (
             inertia(&data, dim, &mlx, &mlx_assign),
@@ -539,6 +540,7 @@ mod tests {
                 (vec![1.0; n], vec![1.0; k])
             };
             let cpu = assign_all_parallel(&data, &dn, dim, n, &cents, &cn, k, &metric);
+            let cpu: Vec<usize> = cpu.iter().map(|&a| a as usize).collect();
             let agree = mlx.iter().zip(&cpu).filter(|(a, b)| a == b).count();
             // Near-ties may flip through the GEMM expansion.
             assert!(agree as f64 / n as f64 > 0.995, "{metric:?}: {agree}/{n}");
@@ -585,6 +587,7 @@ mod tests {
             k,
             &Dist::SquaredEuclidean,
         );
+        let cpu_assign: Vec<usize> = cpu_assign.iter().map(|&a| a as usize).collect();
         let (a, b) = (
             inertia(&data, dim, &flat, &assign),
             inertia(&data, dim, &cpu, &cpu_assign),

@@ -34,9 +34,9 @@ pub struct IvfPqIndex<T> {
     /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (CSR format)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets for each inverted list
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Product quantiser with M codebooks
     codebook: ProductQuantiser<T>,
     /// Number of k-means clusters
@@ -249,7 +249,7 @@ where
         for (vec_idx, &cluster_id) in training_assignments.iter().enumerate() {
             let vec_start = vec_idx * dim;
             let vec = &training_data[vec_start..vec_start + dim];
-            let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
             let residuals = T::subtract_simd(vec, centroid);
             training_residuals.extend_from_slice(&residuals);
         }
@@ -297,7 +297,7 @@ where
             .for_each(|(vec_idx, (chunk, &cluster_id))| {
                 let vec_start = vec_idx * dim;
                 let vec = &vectors_flat[vec_start..vec_start + dim];
-                let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+                let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
 
                 let residual = T::subtract_simd(vec, centroid);
 
@@ -373,8 +373,8 @@ where
         for cluster_idx in probed {
             let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
 
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
 
             let mut worst_dist = if heap.len() >= k {
                 heap.peek().unwrap().0 .0
@@ -469,8 +469,8 @@ where
 
         let mut cluster_assignments = vec![0usize; self.n];
         for cluster_idx in 0..self.nlist {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
             for new_idx in start..end {
                 cluster_assignments[new_idx] = cluster_idx;
             }
@@ -533,8 +533,8 @@ where
             + self.quantised_codes.capacity() * std::mem::size_of::<u8>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.codebook.memory_usage_bytes()
     }
 
@@ -547,15 +547,11 @@ where
     fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let m = self.codebook.m();
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id as u32);
-            }
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
+            new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
         let mut new_codes = Vec::with_capacity(self.quantised_codes.len());

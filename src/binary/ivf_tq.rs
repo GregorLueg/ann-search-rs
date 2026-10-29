@@ -80,9 +80,9 @@ pub struct IvfTurboQuant<T> {
     /// Distance metric.
     metric: Dist,
     /// CSR cell boundaries, length `nlist + 1`.
-    cluster_offsets: Vec<usize>,
+    cluster_offsets: Vec<u32>,
     /// CSR slot to original vector index, length `n`.
-    vector_indices: Vec<usize>,
+    vector_indices: Vec<u32>,
     /// Per-cluster blocked codes for 2/4-bit, one entry per cell. `None` for
     /// 3-bit, which scores through the scalar path instead.
     blocked: Option<Vec<ClusterBlocked>>,
@@ -271,11 +271,11 @@ where
 
         // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
         let norms_f32_csr: Vec<f32> = (0..n)
-            .map(|s| quantiser.storage.norms[vector_indices[s]].to_f32().unwrap())
+            .map(|s| quantiser.storage.norms[vector_indices[s] as usize].to_f32().unwrap())
             .collect();
         let corrections_f32_csr: Vec<f32> = (0..n)
             .map(|s| {
-                quantiser.storage.corrections[vector_indices[s]]
+                quantiser.storage.corrections[vector_indices[s] as usize]
                     .to_f32()
                     .unwrap()
             })
@@ -289,14 +289,14 @@ where
             let bytes_per_vec = quantiser.storage.bytes_per_vec;
             let mut per_cluster = Vec::with_capacity(nlist);
             for c in 0..nlist {
-                let off = cluster_offsets[c];
-                let end = cluster_offsets[c + 1];
+                let off = cluster_offsets[c] as usize;
+                let end = cluster_offsets[c + 1] as usize;
                 let csize = end - off;
 
                 // Gather this cell's bit-plane codes in CSR slot order.
                 let mut packed = vec![0u8; csize * bytes_per_vec];
                 for (local, s) in (off..end).enumerate() {
-                    let src = quantiser.storage.vector_packed(vector_indices[s]);
+                    let src = quantiser.storage.vector_packed(vector_indices[s] as usize);
                     packed[local * bytes_per_vec..(local + 1) * bytes_per_vec].copy_from_slice(src);
                 }
 
@@ -476,8 +476,8 @@ where
             // Scalar bit-plane scan over the probed cells' vectors.
             let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
             for &c in &probed {
-                for s in self.cluster_offsets[c]..self.cluster_offsets[c + 1] {
-                    let orig = self.vector_indices[s];
+                for s in self.cluster_offsets[c] as usize..self.cluster_offsets[c + 1] as usize {
+                    let orig = self.vector_indices[s] as usize;
                     let dist = self.turboquant_dist(&eq, &q_rot_f32, &levels_f32, orig);
                     if heap.len() < k {
                         heap.push((OrderedFloat(dist), orig));
@@ -503,8 +503,8 @@ where
 
         let mut heaps = vec![TopK::new(k.max(1))];
         for &c in &probed {
-            let off = self.cluster_offsets[c];
-            let end = self.cluster_offsets[c + 1];
+            let off = self.cluster_offsets[c] as usize;
+            let end = self.cluster_offsets[c + 1] as usize;
             let csize = end - off;
             if csize == 0 {
                 continue;
@@ -528,7 +528,7 @@ where
         let (csr_idx, dists_f32) = heaps.pop().unwrap().into_sorted(qn, self.metric);
         let indices = csr_idx
             .iter()
-            .map(|&s| self.vector_indices[s as usize])
+            .map(|&s| self.vector_indices[s as usize] as usize)
             .collect();
         let distances = dists_f32.iter().map(|&d| T::from_f32(d).unwrap()).collect();
         Ok((indices, distances))
@@ -804,8 +804,8 @@ where
                     let mut heaps: Vec<TopK> =
                         (0..batch_nq).map(|_| TopK::new(k_search.max(1))).collect();
                     for &c in &probed {
-                        let off = self.cluster_offsets[c];
-                        let end = self.cluster_offsets[c + 1];
+                        let off = self.cluster_offsets[c] as usize;
+                        let end = self.cluster_offsets[c + 1] as usize;
                         let csize = end - off;
                         if csize == 0 {
                             continue;
@@ -831,7 +831,7 @@ where
                         let (csr_idx, dists_f32) = heap.into_sorted(qnorms[qi], self.metric);
                         let cands: Vec<usize> = csr_idx
                             .iter()
-                            .map(|&s| self.vector_indices[s as usize])
+                            .map(|&s| self.vector_indices[s as usize] as usize)
                             .collect();
                         if let Some(vs) = vector_store {
                             out.push(self.rerank_candidates(vs, qrows[qi], &cands, k));
@@ -926,8 +926,8 @@ where
             + self.quantiser.memory_usage_bytes()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>()
-            + self.vector_indices.capacity() * std::mem::size_of::<usize>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<u32>()
+            + self.vector_indices.capacity() * std::mem::size_of::<u32>()
             + self.norms_f32_csr.capacity() * std::mem::size_of::<f32>()
             + self.corrections_f32_csr.capacity() * std::mem::size_of::<f32>()
             + blocked

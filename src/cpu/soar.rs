@@ -74,7 +74,7 @@ pub struct SoarIndex<T> {
     centroids_norm: Vec<T>,
     /// Primary lists. Cell `c` owns rows `offsets[c]..offsets[c + 1]` of
     /// `vectors_flat` directly, so no member array is needed for them
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Spilled entries per cell, as internal row ids. `n` entries total, one
     /// per point
     spill_members: Vec<u32>,
@@ -83,7 +83,7 @@ pub struct SoarIndex<T> {
     /// read instead of a random gather
     spill_primary: Vec<u32>,
     /// Offsets into `spill_members` / `spill_primary`, `nlist + 1` entries
-    spill_offsets: Vec<usize>,
+    spill_offsets: Vec<u32>,
     /// Number of clusters in the index
     nlist: usize,
     /// Rule used for the secondary assignment, kept for introspection
@@ -323,11 +323,8 @@ where
         // lists are built by walking the new order directly.
         let mut new_to_old: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            new_to_old.extend(
-                all_indices[offsets[cluster]..offsets[cluster + 1]]
-                    .iter()
-                    .map(|&i| i as u32),
-            );
+            new_to_old
+                .extend_from_slice(&all_indices[offsets[cluster] as usize..offsets[cluster + 1] as usize]);
         }
 
         let mut reordered = Vec::with_capacity(vectors_flat.len());
@@ -353,7 +350,7 @@ where
         // Primary cell of every reordered row, from the contiguous ranges.
         let mut row_primary = vec![0u32; n];
         for cluster in 0..nlist {
-            for row in offsets[cluster]..offsets[cluster + 1] {
+            for row in offsets[cluster] as usize..offsets[cluster + 1] as usize {
                 row_primary[row] = cluster as u32;
             }
         }
@@ -401,10 +398,10 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.spill_members.capacity() * std::mem::size_of::<u32>()
             + self.spill_primary.capacity() * std::mem::size_of::<u32>()
-            + self.spill_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.spill_offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -477,8 +474,8 @@ where
 
             // Primary pass: contiguous rows, identical to a plain IVF scan.
             for &cluster_idx in &probed {
-                let start = self.offsets[cluster_idx];
-                let end = self.offsets[cluster_idx + 1];
+                let start = self.offsets[cluster_idx] as usize;
+                let end = self.offsets[cluster_idx + 1] as usize;
                 for vec_idx in start..end {
                     buffer.insert((OrderedFloat(dist_to(vec_idx)), vec_idx), k);
                 }
@@ -486,8 +483,8 @@ where
 
             // Spill pass: gather, skipping anything the primary pass already saw.
             for &cluster_idx in &probed {
-                let start = self.spill_offsets[cluster_idx];
-                let end = self.spill_offsets[cluster_idx + 1];
+                let start = self.spill_offsets[cluster_idx] as usize;
+                let end = self.spill_offsets[cluster_idx + 1] as usize;
                 for pos in start..end {
                     if probed_mask.contains(self.spill_primary[pos] as usize) {
                         continue;
@@ -709,7 +706,7 @@ mod tests {
             11.2, 0.0, // c2 = cB, anti-aligned
         ];
         let k = 3;
-        let primary = vec![0usize];
+        let primary = vec![0u32];
         let norms = vec![1.0f32];
         let centroid_norms = vec![1.0f32; k];
 
@@ -836,7 +833,7 @@ mod tests {
             );
             for i in 0..n {
                 assert_ne!(
-                    sec[i] as usize, primary[i],
+                    sec[i], primary[i],
                     "rule {:?} collided at {}",
                     rule, i
                 );
@@ -888,7 +885,7 @@ mod tests {
 
         assert_eq!(index.spill_members.len(), n);
         assert_eq!(index.spill_primary.len(), n);
-        assert_eq!(index.spill_offsets[nlist], n);
+        assert_eq!(index.spill_offsets[nlist] as usize, n);
         let unique: HashSet<u32> = index.spill_members.iter().copied().collect();
         assert_eq!(
             unique.len(),

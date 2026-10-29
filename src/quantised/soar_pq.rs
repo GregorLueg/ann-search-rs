@@ -68,11 +68,11 @@ pub struct SoarPqIndex<T> {
     centroids_norm: Vec<T>,
     /// Offsets over CSR positions, `nlist + 1` entries. Differences are list
     /// lengths *including* spilled entries
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Cumulative count of primary entries per cell, `nlist + 1` entries. Used
     /// only to tell `select_probed_clusters` how many *distinct* points a probe
     /// list reaches
-    primary_offsets: Vec<usize>,
+    primary_offsets: Vec<u32>,
     /// CSR position holding each point's primary copy, `n` entries. Only needed
     /// to reconstruct a point for the self-query path
     primary_pos: Vec<u32>,
@@ -339,7 +339,7 @@ where
         let mut training_residuals = Vec::with_capacity(training_data.len());
         for (vec_idx, &cluster_id) in training_primary.iter().enumerate() {
             let vec = &training_data[vec_idx * dim..(vec_idx + 1) * dim];
-            let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
             training_residuals.extend_from_slice(&T::subtract_simd(vec, centroid));
         }
 
@@ -385,7 +385,7 @@ where
         // Interleave into the `n * 2` layout `invert_assignments_csr` expects.
         let mut both = vec![0u32; n * 2];
         for i in 0..n {
-            both[i * 2] = primary[i] as u32;
+            both[i * 2] = primary[i];
             both[i * 2 + 1] = secondary[i];
         }
         let (members, offsets) = invert_assignments_csr(&both, n, 2, nlist);
@@ -394,7 +394,7 @@ where
         let n_entries = members.len();
         let mut pos_cluster = vec![0u32; n_entries];
         for cluster in 0..nlist {
-            for pos in offsets[cluster]..offsets[cluster + 1] {
+            for pos in offsets[cluster] as usize..offsets[cluster + 1] as usize {
                 pos_cluster[pos] = cluster as u32;
             }
         }
@@ -420,21 +420,21 @@ where
 
         let mut primary_pos = vec![0u32; n];
         let mut dedup_key = vec![0u32; n_entries];
-        let mut primary_counts = vec![0usize; nlist];
+        let mut primary_counts = vec![0u32; nlist];
         let mut seen_primary = vec![false; n];
         for pos in 0..n_entries {
             let point = members[pos] as usize;
             let cluster = pos_cluster[pos] as usize;
-            if cluster == primary[point] && !seen_primary[point] {
+            if cluster == primary[point] as usize && !seen_primary[point] {
                 seen_primary[point] = true;
                 primary_pos[point] = pos as u32;
                 primary_counts[cluster] += 1;
                 dedup_key[pos] = u32::MAX;
             } else {
-                dedup_key[pos] = primary[point] as u32;
+                dedup_key[pos] = primary[point];
             }
         }
-        let mut primary_offsets = vec![0usize; nlist + 1];
+        let mut primary_offsets = vec![0u32; nlist + 1];
         for c in 0..nlist {
             primary_offsets[c + 1] = primary_offsets[c] + primary_counts[c];
         }
@@ -476,8 +476,8 @@ where
             + self.quantised_codes.capacity() * std::mem::size_of::<u8>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.primary_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.primary_offsets.capacity() * std::mem::size_of::<u32>()
             + self.primary_pos.capacity() * std::mem::size_of::<u32>()
             + self.dedup_key.capacity() * std::mem::size_of::<u32>()
             + self.original_ids.capacity() * std::mem::size_of::<u32>()
@@ -539,8 +539,8 @@ where
             for &cluster_idx in &probed {
                 let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
 
-                let start = self.offsets[cluster_idx];
-                let end = self.offsets[cluster_idx + 1];
+                let start = self.offsets[cluster_idx] as usize;
+                let end = self.offsets[cluster_idx + 1] as usize;
 
                 let mut worst_dist = if heap.len() >= k {
                     heap.peek().unwrap().0 .0
@@ -646,7 +646,7 @@ where
 
         let mut pos_cluster = vec![0u32; self.original_ids.len()];
         for cluster in 0..self.nlist {
-            for pos in self.offsets[cluster]..self.offsets[cluster + 1] {
+            for pos in self.offsets[cluster] as usize..self.offsets[cluster + 1] as usize {
                 pos_cluster[pos] = cluster as u32;
             }
         }
@@ -839,7 +839,7 @@ mod tests {
             let mut spilled_scored = 0usize;
             for &c in &probed {
                 let table = idx.build_lookup_tables_residual(q, c);
-                for pos in idx.offsets[c]..idx.offsets[c + 1] {
+                for pos in idx.offsets[c] as usize..idx.offsets[c + 1] as usize {
                     let key = idx.dedup_key[pos];
                     if key != u32::MAX && probed_set.contains(&(key as usize)) {
                         continue;
@@ -924,7 +924,7 @@ mod tests {
                 let primary = idx.primary_pos[id] as usize;
                 // Cell owning the primary position.
                 let cell = (0..nlist)
-                    .find(|&c| primary >= idx.offsets[c] && primary < idx.offsets[c + 1])
+                    .find(|&c| primary >= idx.offsets[c] as usize && primary < idx.offsets[c + 1] as usize)
                     .unwrap();
                 let table = idx.build_lookup_tables_residual(q, cell);
                 let from_primary = idx.compute_distance_adc(primary, &table);

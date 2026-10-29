@@ -270,7 +270,7 @@ where
             .enumerate()
             .try_for_each(
                 |(node, (((sign, ex), factor), bin_factor))| -> Result<(), AnnSearchErrors> {
-                    let c = assignments[node];
+                    let c = assignments[node] as usize;
                     let rotated =
                         encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
                     let centroid = &centroids_rotated[c * padded_dim..(c + 1) * padded_dim];

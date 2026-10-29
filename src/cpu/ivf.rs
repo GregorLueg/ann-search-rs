@@ -38,9 +38,9 @@ pub struct IvfIndex<T> {
     /// The norms of the centroids for Cosine distance calculations
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (in a flat structure)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets of the elements of each inverted list
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of clusters in the index
     nlist: usize,
     /// Original indices
@@ -254,15 +254,11 @@ where
     /// New to old mapping
     fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id as u32);
-            }
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
+            new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -302,8 +298,8 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -369,8 +365,8 @@ where
         let mut heap = BoundedMaxHeap::new(k);
 
         for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
             let tail = start + (end - start) / 4 * 4;
 
             match self.metric {

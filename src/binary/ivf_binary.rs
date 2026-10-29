@@ -51,9 +51,9 @@ pub struct IvfIndexBinary<T> {
     /// distances
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (CSR format)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets for CSR access
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of clusters/lists in this index
     nlist: usize,
     /// Optional vector store that is saved in binary on disk
@@ -69,7 +69,7 @@ pub struct IvfIndexBinary<T> {
     /// Old to new mapping. Read by the asymmetric query path, which gets
     /// original ids back from [`IvfIndexBinary::query`] and has to reach the
     /// physical code slot they live in.
-    old_to_new: Vec<usize>,
+    old_to_new: Vec<u32>,
 }
 
 //////////////////////////
@@ -496,8 +496,8 @@ where
         let mut block = [0u32; HAMMING_BLOCK];
 
         for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
 
             let mut vec_idx = start;
             while vec_idx < end {
@@ -606,7 +606,7 @@ where
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
             .map(|&idx| {
-                let start_i = self.old_to_new[idx] * self.n_bytes;
+                let start_i = self.old_to_new[idx] as usize * self.n_bytes;
                 let vec_i = unsafe {
                     self.vectors_flat_binarised
                         .get_unchecked(start_i..start_i + self.n_bytes)
@@ -867,8 +867,8 @@ where
                     let mut block = [0u32; HAMMING_BLOCK];
 
                     for cluster_idx in 0..self.nlist {
-                        let start_idx = self.offsets[cluster_idx];
-                        let end_idx = self.offsets[cluster_idx + 1];
+                        let start_idx = self.offsets[cluster_idx] as usize;
+                        let end_idx = self.offsets[cluster_idx + 1] as usize;
 
                         let mut vec_idx = start_idx;
                         while vec_idx < end_idx {
@@ -938,8 +938,8 @@ where
             + self.binariser.memory_usage_bytes()
             + self.centroids_float.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 
     /// Returns whether the index supports asymmetric queries
@@ -959,14 +959,14 @@ where
     /// New to old mapping
     fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
+        let mut old_to_new = vec![0u32; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
             for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id as u32);
+                old_to_new[old_id as usize] = new_to_old.len() as u32;
+                new_to_old.push(old_id);
             }
         }
 

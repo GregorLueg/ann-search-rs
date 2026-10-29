@@ -342,9 +342,9 @@ pub struct RaBitQStorage<T> {
     /// Per-vector distance to centroid and dot correction
     pub packed_vectors: Vec<RaBitQPackedVector<T>>,
     /// Original indices, ordered by cluster
-    pub vector_indices: Vec<usize>,
+    pub vector_indices: Vec<u32>,
     /// Cluster boundaries, len = nlist + 1
-    pub offsets: Vec<usize>,
+    pub offsets: Vec<u32>,
     /// The one-bit codes, one blocked fast-scan layout per cluster.
     ///
     /// This is the only copy: the scan kernels read this order directly, so
@@ -409,7 +409,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
 
         let (n_bytes, src) = (self.n_bytes, self.blocked_arch);
         for c in 0..self.nlist {
-            let n_vectors = self.offsets[c + 1] - self.offsets[c];
+            let n_vectors = (self.offsets[c + 1] - self.offsets[c]) as usize;
             let raw = unpack_rabitq_blocked(&self.blocked[c].data, n_vectors, n_bytes, src);
             self.blocked[c] = pack_rabitq_blocked(&raw, n_vectors, n_bytes);
         }
@@ -472,7 +472,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// The vector index in that cluster with the specific local index
     #[inline]
     pub fn get_vector_data(&self, cluster_idx: usize, local_idx: usize) -> &RaBitQPackedVector<T> {
-        let global_idx = self.offsets[cluster_idx] + local_idx;
+        let global_idx = self.offsets[cluster_idx] as usize + local_idx;
         &self.packed_vectors[global_idx]
     }
 
@@ -487,8 +487,8 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// Slice of the packed vector in this cluster index
     #[inline]
     pub fn cluster_packed_data(&self, cluster_idx: usize) -> &[RaBitQPackedVector<T>] {
-        let start = self.offsets[cluster_idx];
-        let end = self.offsets[cluster_idx + 1];
+        let start = self.offsets[cluster_idx] as usize;
+        let end = self.offsets[cluster_idx + 1] as usize;
         &self.packed_vectors[start..end]
     }
 
@@ -534,9 +534,9 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     ///
     /// The vector indices (original) for every vector in this cluster
     #[inline]
-    pub fn cluster_vector_indices(&self, cluster_idx: usize) -> &[usize] {
-        let start = self.offsets[cluster_idx];
-        let end = self.offsets[cluster_idx + 1];
+    pub fn cluster_vector_indices(&self, cluster_idx: usize) -> &[u32] {
+        let start = self.offsets[cluster_idx] as usize;
+        let end = self.offsets[cluster_idx + 1] as usize;
         &self.vector_indices[start..end]
     }
 
@@ -551,7 +551,7 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
     /// Number of vectors in that cluster
     #[inline]
     pub fn cluster_size(&self, cluster_idx: usize) -> usize {
-        self.offsets[cluster_idx + 1] - self.offsets[cluster_idx]
+        (self.offsets[cluster_idx + 1] - self.offsets[cluster_idx]) as usize
     }
 
     /// Total vectors stored
@@ -580,8 +580,8 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
                 .map(|b| b.data.capacity())
                 .sum::<usize>()
             + self.packed_vectors.capacity() * std::mem::size_of::<RaBitQPackedVector<T>>()
-            + self.vector_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.vector_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -606,7 +606,7 @@ pub fn build_rabitq_storage<T>(
     n: usize,
     centroids: &[T],
     nlist: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     encoder: &RaBitQEncoder<T>,
 ) -> Result<RaBitQStorage<T>, AnnSearchErrors>
 where
@@ -621,13 +621,13 @@ where
         .collect();
 
     // Count vectors per cluster
-    let mut counts = vec![0usize; nlist];
+    let mut counts = vec![0u32; nlist];
     for &a in assignments {
-        counts[a] += 1;
+        counts[a as usize] += 1;
     }
 
     // Build offsets
-    let mut offsets = vec![0usize; nlist + 1];
+    let mut offsets = vec![0u32; nlist + 1];
     for i in 0..nlist {
         offsets[i + 1] = offsets[i] + counts[i];
     }
@@ -652,7 +652,7 @@ where
             };
             n
         ],
-        vector_indices: vec![0usize; n],
+        vector_indices: vec![0u32; n],
         offsets: offsets.clone(),
         blocked: Vec::new(),
         blocked_arch: BLOCKED_ARCH,
@@ -669,8 +669,8 @@ where
     let mut insert_pos = offsets[..nlist].to_vec();
 
     for vec_idx in 0..n {
-        let cluster_idx = assignments[vec_idx];
-        let pos = insert_pos[cluster_idx];
+        let cluster_idx = assignments[vec_idx] as usize;
+        let pos = insert_pos[cluster_idx] as usize;
         insert_pos[cluster_idx] += 1;
 
         let vec = &data[vec_idx * dim..(vec_idx + 1) * dim];
@@ -686,12 +686,12 @@ where
             dot_correction_inv: dot_corr,
         };
 
-        storage.vector_indices[pos] = vec_idx;
+        storage.vector_indices[pos] = vec_idx as u32;
     }
 
     storage.blocked = (0..nlist)
         .map(|c| {
-            let (start, end) = (offsets[c], offsets[c + 1]);
+            let (start, end) = (offsets[c] as usize, offsets[c + 1] as usize);
             pack_rabitq_blocked(
                 &codes_flat[start * n_bytes..end * n_bytes],
                 end - start,
