@@ -666,7 +666,7 @@ pub struct AnnoyIndex<T> {
     /// Number of trees in the forest
     pub n_trees: usize,
     /// Orignal indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -763,7 +763,7 @@ where
             n,
             norms,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         let new_to_old = idx.optimise_memory_layout();
@@ -778,20 +778,17 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         if self.n_trees == 0 || self.n == 0 {
             return Vec::new();
         }
 
         // Tree 0's permutation is its leaves in DFS order and covers every
         // item exactly once.
-        let new_to_old: Vec<usize> = self.trees.leaf_indices[..self.n]
-            .iter()
-            .map(|&i| i as usize)
-            .collect();
+        let new_to_old: Vec<u32> = self.trees.leaf_indices[..self.n].to_vec();
         let mut old_to_new = vec![0u32; self.n];
         for (new_id, &old_id) in new_to_old.iter().enumerate() {
-            old_to_new[old_id] = new_id as u32;
+            old_to_new[old_id as usize] = new_id as u32;
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -802,6 +799,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             let end = start + self.dim;
 
@@ -829,7 +827,7 @@ where
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.trees.memory_usage_bytes()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -1013,7 +1011,7 @@ where
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for entry in candidates.iter_mut() {
-            entry.1 = self.original_ids[entry.1];
+            entry.1 = self.original_ids[entry.1] as usize;
         }
 
         Ok(())
@@ -1084,7 +1082,7 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1152,7 +1150,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

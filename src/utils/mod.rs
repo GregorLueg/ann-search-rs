@@ -154,7 +154,7 @@ where
     /// ### Returns
     ///
     /// The original indices of the index
-    fn original_ids(&self) -> &[usize];
+    fn original_ids(&self) -> &[u32];
 
     /// Exhaustive search for ground truth
     ///
@@ -226,7 +226,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|(OrderedFloat(dist), idx)| (dist, self.original_ids()[idx]))
+            .map(|(OrderedFloat(dist), idx)| (dist, self.original_ids()[idx] as usize))
             .unzip();
 
         Ok((indices, distances))

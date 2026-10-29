@@ -362,7 +362,7 @@ pub struct NsgIndex<T> {
     /// Global entry point selected by the build
     pub navigating_node: u32,
     /// Original ids (identity by default)
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -767,7 +767,7 @@ where
             l_build: params.l_build,
             c: params.c,
             navigating_node: 0,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         // Step 1: pick the navigating node
@@ -1721,7 +1721,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

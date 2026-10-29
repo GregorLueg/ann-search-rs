@@ -400,7 +400,7 @@ pub struct VamanaIndex<T> {
     /// Search beam width during construction
     pub l_build: usize,
     /// Orignal indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -510,7 +510,7 @@ where
             medoid,
             r,
             l_build,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         let passes = [
@@ -1056,7 +1056,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

@@ -51,7 +51,7 @@ where
     /// Number of k-means clusters.
     nlist: usize,
     /// Original indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 /////////////////////////
@@ -235,13 +235,18 @@ where
         // 4. reorder into cluster order *before* encoding, so a probed cell is
         // one contiguous run of codes. Doing it afterwards would mean
         // permuting the codes and every precomputed per-vector term with them.
-        let mut original_ids = Vec::with_capacity(n);
+        let mut original_ids: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            original_ids.extend_from_slice(&all_indices[offsets[cluster]..offsets[cluster + 1]]);
+            original_ids.extend(
+                all_indices[offsets[cluster]..offsets[cluster + 1]]
+                    .iter()
+                    .map(|&i| i as u32),
+            );
         }
 
         let mut reordered = Vec::with_capacity(n * dim);
         for &old_id in &original_ids {
+            let old_id = old_id as usize;
             reordered.extend_from_slice(&vectors_flat[old_id * dim..(old_id + 1) * dim]);
         }
         drop(vectors_flat);
@@ -383,7 +388,7 @@ where
         let mut out: Vec<(OrderedFloat<T>, usize)> = heap.into_vec();
         out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         out.into_iter()
-            .map(|(OrderedFloat(s), i)| (self.original_ids[i], self.codec.finalise(s)))
+            .map(|(OrderedFloat(s), i)| (self.original_ids[i] as usize, self.codec.finalise(s)))
             .unzip()
     }
 
@@ -446,7 +451,7 @@ where
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -494,7 +499,7 @@ where
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<usize>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 

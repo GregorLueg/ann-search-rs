@@ -83,7 +83,7 @@ fn assert_non_negative(label: &str, distances: &Option<Vec<Vec<f32>>>) {
 #[test]
 fn hnsw_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_hnsw_index((&data[..], n, dim), 16, 100, "cosine", 42, false);
+    let index = build_hnsw_index((&data[..], n, dim), 16, 100, "cosine", 42, false).unwrap();
 
     let (_, self_d) = query_hnsw_self(&index, K, 50, true, false).unwrap();
     assert_non_negative("hnsw self", &self_d);
@@ -186,7 +186,7 @@ fn balltree_cosine_is_non_negative() {
 #[test]
 fn kd_tree_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_kd_tree_index((&data[..], n, dim), "cosine", 4, 42);
+    let index = build_kd_tree_index((&data[..], n, dim), "cosine", 4, 42).unwrap();
 
     let (_, self_d) = query_kd_tree_self(&index, K, None, true, false).unwrap();
     assert_non_negative("kd_tree self", &self_d);
@@ -297,7 +297,7 @@ fn soar_cosine_is_non_negative() {
 #[test]
 fn vamana_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_vamana_index((&data[..], n, dim), 16, 60, None, 1.0, 1.2, "cosine", 42);
+    let index = build_vamana_index((&data[..], n, dim), 16, 60, None, 1.0, 1.2, "cosine", 42).unwrap();
 
     let (_, self_d) = query_vamana_self(&index, K, None, true, false).unwrap();
     assert_non_negative("vamana self", &self_d);

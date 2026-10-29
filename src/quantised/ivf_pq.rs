@@ -42,7 +42,7 @@ pub struct IvfPqIndex<T> {
     /// Number of k-means clusters
     nlist: usize,
     /// Original indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 //////////////////////
@@ -407,7 +407,7 @@ where
 
         let (distances, indices) = results
             .into_iter()
-            .map(|(d, i)| (d.0, self.original_ids[i]))
+            .map(|(d, i)| (d.0, self.original_ids[i] as usize))
             .unzip();
 
         Ok((indices, distances))
@@ -487,7 +487,7 @@ where
                 let residual = self.codebook.decode(codes);
                 let reconstructed: Vec<T> = T::add_simd(my_centroid, &residual);
 
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -544,7 +544,7 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let m = self.codebook.m();
         let mut new_to_old = Vec::with_capacity(self.n);
         let mut old_to_new = vec![0usize; self.n];
@@ -554,12 +554,13 @@ where
             let end = self.offsets[cluster + 1];
             for &old_id in &self.all_indices[start..end] {
                 old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
+                new_to_old.push(old_id as u32);
             }
         }
 
         let mut new_codes = Vec::with_capacity(self.quantised_codes.len());
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * m;
             new_codes.extend_from_slice(&self.quantised_codes[start..start + m]);
         }

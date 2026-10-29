@@ -45,7 +45,7 @@ pub struct IvfIndexBf16<T> {
     /// Number of clusters in the index
     nlist: usize,
     /// Original ids
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ///////////////////////
@@ -342,7 +342,7 @@ where
         let (distances, indices) = buffer
             .data()
             .iter()
-            .map(|(d, i)| (d.0, self.original_ids[*i]))
+            .map(|(d, i)| (d.0, self.original_ids[*i] as usize))
             .unzip();
 
         Ok((indices, distances))
@@ -412,7 +412,7 @@ where
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -513,7 +513,7 @@ where
         let (distances, indices) = buffer
             .data()
             .iter()
-            .map(|(d, i)| (d.0, self.original_ids[*i]))
+            .map(|(d, i)| (d.0, self.original_ids[*i] as usize))
             .unzip();
         (indices, distances)
     }
@@ -524,7 +524,7 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
         let mut old_to_new = vec![0usize; self.n];
 
@@ -533,7 +533,7 @@ where
             let end = self.offsets[cluster + 1];
             for &old_id in &self.all_indices[start..end] {
                 old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
+                new_to_old.push(old_id as u32);
             }
         }
 
@@ -545,6 +545,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
             if !self.norms.is_empty() {

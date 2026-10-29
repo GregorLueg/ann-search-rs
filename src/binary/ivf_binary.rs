@@ -65,7 +65,7 @@ pub struct IvfIndexBinary<T> {
     #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
     store_meta: Option<StoreMeta>,
     /// New to old mapping
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
     /// Old to new mapping. Read by the asymmetric query path, which gets
     /// original ids back from [`IvfIndexBinary::query`] and has to reach the
     /// physical code slot they live in.
@@ -527,7 +527,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|(d, i)| (d, self.original_ids[i]))
+            .map(|(d, i)| (d, self.original_ids[i] as usize))
             .unzip();
 
         Ok((indices, distances))
@@ -808,7 +808,7 @@ where
             let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
-                    let orig_id = self.original_ids[i];
+                    let orig_id = self.original_ids[i] as usize;
                     let vec = vector_store.load_vector(orig_id);
 
                     if verbose {
@@ -847,7 +847,7 @@ where
             let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
-                    let orig_id = self.original_ids[i];
+                    let orig_id = self.original_ids[i] as usize;
                     let start = i * self.n_bytes;
                     let query_binary = &self.vectors_flat_binarised[start..start + self.n_bytes];
                     let k = k.min(self.n);
@@ -902,7 +902,7 @@ where
 
                     let (distances, indices): (Vec<_>, Vec<_>) = results
                         .into_iter()
-                        .map(|(d, i)| (d, self.original_ids[i]))
+                        .map(|(d, i)| (d, self.original_ids[i] as usize))
                         .unzip();
 
                     (orig_id, indices, distances)
@@ -957,7 +957,7 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
         let mut old_to_new = vec![0usize; self.n];
 
@@ -966,7 +966,7 @@ where
             let end = self.offsets[cluster + 1];
             for &old_id in &self.all_indices[start..end] {
                 old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
+                new_to_old.push(old_id as u32);
             }
         }
 
@@ -976,7 +976,7 @@ where
             .par_chunks_mut(n_bytes)
             .zip(new_to_old.par_iter())
             .for_each(|(slot, &old_id)| {
-                let start = old_id * n_bytes;
+                let start = old_id as usize * n_bytes;
                 slot.copy_from_slice(&self.vectors_flat_binarised[start..start + n_bytes]);
             });
 

@@ -112,6 +112,32 @@ use crate::quantised::{
 // Helper //
 ////////////
 
+/// Largest sample count the `u32`-id indices can address. `u32::MAX` is the
+/// empty-slot sentinel, so it cannot be a valid id.
+const MAX_SAMPLES_U32: usize = u32::MAX as usize - 1;
+
+/// Largest sample count NN-Descent can address. It packs an is-new flag into
+/// the top bit of the id and reserves `SENTINEL_PID` (see
+/// `utils/nndescent_utils.rs`) for empty slots.
+const MAX_SAMPLES_NND: usize = (u32::MAX >> 1) as usize - 1;
+
+/// Guard against datasets the `u32` ids cannot address
+///
+/// ### Params
+///
+/// * `n` - Number of samples
+/// * `max` - Largest supported number of samples
+///
+/// ### Returns
+///
+/// `Ok(())` if `n <= max`, otherwise [`AnnSearchErrors::TooManySamples`].
+fn check_n_samples(n: usize, max: usize) -> Result<(), AnnSearchErrors> {
+    if n > max {
+        return Err(AnnSearchErrors::TooManySamples { n, max });
+    }
+    Ok(())
+}
+
 /// Helper function to execute parallel queries across samples
 ///
 /// ### Params
@@ -431,6 +457,8 @@ pub fn build_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -524,6 +552,8 @@ pub fn build_annoy_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -623,6 +653,8 @@ pub fn build_balltree_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -712,7 +744,7 @@ where
 ///
 /// ### Return
 ///
-/// The `HnswIndex`.
+/// The `HnswIndex`, or an error if the sample count exceeds the `u32` id limit.
 pub fn build_hnsw_index<T>(
     mat: impl AnnMatrix<T>,
     m: usize,
@@ -720,17 +752,26 @@ pub fn build_hnsw_index<T>(
     dist_metric: &str,
     seed: usize,
     verbose: bool,
-) -> HnswIndex<T>
+) -> Result<HnswIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
 
-    HnswIndex::build(mat, m, ef_construction, &metric, seed, verbose)
+    Ok(HnswIndex::build(
+        mat,
+        m,
+        ef_construction,
+        &metric,
+        seed,
+        verbose,
+    ))
 }
 
 /// Helper function to query a given HNSW index
@@ -841,6 +882,8 @@ pub fn build_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -981,6 +1024,8 @@ pub fn build_soar_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1083,22 +1128,24 @@ where
 ///
 /// ### Return
 ///
-/// The `KdTreeIndex`.
+/// The `KdTreeIndex`, or an error if the sample count exceeds the `u32` id limit.
 pub fn build_kd_tree_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     n_trees: usize,
     seed: usize,
-) -> KdTreeIndex<T>
+) -> Result<KdTreeIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
 
-    KdTreeIndex::new(mat, n_trees, metric, seed)
+    Ok(KdTreeIndex::new(mat, n_trees, metric, seed))
 }
 
 /// Helper function to query a given Kd-Tree index
@@ -1204,6 +1251,8 @@ pub fn build_lsh_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1339,6 +1388,8 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1508,6 +1559,8 @@ where
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1545,7 +1598,8 @@ where
 ///
 /// ### Returns
 ///
-/// The built `VamanaIndex`.
+/// The built `VamanaIndex`, or an error if the sample count exceeds the `u32` id
+/// limit.
 #[allow(clippy::too_many_arguments)]
 pub fn build_vamana_index<T>(
     mat: impl AnnMatrix<T>,
@@ -1556,17 +1610,19 @@ pub fn build_vamana_index<T>(
     alpha_pass2: f32,
     dist_metric: &str,
     seed: usize,
-) -> VamanaIndex<T>
+) -> Result<VamanaIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
 
-    VamanaIndex::build(
+    Ok(VamanaIndex::build(
         mat,
         metric,
         r,
@@ -1575,7 +1631,7 @@ where
         alpha_pass1,
         alpha_pass2,
         seed,
-    )
+    ))
 }
 
 /// Query a Vamana index with an external query matrix
@@ -1686,6 +1742,8 @@ where
     NsgIndex<T>: NsgState<T>,
     NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1838,6 +1896,8 @@ where
     T: AnnSearchFloat,
     RnnDescentIndex<T>: RnnDescentState<T> + ApplySortedUpdates<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -1951,6 +2011,7 @@ where
     });
 
     let (vectors_flat, n, dim) = mat.into_row_major();
+    check_n_samples(n, MAX_SAMPLES_U32)?;
 
     if verbose {
         println!("Building exhaustive BF16 index with {} samples", n);
@@ -2054,6 +2115,7 @@ where
     });
 
     let (vectors_flat, n, dim) = mat.into_row_major();
+    check_n_samples(n, MAX_SAMPLES_U32)?;
 
     if verbose {
         println!("Building exhaustive SQ8 index with {} samples", n);
@@ -2158,6 +2220,8 @@ pub fn build_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2265,6 +2329,8 @@ pub fn build_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2370,6 +2436,8 @@ pub fn build_ivf_bf16_index<T>(
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2489,6 +2557,8 @@ pub fn build_ivf_sq8_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2623,6 +2693,8 @@ pub fn build_hnsw_sq8u_index<T>(
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2748,6 +2820,8 @@ pub fn build_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2817,6 +2891,8 @@ pub fn build_soar_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -2879,6 +2955,8 @@ pub fn build_soar_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3144,6 +3222,8 @@ pub fn build_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3263,6 +3343,8 @@ pub fn build_exhaustive_index_gpu<T>(
 where
     T: CubeclFloat + AnnSearchFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3357,6 +3439,8 @@ pub fn build_exhaustive_index_mlx(
     mat: impl AnnMatrix<f32>,
     dist_metric: &str,
 ) -> Result<ExhaustiveIndexMlx, AnnSearchErrors> {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3513,6 +3597,8 @@ pub fn build_ivf_index_mlx(
     seed: usize,
     verbose: bool,
 ) -> Result<IvfIndexMlx, AnnSearchErrors> {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3629,6 +3715,8 @@ pub fn build_knn_graph_mlx(
     seed: usize,
     verbose: bool,
 ) -> Result<KnnGraphMlx, AnnSearchErrors> {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3691,6 +3779,8 @@ pub fn build_nndescent_index_mlx(
     seed: usize,
     verbose: bool,
 ) -> Result<NNDescentIndexMlx, AnnSearchErrors> {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3804,6 +3894,8 @@ pub fn build_ivf_index_gpu<T>(
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -3931,6 +4023,8 @@ pub fn build_nndescent_index_gpu<T>(
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4135,6 +4229,8 @@ pub fn build_knn_graph_gpu<T>(
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4203,6 +4299,8 @@ pub fn build_clustered_knn_graph_gpu<T>(
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4267,6 +4365,8 @@ pub fn build_knn_graph_nndescent_gpu<T>(
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4378,6 +4478,8 @@ pub fn build_exhaustive_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4532,6 +4634,8 @@ pub fn build_ivf_index_binary<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4693,6 +4797,8 @@ pub fn build_exhaustive_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4825,6 +4931,8 @@ pub fn build_ivf_index_rabitq<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -4958,6 +5066,8 @@ pub fn build_exhaustive_index_turboquant<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -5080,6 +5190,8 @@ pub fn build_ivf_index_turboquant<T>(
 where
     T: AnnSearchFloat + Pod,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -5236,6 +5348,8 @@ where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
     VamanaIndex<T>: VamanaState<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -5294,6 +5408,8 @@ where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
     VamanaIndex<T>: VamanaState<T>,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
@@ -5431,6 +5547,8 @@ pub fn build_hnsw_rabitq_index<T>(
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_U32)?;
     let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()

@@ -341,7 +341,7 @@ pub struct RnnDescentIndex<T> {
     /// Kd-tree forest used to pick query entry points
     pub forest: KdTreeIndex<T>,
     /// Original ids
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -618,7 +618,7 @@ where
             norms,
             graph: Vec::new(),
             forest,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         // Working flat graph in Neighbour<T> form during build.
@@ -1191,7 +1191,7 @@ where
     fn metric(&self) -> Dist {
         self.metric
     }
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

@@ -145,7 +145,7 @@ pub struct QgIndex<T> {
     /// The metric the index answers in
     metric: Dist,
     /// Original row indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -450,7 +450,7 @@ where
             padded_dim,
             n,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         })
     }
 
@@ -727,7 +727,7 @@ where
     /// ### Returns
     ///
     /// Slice of original indices
-    pub fn original_ids(&self) -> &[usize] {
+    pub fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 
@@ -744,7 +744,7 @@ where
             + self.edges.capacity() * std::mem::size_of::<u32>()
             + self.codes.capacity()
             + self.factors.capacity() * std::mem::size_of::<T>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -805,7 +805,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

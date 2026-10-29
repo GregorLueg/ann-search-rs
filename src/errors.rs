@@ -35,6 +35,15 @@ pub enum AnnSearchErrors {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// Dataset is too large for the `u32` point ids the index stores.
+    #[error("{n} samples exceed the {max} this index can address with u32 ids.")]
+    TooManySamples {
+        /// Number of samples given
+        n: usize,
+        /// Largest supported sample count
+        max: usize,
+    },
+
     // -- lsh errors --
     /// Requested hash width exceeds what a directly addressed bucket table can
     /// hold.

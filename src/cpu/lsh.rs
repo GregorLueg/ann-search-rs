@@ -585,7 +585,7 @@ pub struct LSHIndex<T> {
     /// Addressable codes per table, `1 << (n_proj * slot_bits)`
     n_buckets: usize,
     /// Orignal indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -766,19 +766,16 @@ where
     /// ### Returns
     ///
     /// New-to-old id mapping, to be stored as `original_ids`.
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         if self.n == 0 {
             return Vec::new();
         }
 
-        let new_to_old: Vec<usize> = self.bucket_ids[..self.n]
-            .iter()
-            .map(|&id| id as usize)
-            .collect();
+        let new_to_old: Vec<u32> = self.bucket_ids[..self.n].to_vec();
 
         let mut old_to_new = vec![0u32; self.n];
         for (new_id, &old_id) in new_to_old.iter().enumerate() {
-            old_to_new[old_id] = new_id as u32;
+            old_to_new[old_id as usize] = new_id as u32;
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -789,6 +786,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
             if !self.norms.is_empty() {
@@ -822,7 +820,7 @@ where
         total += self.boundaries.capacity() * std::mem::size_of::<T>();
         total += self.bucket_offsets.capacity() * std::mem::size_of::<u32>();
         total += self.bucket_ids.capacity() * std::mem::size_of::<u32>();
-        total += self.original_ids.capacity() * std::mem::size_of::<usize>();
+        total += self.original_ids.capacity() * std::mem::size_of::<u32>();
 
         total
     }
@@ -1061,7 +1059,7 @@ where
                 let (indices, dists) = buffer
                     .data()
                     .iter()
-                    .map(|&(OrderedFloat(d), idx)| (self.original_ids[idx], d))
+                    .map(|&(OrderedFloat(d), idx)| (self.original_ids[idx] as usize, d))
                     .unzip();
 
                 (indices, dists, fallback_triggered)
@@ -1184,7 +1182,7 @@ where
                 }
 
                 let (indices, dists, fallback) = self.self_query_at(vec_idx, k, max_cand, n_probes);
-                (self.original_ids[vec_idx], indices, dists, fallback)
+                (self.original_ids[vec_idx] as usize, indices, dists, fallback)
             })
             .collect();
 
@@ -1282,7 +1280,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1524,7 +1522,7 @@ mod tests {
             index
                 .original_ids
                 .iter()
-                .position(|&o| o == orig)
+                .position(|&o| o as usize == orig)
                 .expect("every original id is present")
         };
         let (lo, hi) = (internal(0), internal(n - 1));
@@ -1839,6 +1837,7 @@ mod tests {
         // `original_ids` must be a bijection, else results map back wrongly.
         let mut seen = vec![false; n];
         for &old in &index.original_ids {
+            let old = old as usize;
             assert!(!seen[old], "original id {old} appeared twice");
             seen[old] = true;
         }
@@ -1846,6 +1845,7 @@ mod tests {
 
         // Every stored row must still be the vector its original id names.
         for (new_id, &old_id) in index.original_ids.iter().enumerate() {
+            let old_id = old_id as usize;
             let stored = &index.vectors_flat[new_id * dim..(new_id + 1) * dim];
             for (j, &v) in stored.iter().enumerate() {
                 assert_eq!(v, mat[(old_id, j)], "row {old_id} moved but changed");
@@ -1905,7 +1905,7 @@ mod tests {
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
         assert_eq!(indices.len(), distances.len());
-        assert!(indices.contains(&index.original_ids[0]));
+        assert!(indices.contains(&(index.original_ids[0] as usize)));
     }
 
     #[test]

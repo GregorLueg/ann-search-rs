@@ -42,7 +42,7 @@ pub struct KmknnIndex<T> {
     /// Number of clusters
     nlist: usize,
     /// Mapping from internal position to original sample index
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
     /// Squared distance from each point to its assigned centroid
     point_to_centroid_sq: Vec<T>,
     /// Per-cluster squared maximum point-to-centroid distance
@@ -203,12 +203,12 @@ where
         let mut new_to_old = Vec::with_capacity(n);
         for c in 0..nlist {
             for &old_id in &all_indices[offsets[c]..offsets[c + 1]] {
-                new_to_old.push(old_id);
+                new_to_old.push(old_id as u32);
             }
         }
         let mut new_vectors_flat = Vec::with_capacity(n * dim);
         for &old_id in &new_to_old {
-            let start = old_id * dim;
+            let start = old_id as usize * dim;
             new_vectors_flat.extend_from_slice(&vectors_flat[start..start + dim]);
         }
 
@@ -259,7 +259,7 @@ where
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
             + self.point_to_centroid_sq.capacity() * std::mem::size_of::<T>()
             + self.cluster_radii_sq.capacity() * std::mem::size_of::<T>()
     }
@@ -354,7 +354,7 @@ where
                     Dist::Cosine => d_sq * half,
                     Dist::Manhattan => unreachable!(),
                 };
-                (out, self.original_ids[pos])
+                (out, self.original_ids[pos] as usize)
             })
             .unzip();
 
@@ -434,7 +434,7 @@ where
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -500,7 +500,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

@@ -247,7 +247,7 @@ fn main() {
             cli.alpha_pass2,
             &cli.distance,
             cli.seed as usize,
-        );
+        ).unwrap();
         println!("Build {}: {:.2?}", run + 1, start.elapsed());
 
         index = Some(built);

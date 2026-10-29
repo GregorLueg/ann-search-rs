@@ -475,7 +475,7 @@ mod tests {
     round_trip!(
         test_round_trip_hnsw,
         HnswIndex<f32>,
-        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false),
+        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false).unwrap(),
         |i, q| unwrap_knn(query_hnsw_index(q, i, K, 32, true, false))
     );
 
@@ -496,7 +496,7 @@ mod tests {
     round_trip!(
         test_round_trip_kd_forest,
         KdTreeIndex<f32>,
-        |m| build_kd_tree_index(m, "euclidean", 4, 1),
+        |m| build_kd_tree_index(m, "euclidean", 4, 1).unwrap(),
         |i, q| unwrap_knn(query_kd_tree_index(q, i, K, None, true, false))
     );
 
@@ -529,7 +529,7 @@ mod tests {
     round_trip!(
         test_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1).unwrap(),
         |i, q| unwrap_knn(query_vamana_index(q, i, K, None, true, false))
     );
 
@@ -1744,7 +1744,7 @@ mod tests {
     self_round_trip!(
         test_self_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1),
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1).unwrap(),
         |i| query_vamana_self(i, K, None, false, false).unwrap().0
     );
 
@@ -1767,7 +1767,7 @@ mod tests {
     self_round_trip!(
         test_self_round_trip_hnsw,
         HnswIndex<f32>,
-        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false),
+        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false).unwrap(),
         |i| query_hnsw_self(i, K, 32, false, false).unwrap().0
     );
 

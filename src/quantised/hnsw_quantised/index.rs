@@ -68,7 +68,7 @@ where
     /// Construction beam width the graph was built with.
     ef_construction: usize,
     /// Original ids, identity by default. Kept for the trait surface.
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
     /// Ties the index to its float type.
     _phantom: PhantomData<T>,
 }
@@ -161,7 +161,7 @@ where
             metric,
             m: params.m,
             ef_construction: params.ef_construction,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
             _phantom: PhantomData,
         }
     }
@@ -458,7 +458,7 @@ where
     /// ### Returns
     ///
     /// Identity mapping unless the index was reordered
-    pub fn original_ids(&self) -> &[usize] {
+    pub fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 
@@ -676,7 +676,7 @@ where
             + self.codec.memory_usage_bytes()
             + self.graph.memory_usage_bytes()
             + self.hierarchy.memory_usage_bytes()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 

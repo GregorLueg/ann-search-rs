@@ -324,14 +324,14 @@ mod tests {
             .collect();
         let mat = Mat::from_fn(n, dim, |i, j| flat[i * dim + j]);
 
-        let faer_index = build_hnsw_index(mat.as_ref(), 16, 100, "euclidean", 42, false);
+        let faer_index = build_hnsw_index(mat.as_ref(), 16, 100, "euclidean", 42, false).unwrap();
         let (faer_idx, faer_dist) =
             query_hnsw_index(mat.as_ref(), &faer_index, 5, 50, true, false).unwrap();
         let faer_dist = faer_dist.unwrap();
 
         // Same data as a flat row-major buffer: same index, same neighbours.
         let flat_index =
-            build_hnsw_index((flat.as_slice(), n, dim), 16, 100, "euclidean", 42, false);
+            build_hnsw_index((flat.as_slice(), n, dim), 16, 100, "euclidean", 42, false).unwrap();
         let (flat_idx, flat_dist) =
             query_hnsw_index((flat.as_slice(), n, dim), &flat_index, 5, 50, true, false).unwrap();
 
@@ -342,7 +342,7 @@ mod tests {
         {
             let arr = Array2::from_shape_fn((n, dim), |(i, j)| flat[i * dim + j]);
 
-            let nd_index = build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, false);
+            let nd_index = build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, false).unwrap();
             let (nd_idx, nd_dist) =
                 query_hnsw_index(arr.view(), &nd_index, 5, 50, true, false).unwrap();
             assert_eq!(faer_idx, nd_idx);

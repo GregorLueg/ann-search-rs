@@ -147,7 +147,7 @@ where
     /// Size of dynamic candidate list during construction
     ef_construction: usize,
     /// Original indices - for trait purposes
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -281,7 +281,7 @@ where
             max_layer,
             m,
             ef_construction,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
@@ -1071,7 +1071,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

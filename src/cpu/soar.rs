@@ -89,7 +89,7 @@ pub struct SoarIndex<T> {
     /// Rule used for the secondary assignment, kept for introspection
     rule: SoarRule,
     /// Internal row -> caller-facing id
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -321,9 +321,13 @@ where
         // Reorder vectors into primary-cluster order. `new_to_old` doubles as
         // `original_ids`; nothing needs the inverse map, because the spill
         // lists are built by walking the new order directly.
-        let mut new_to_old: Vec<usize> = Vec::with_capacity(n);
+        let mut new_to_old: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            new_to_old.extend_from_slice(&all_indices[offsets[cluster]..offsets[cluster + 1]]);
+            new_to_old.extend(
+                all_indices[offsets[cluster]..offsets[cluster + 1]]
+                    .iter()
+                    .map(|&i| i as u32),
+            );
         }
 
         let mut reordered = Vec::with_capacity(vectors_flat.len());
@@ -333,6 +337,7 @@ where
             Vec::with_capacity(n)
         };
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * dim;
             reordered.extend_from_slice(&vectors_flat[start..start + dim]);
             if !norms.is_empty() {
@@ -342,7 +347,7 @@ where
 
         // Spill lists index the *reordered* rows, so translate the secondary
         // assignment out of caller-id space on the way in.
-        let spill_assign: Vec<u32> = new_to_old.iter().map(|&old| secondary[old]).collect();
+        let spill_assign: Vec<u32> = new_to_old.iter().map(|&old| secondary[old as usize]).collect();
         let (spill_members, spill_offsets) = invert_assignments_csr(&spill_assign, n, 1, nlist);
 
         // Primary cell of every reordered row, from the contiguous ranges.
@@ -499,7 +504,7 @@ where
             let (distances, indices) = buffer
                 .data()
                 .iter()
-                .map(|(d, i)| (d.0, self.original_ids[*i]))
+                .map(|(d, i)| (d.0, self.original_ids[*i] as usize))
                 .unzip();
 
             Ok((indices, distances))
@@ -568,7 +573,7 @@ where
             .map(|i| {
                 let start = i * self.dim;
                 let vec = &self.vectors_flat[start..start + self.dim];
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
                 if verbose {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -633,7 +638,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }

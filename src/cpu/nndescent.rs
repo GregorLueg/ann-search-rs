@@ -1018,7 +1018,7 @@ pub struct NNDescent<T> {
     /// Whether construction converged
     converged: bool,
     /// Original indices - for trait purposes
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -1130,7 +1130,7 @@ where
             query_graph: Vec::new(),
             converged: false,
             forest: Some(forest),
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         let start = Instant::now();
@@ -1183,7 +1183,7 @@ where
             query_graph,
             converged,
             forest: builder.forest,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         })
     }
 
@@ -2879,7 +2879,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
