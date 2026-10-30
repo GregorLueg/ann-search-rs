@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use num_traits::{Float, FromPrimitive};
+use std::collections::BinaryHeap;
 
 #[cfg(test)]
 use crate::binary::rabitq::fastscan::unpack_rabitq_blocked;
@@ -701,35 +702,43 @@ where
         self.storage().n_bytes
     }
 
-    /// Squared RaBitQ distances for one fast-scan block within a cluster
+    /// Squared RaBitQ estimates and lower bounds for one fast-scan block
     ///
     /// The signed inner product comes from a nibble table scanned 32 lanes at
     /// a time rather than a per-vector AND-popcount, so there is no int4 query
-    /// quantisation and none of the popcount corrections it would need: only
-    /// the per-vector norm and dot correction remain.
+    /// quantisation and none of the popcount corrections it would need. See
+    /// [`RaBitQPackedVector`] for the estimate and the bound.
     ///
     /// `local_start` must be a multiple of [`RABITQ_BLOCK`], which is what the
     /// scan loops step by.
     ///
     /// ### Params
     ///
-    /// * `query` - The query, already prepared against this cluster
+    /// * `query` - The prepared query
     /// * `cluster_idx` - Index of the cluster
     /// * `local_start` - Local index of the first vector in the block
-    /// * `out` - Per-vector output; its length sets how many lanes are kept
+    /// * `g_add` - `||q - c||^2` for this cluster
+    /// * `g_error` - `||q - c||` for this cluster
+    /// * `est` - Per-vector estimates; its length sets how many lanes are kept
+    /// * `low` - Per-vector lower bounds, same length as `est`
     ///
     /// ### Returns
     ///
-    /// The minimum written into `out`, or infinity when `out` is empty
+    /// The minimum of `est` and the minimum of `low`, infinity when empty
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn rabitq_block_sq_fastscan(
         &self,
         query: &SignScanQuery<T>,
         cluster_idx: usize,
         local_start: usize,
-        out: &mut [T],
-    ) -> T {
+        g_add: T,
+        g_error: T,
+        est: &mut [T],
+        low: &mut [T],
+    ) -> (T, T) {
         debug_assert_eq!(local_start % RABITQ_BLOCK, 0);
+        debug_assert_eq!(est.len(), low.len());
 
         let storage = self.storage();
         let blocked = storage.cluster_blocked(cluster_idx);
@@ -742,31 +751,118 @@ where
             &mut lanes,
         );
 
-        let one = T::one();
-        let two = one + one;
-        let q_dist = query.dist_to_centroid;
-        let q_dist_sq = q_dist * q_dist;
-
         let global_start = storage.offsets[cluster_idx] as usize + local_start;
-        let mut min = T::infinity();
+        let packed = &storage.packed_vectors[global_start..global_start + est.len()];
+        let (mut min_est, mut min_low) = (T::infinity(), T::infinity());
 
-        for (j, slot) in out.iter_mut().enumerate() {
-            let packed = unsafe { storage.packed_vectors.get_unchecked(global_start + j) };
+        for (j, p) in packed.iter().enumerate() {
+            let e = (p.f_add + g_add + p.f_rescale * T::from_f32(lanes[j]).unwrap()).max(T::zero());
+            let l = e - p.f_error * g_error;
+            est[j] = e;
+            low[j] = l;
+            min_est = min_est.min(e);
+            min_low = min_low.min(l);
+        }
 
-            let sgn = T::from_f32(lanes[j]).unwrap();
-            let q_dot_v = (sgn * packed.dot_correction_inv).clamp(one.neg(), one);
+        (min_est, min_low)
+    }
 
-            let v_dist = packed.dist_to_centroid;
-            let dist =
-                (v_dist * v_dist + q_dist_sq - two * v_dist * q_dist * q_dot_v).max(T::zero());
+    /// Scan the probed clusters and keep the `k` best
+    ///
+    /// Without `exact` the heap ranks on the estimates. With it, the
+    /// reference's one-stage rerank: a candidate whose lower bound beats the
+    /// current `k`-th distance gets an exact distance and enters the heap on
+    /// that, everything else is dropped unscored. The bound is probabilistic,
+    /// so this can miss a neighbour a fixed shortlist would have caught, but it
+    /// pays for exact distances only where the estimate is ambiguous.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The prepared query
+    /// * `probed` - Clusters to scan
+    /// * `k` - Number of neighbours to keep
+    /// * `exact` - Exact squared distance (in the estimate's space) by
+    ///   original index, or `None` to rank on the estimates
+    ///
+    /// ### Returns
+    ///
+    /// `(squared distance, original index)` ascending, at most `k` long
+    fn rabitq_scan<F>(
+        &self,
+        query: &SignScanQuery<T>,
+        probed: &[usize],
+        k: usize,
+        mut exact: Option<F>,
+    ) -> Vec<(OrderedFloat<T>, usize)>
+    where
+        T: SimdDistance,
+        F: FnMut(usize) -> T,
+    {
+        let storage = self.storage();
+        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let mut est = [T::zero(); RABITQ_BLOCK];
+        let mut low = [T::zero(); RABITQ_BLOCK];
 
-            *slot = dist;
-            if dist < min {
-                min = dist;
+        let top = |heap: &BinaryHeap<(OrderedFloat<T>, usize)>| {
+            if heap.len() < k {
+                T::infinity()
+            } else {
+                heap.peek().map_or(T::infinity(), |e| e.0 .0)
+            }
+        };
+
+        for &c_idx in probed {
+            let g_add = T::euclidean_simd(&query.rotated, storage.centroid_rotated(c_idx));
+            let g_error = g_add.sqrt();
+            let cluster_size = storage.cluster_size(c_idx);
+            let indices = storage.cluster_vector_indices(c_idx);
+
+            let mut local_idx = 0;
+            while local_idx < cluster_size {
+                let take = RABITQ_BLOCK.min(cluster_size - local_idx);
+                let (min_est, min_low) = self.rabitq_block_sq_fastscan(
+                    query,
+                    c_idx,
+                    local_idx,
+                    g_add,
+                    g_error,
+                    &mut est[..take],
+                    &mut low[..take],
+                );
+
+                match exact.as_mut() {
+                    None if min_est < top(&heap) => {
+                        for j in 0..take {
+                            if est[j] < top(&heap) {
+                                if heap.len() == k {
+                                    heap.pop();
+                                }
+                                heap.push((OrderedFloat(est[j]), indices[local_idx + j] as usize));
+                            }
+                        }
+                    }
+                    Some(exact) if min_low < top(&heap) => {
+                        for j in 0..take {
+                            if low[j] < top(&heap) {
+                                let idx = indices[local_idx + j] as usize;
+                                let d = exact(idx);
+                                if d < top(&heap) {
+                                    if heap.len() == k {
+                                        heap.pop();
+                                    }
+                                    heap.push((OrderedFloat(d), idx));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                local_idx += take;
             }
         }
 
-        min
+        heap.into_sorted_vec()
     }
 }
 
@@ -996,9 +1092,8 @@ mod tests {
         assert_eq!(quantiser.n_bytes(), 4);
     }
 
-    /// The estimate computed longhand from the stored factors and the exact
-    /// signed inner product, with no table quantisation anywhere.
-    fn oracle_dist_sq(
+    /// The signed inner product `<sign, q_rot>` of one stored code, exact.
+    fn oracle_sign_ip(
         quantiser: &RaBitQQuantiser<f32>,
         q_rot: &[f32],
         cluster_idx: usize,
@@ -1016,16 +1111,7 @@ mod tests {
         );
         let code = &codes[local_idx * n_bytes..(local_idx + 1) * n_bytes];
 
-        let c_rot = storage.centroid_rotated(cluster_idx);
-        let res: Vec<f32> = q_rot.iter().zip(c_rot).map(|(a, b)| a - b).collect();
-        let q_dist = res.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let unit: Vec<f32> = if q_dist > f32::EPSILON {
-            res.iter().map(|x| x / q_dist).collect()
-        } else {
-            vec![0.0; res.len()]
-        };
-
-        let sgn: f32 = unit
+        q_rot
             .iter()
             .enumerate()
             .map(|(d, &x)| {
@@ -1035,13 +1121,74 @@ mod tests {
                     -x
                 }
             })
+            .sum()
+    }
+
+    /// The estimate computed longhand from the stored factors and the exact
+    /// signed inner product, with no table quantisation anywhere.
+    fn oracle_dist_sq(
+        quantiser: &RaBitQQuantiser<f32>,
+        q_rot: &[f32],
+        cluster_idx: usize,
+        local_idx: usize,
+    ) -> f32 {
+        let storage = quantiser.storage();
+        let c_rot = storage.centroid_rotated(cluster_idx);
+        let g_add: f32 = q_rot
+            .iter()
+            .zip(c_rot)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let p = storage.get_vector_data(cluster_idx, local_idx);
+
+        (p.f_add + g_add + p.f_rescale * oracle_sign_ip(quantiser, q_rot, cluster_idx, local_idx))
+            .max(0.0)
+    }
+
+    /// Clustered pseudo-random data, not a ramp: near-collinear vectors drive
+    /// the residual L1 norm towards zero, which leaves the estimate saying
+    /// nothing about the kernel.
+    fn clustered_data(n: usize, dim: usize) -> Mat<f32> {
+        faer::Mat::from_fn(n, dim, |i, j| {
+            let centre = (splitmix_byte(1, (i % 4) * dim + j) as f32 / 128.0) - 1.0;
+            centre * 4.0 + (splitmix_byte(2, i * dim + j) as f32 / 128.0) - 1.0
+        })
+    }
+
+    /// Scores every vector of one cluster through the block kernel.
+    fn score_cluster(
+        quantiser: &RaBitQQuantiser<f32>,
+        query: &SignScanQuery<f32>,
+        c_idx: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let storage = quantiser.storage();
+        let size = storage.cluster_size(c_idx);
+        let g_add: f32 = query
+            .rotated
+            .iter()
+            .zip(storage.centroid_rotated(c_idx))
+            .map(|(a, b)| (a - b) * (a - b))
             .sum();
 
-        let packed = storage.get_vector_data(cluster_idx, local_idx);
-        let q_dot_v = (sgn * packed.dot_correction_inv).clamp(-1.0, 1.0);
-        let v_dist = packed.dist_to_centroid;
-
-        (v_dist * v_dist + q_dist * q_dist - 2.0 * v_dist * q_dist * q_dot_v).max(0.0)
+        let (mut est, mut low) = (vec![0.0f32; size], vec![0.0f32; size]);
+        let mut local = 0;
+        while local < size {
+            let take = RABITQ_BLOCK.min(size - local);
+            let (min_est, min_low) = quantiser.rabitq_block_sq_fastscan(
+                query,
+                c_idx,
+                local,
+                g_add,
+                g_add.sqrt(),
+                &mut est[local..local + take],
+                &mut low[local..local + take],
+            );
+            let fold = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
+            assert_eq!(min_est, fold(&est[local..local + take]));
+            assert_eq!(min_low, fold(&low[local..local + take]));
+            local += take;
+        }
+        (est, low)
     }
 
     #[test]
@@ -1049,27 +1196,20 @@ mod tests {
         for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
             let data = create_test_data::<f32>(100, 32);
             let quantiser = RaBitQQuantiser::new(data.as_ref(), &metric, Some(10), 42).unwrap();
-            let query = vec![1.0f32; 32];
-            let q_rot = quantiser
+            let query = quantiser
                 .encoder
-                .apply_rotation(&quantiser.encoder.normalise_query(&query));
+                .encode_query(&quantiser.encoder.normalise_query(&[1.0f32; 32]))
+                .unwrap();
 
             for c_idx in 0..quantiser.storage().nlist {
-                let encoded = quantiser.encode_query_prerotated(&q_rot, c_idx).unwrap();
-                let size = quantiser.storage().cluster_size(c_idx);
-
-                let mut a = vec![0.0f32; size.min(RABITQ_BLOCK)];
-                let mut b = vec![0.0f32; size.min(RABITQ_BLOCK)];
-                if a.is_empty() {
-                    continue;
-                }
-                quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, 0, &mut a);
-                quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, 0, &mut b);
+                let (a, low) = score_cluster(&quantiser, &query, c_idx);
+                let (b, _) = score_cluster(&quantiser, &query, c_idx);
 
                 assert!(
                     a.iter().all(|&d| d >= 0.0),
                     "{metric:?} produced a negative"
                 );
+                assert!(a.iter().zip(&low).all(|(e, l)| l <= e));
                 assert_eq!(a, b, "{metric:?} is not deterministic");
             }
         }
@@ -1077,52 +1217,101 @@ mod tests {
 
     #[test]
     fn test_rabitq_block_tracks_the_oracle() {
-        // Clustered pseudo-random data, not the ramp: near-collinear vectors
-        // drive the residual L1 norm towards zero, which sends
-        // `dot_correction_inv` to infinity and leaves the estimate pinned at
-        // the clamp, where it says nothing about the kernel.
         let (n, dim) = (200usize, 64usize);
-        let data = faer::Mat::from_fn(n, dim, |i, j| {
-            let centre = (splitmix_byte(1, (i % 4) * dim + j) as f32 / 128.0) - 1.0;
-            centre * 4.0 + (splitmix_byte(2, i * dim + j) as f32 / 128.0) - 1.0
-        });
+        let data = clustered_data(n, dim);
         let quantiser =
             RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
-        let q_rot = quantiser.encoder.apply_rotation(&query);
+        let prepared = quantiser.encoder.encode_query(&query).unwrap();
 
         for c_idx in 0..quantiser.storage().nlist {
-            let encoded = quantiser.encode_query_prerotated(&q_rot, c_idx).unwrap();
-            let size = quantiser.storage().cluster_size(c_idx);
-
-            let mut local = 0;
-            while local < size {
-                let take = RABITQ_BLOCK.min(size - local);
-                let mut block = vec![0.0f32; take];
-                let block_min =
-                    quantiser.rabitq_block_sq_fastscan(&encoded, c_idx, local, &mut block);
-
-                for j in 0..take {
-                    // The table rounds to u8 and that error is carried through
-                    // `2 * v_dist * q_dist`, so the bound is relative: the
-                    // estimate tracks the oracle, it does not reproduce it.
-                    approx::assert_relative_eq!(
-                        block[j],
-                        oracle_dist_sq(&quantiser, &q_rot, c_idx, local + j),
-                        max_relative = 0.01,
-                        epsilon = 1e-4
-                    );
-                }
-
-                assert_abs_diff_eq!(
-                    block_min,
-                    block.iter().cloned().fold(f32::INFINITY, f32::min),
-                    epsilon = 1e-6
+            let (est, _) = score_cluster(&quantiser, &prepared, c_idx);
+            for (j, &e) in est.iter().enumerate() {
+                // The table rounds to u8 and that error is carried through
+                // `f_rescale`, so the bound is relative: the estimate tracks
+                // the oracle, it does not reproduce it.
+                approx::assert_relative_eq!(
+                    e,
+                    oracle_dist_sq(&quantiser, &prepared.rotated, c_idx, j),
+                    max_relative = 0.01,
+                    epsilon = 1e-3
                 );
-                local += take;
             }
         }
+    }
+
+    #[test]
+    fn test_factors_reproduce_the_original_estimator() {
+        // `f_add + g_add + f_rescale <s, q>` is the original
+        // `||r||^2 + ||q - c||^2 - 2 ||r|| dci <s, q - c>` with the centroid
+        // term moved into `f_add`. Check the algebra on raw encodings.
+        let dim = 64;
+        let encoder = RaBitQEncoder::<f32>::new(dim, Dist::SquaredEuclidean, 7);
+        let data = clustered_data(20, dim);
+        let centroid: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.11).cos()).collect();
+        let c_rot = encoder.apply_rotation(&centroid);
+        let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.29).sin() * 3.0).collect();
+        let q_rot = encoder.apply_rotation(&query);
+
+        for i in 0..20 {
+            let v: Vec<f32> = data.row(i).iter().cloned().collect();
+            let (code, dist, dci) = encoder.encode_vector(&v, &centroid).unwrap();
+            let p = RaBitQPackedVector::from_code(&code, dist, dci, &c_rot);
+
+            let sign = |x: &[f32]| -> f64 {
+                x.iter()
+                    .enumerate()
+                    .map(|(d, &v)| {
+                        if code[d / 8] >> (d % 8) & 1 == 1 {
+                            v as f64
+                        } else {
+                            -(v as f64)
+                        }
+                    })
+                    .sum()
+            };
+            let res: Vec<f32> = q_rot.iter().zip(&c_rot).map(|(a, b)| a - b).collect();
+            let g_add: f64 = res.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            let (dist, dci) = (dist as f64, dci as f64);
+
+            let original = dist * dist + g_add - 2.0 * dist * dci * sign(&res);
+            let factored = p.f_add as f64 + g_add + p.f_rescale as f64 * sign(&q_rot);
+            approx::assert_relative_eq!(factored, original, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_lower_bound_holds_for_most_vectors() {
+        // The bound is probabilistic: the reference's 1.9 epsilon is about a
+        // 1.9 sigma one-sided interval, so roughly 3% of vectors fall below
+        // it. A halved `f_error` would drop that to ~83%, a sign error
+        // further still.
+        let (n, dim) = (400usize, 128usize);
+        let data = clustered_data(n, dim);
+        let quantiser =
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
+        let storage = quantiser.storage();
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 4.0).collect();
+        let prepared = quantiser.encoder.encode_query(&query).unwrap();
+
+        let (mut held, mut total) = (0usize, 0usize);
+        for c_idx in 0..storage.nlist {
+            let (_, low) = score_cluster(&quantiser, &prepared, c_idx);
+            for (j, &l) in low.iter().enumerate() {
+                let idx = storage.cluster_vector_indices(c_idx)[j] as usize;
+                let truth: f32 = data
+                    .row(idx)
+                    .iter()
+                    .zip(&query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                held += (l <= truth) as usize;
+                total += 1;
+            }
+        }
+        assert!(held as f64 >= 0.95 * total as f64, "{held} / {total}");
     }
 
     /////////////////////

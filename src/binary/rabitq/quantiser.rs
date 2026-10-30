@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
+use crate::binary::rabitq::ex_bits::ERROR_EPSILON;
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, unpack_rabitq_blocked, SignScanQuery, BLOCKED_ARCH,
 };
@@ -200,81 +201,33 @@ where
         }
     }
 
-    /// Encode a query vector relative to a specific cluster
+    /// Prepare a query for scanning any number of clusters
     ///
-    /// Rotates on every call. A scan that probes many clusters should rotate
-    /// the query once and use
-    /// [`encode_query_prerotated`](Self::encode_query_prerotated) instead.
+    /// Rotates once and builds one sign table over the rotated query. The
+    /// table is shared by every probed cluster: the centroid enters the
+    /// estimate only through each vector's `f_add` and the per-cluster
+    /// `||q - c||`, so nothing here depends on which cluster is scanned.
     ///
     /// ### Params
     ///
-    /// * `query` - Query vector
-    /// * `centroid` - The centroid against which to encode the query vector
+    /// * `query` - Query vector, already passed through
+    ///   [`normalise_query`](Self::normalise_query)
     ///
     /// ### Returns
     ///
-    /// Encoded query for distance estimation
+    /// The prepared query, or an error on a dimension mismatch
     #[inline]
-    pub fn encode_query(
-        &self,
-        query: &[T],
-        centroid: &[T],
-    ) -> Result<SignScanQuery<T>, AnnSearchErrors> {
+    pub fn encode_query(&self, query: &[T]) -> Result<SignScanQuery<T>, AnnSearchErrors> {
         self.check_dim(query.len())?;
 
-        let query_norm = self.normalise_query(query);
-
-        let q_rot = self.apply_rotation(&query_norm);
-        let c_rot = self.apply_rotation(centroid);
-
-        self.encode_query_prerotated(&q_rot, &c_rot)
-    }
-
-    /// Encode an already-rotated query against an already-rotated centroid
-    ///
-    /// The rotation is linear and `R` is orthogonal, so
-    /// `R(q - c) / ||q - c||` equals `(Rq - Rc) / ||Rq - Rc||`. Rotating the
-    /// query once per query and the centroids once at build time drops the
-    /// per-cluster cost from a `dim * dim` matvec to three `O(dim)` passes,
-    /// which is what dominates an IVF scan once `nprobe` grows.
-    ///
-    /// ### Params
-    ///
-    /// * `q_rot` - The rotated, metric-normalised query
-    /// * `c_rot` - The rotated centroid of the target cluster
-    ///
-    /// ### Returns
-    ///
-    /// The prepared query, or an error if the table cannot be built
-    #[inline]
-    pub fn encode_query_prerotated(
-        &self,
-        q_rot: &[T],
-        c_rot: &[T],
-    ) -> Result<SignScanQuery<T>, AnnSearchErrors> {
-        debug_assert_eq!(q_rot.len(), self.padded_dim);
-        debug_assert_eq!(c_rot.len(), self.padded_dim);
-
-        let res_rot = T::subtract_simd(q_rot, c_rot);
-        let dist_to_centroid = compute_l2_norm(&res_rot);
-
-        let q_c_rotated: Vec<T> = if dist_to_centroid > T::epsilon() {
-            res_rot.iter().map(|&r| r / dist_to_centroid).collect()
-        } else {
-            vec![T::zero(); self.padded_dim]
-        };
-
+        let rotated = self.apply_rotation(query);
         Ok(SignScanQuery {
-            lut: build_sign_lut(&q_c_rotated)?,
-            dist_to_centroid,
+            lut: build_sign_lut(&rotated)?,
+            rotated,
         })
     }
 
     /// Apply rotation to a vector
-    ///
-    /// Public because the scan paths rotate a query once and then encode it
-    /// against many pre-rotated centroids, see
-    /// [`encode_query_prerotated`](Self::encode_query_prerotated).
     ///
     /// ### Params
     ///
@@ -302,19 +255,88 @@ where
 // RaBitQStorage //
 ///////////////////
 
-/// RaBitQPackedVector
+/// Per-vector estimator factors
 ///
-/// Packed vector representation for RaBitQ encoded vectors for better cache
-/// locality and reduced misses
+/// The squared distance estimate against a query `q` (rotated) whose cluster
+/// centroid is `c` is
+///
+/// ```text
+/// est = f_add + ||q - c||^2 + f_rescale * <sign, q>
+/// low = est - f_error * ||q - c||
+/// ```
+///
+/// with `sign` the `+-1` code. The centroid's own `<sign, c>` is folded into
+/// `f_add`, which is what lets one sign table over `q` serve every cluster.
+/// `low` is the reference's probabilistic lower bound, used to decide which
+/// candidates are worth an exact distance.
 #[repr(C)]
 #[derive(Clone)]
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RaBitQPackedVector<T> {
-    /// Distance to centroid
-    pub dist_to_centroid: T,
-    /// Inverse of the dot correction (`1 / L1 norm` of the rotated unit
-    /// residual), or zero when that norm underflowed
-    pub dot_correction_inv: T,
+    /// Query-independent additive term
+    pub f_add: T,
+    /// Multiplier on the signed query inner product
+    pub f_rescale: T,
+    /// Error bound coefficient, multiplied by `||q - c||` at query time
+    pub f_error: T,
+}
+
+impl<T: Float + FromPrimitive> RaBitQPackedVector<T> {
+    /// Factors from a one-bit encoding
+    ///
+    /// With `r` the residual, `dci = 1 / ||rot(r / ||r||)||_1` and `s` the
+    /// `+-1` code, the original estimator
+    /// `||r||^2 + ||q - c||^2 - 2 ||r|| dci <s, q - c>` splits into the
+    /// query-independent `f_add` and the multiplier `f_rescale`. The error
+    /// coefficient is the reference's 1-bit bound written in the same terms:
+    /// its `||r||^2 ||x||^2 / <r, x>^2` collapses to `D * dci^2` for a sign
+    /// code. Accumulated in f64, the `<s, c>` term is a long signed sum.
+    ///
+    /// ### Params
+    ///
+    /// * `code` - Sign bits, bit `d % 8` of byte `d / 8` set for `+1`
+    /// * `dist_to_centroid` - `||r||`
+    /// * `dot_correction_inv` - `dci`, zero when the L1 norm underflowed
+    /// * `centroid_rotated` - The rotated centroid, `padded_dim` long
+    ///
+    /// ### Returns
+    ///
+    /// The factors
+    pub fn from_code(
+        code: &[u8],
+        dist_to_centroid: T,
+        dot_correction_inv: T,
+        centroid_rotated: &[T],
+    ) -> Self {
+        let padded_dim = centroid_rotated.len() as f64;
+        let ip_centroid: f64 = centroid_rotated
+            .iter()
+            .enumerate()
+            .map(|(d, &c)| {
+                let c = c.to_f64().unwrap_or(0.0);
+                if code[d / 8] >> (d % 8) & 1 == 1 {
+                    c
+                } else {
+                    -c
+                }
+            })
+            .sum();
+
+        let dist = dist_to_centroid.to_f64().unwrap_or(0.0);
+        let dci = dot_correction_inv.to_f64().unwrap_or(0.0);
+        let f_rescale = -2.0 * dist * dci;
+        let f_add = dist * dist - f_rescale * ip_centroid;
+        let f_error = 2.0
+            * ERROR_EPSILON
+            * dist
+            * ((padded_dim * dci * dci - 1.0).max(0.0) / (padded_dim - 1.0).max(1.0)).sqrt();
+
+        Self {
+            f_add: T::from_f64(f_add).unwrap_or_else(T::zero),
+            f_rescale: T::from_f64(f_rescale).unwrap_or_else(T::zero),
+            f_error: T::from_f64(f_error).unwrap_or_else(T::zero),
+        }
+    }
 }
 
 impl<T> RaBitQPackedVector<T> {
@@ -339,7 +361,7 @@ pub struct RaBitQStorage<T> {
     pub centroids_rotated: Vec<T>,
     /// Norms of the centroids
     pub centroids_norm: Vec<T>,
-    /// Per-vector distance to centroid and dot correction
+    /// Per-vector estimator factors
     pub packed_vectors: Vec<RaBitQPackedVector<T>>,
     /// Original indices, ordered by cluster
     pub vector_indices: Vec<u32>,
@@ -492,38 +514,6 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
         &self.packed_vectors[start..end]
     }
 
-    /// Get dist_to_centroid slice for cluster
-    ///
-    /// ### Params
-    ///
-    /// * `cluster_idx` Index position of the cluster
-    ///
-    /// ### Returns
-    ///
-    /// The distance to centroid slice for every vector in this cluster
-    #[inline]
-    pub fn cluster_dist_to_centroid(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
-        self.cluster_packed_data(cluster_idx)
-            .iter()
-            .map(|v| v.dist_to_centroid)
-    }
-
-    /// Get inverse dot_corrections slice for cluster
-    ///
-    /// ### Params
-    ///
-    /// * `cluster_idx` Index position of the cluster
-    ///
-    /// ### Returns
-    ///
-    /// The inverse dot corrections for every vector in this cluster
-    #[inline]
-    pub fn cluster_dot_corrections(&self, cluster_idx: usize) -> impl Iterator<Item = T> + '_ {
-        self.cluster_packed_data(cluster_idx)
-            .iter()
-            .map(|v| v.dot_correction_inv)
-    }
-
     /// Get vector indices for cluster
     ///
     /// ### Params
@@ -647,8 +637,9 @@ where
         centroids_norm,
         packed_vectors: vec![
             RaBitQPackedVector {
-                dist_to_centroid: T::zero(),
-                dot_correction_inv: T::zero(),
+                f_add: T::zero(),
+                f_rescale: T::zero(),
+                f_error: T::zero(),
             };
             n
         ],
@@ -681,10 +672,12 @@ where
         let byte_start = pos * n_bytes;
         codes_flat[byte_start..byte_start + n_bytes].copy_from_slice(&binary);
 
-        storage.packed_vectors[pos] = RaBitQPackedVector {
-            dist_to_centroid: dist,
-            dot_correction_inv: dot_corr,
-        };
+        storage.packed_vectors[pos] = RaBitQPackedVector::from_code(
+            &binary,
+            dist,
+            dot_corr,
+            &storage.centroids_rotated[cluster_idx * padded_dim..(cluster_idx + 1) * padded_dim],
+        );
 
         storage.vector_indices[pos] = vec_idx as u32;
     }
@@ -853,49 +846,6 @@ where
         Ok(Self { encoder, storage })
     }
 
-    /// Encode query relative to a cluster
-    ///
-    /// ### Params
-    ///
-    /// * `query` - The query vector
-    /// * `cluster_idx` - The cluster idx against which to encode the query
-    ///
-    /// ### Returns
-    ///
-    /// The prepared query
-    #[inline]
-    pub fn encode_query(
-        &self,
-        query: &[T],
-        cluster_idx: usize,
-    ) -> Result<SignScanQuery<T>, AnnSearchErrors> {
-        let centroid = self.storage.centroid(cluster_idx);
-        self.encoder.encode_query(query, centroid)
-    }
-
-    /// Encode an already-rotated query relative to a cluster
-    ///
-    /// Rotate the query once with
-    /// [`RaBitQEncoder::apply_rotation`] and call this per probed cluster.
-    ///
-    /// ### Params
-    ///
-    /// * `q_rot` - The rotated, metric-normalised query
-    /// * `cluster_idx` - The cluster idx against which to encode the query
-    ///
-    /// ### Returns
-    ///
-    /// The prepared query
-    #[inline]
-    pub fn encode_query_prerotated(
-        &self,
-        q_rot: &[T],
-        cluster_idx: usize,
-    ) -> Result<SignScanQuery<T>, AnnSearchErrors> {
-        self.encoder
-            .encode_query_prerotated(q_rot, self.storage.centroid_rotated(cluster_idx))
-    }
-
     /// Returns the number of clusters
     ///
     /// ### Returns
@@ -1014,43 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prerotated_encoding_agrees_with_rotate_per_cluster() {
-        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
-            let data = rotation_test_data(200, 32);
-            let q = RaBitQQuantiser::new(data.as_ref(), &metric, Some(6), 42).unwrap();
-
-            let query: Vec<f32> = (0..32).map(|i| (i as f32 * 0.41).cos()).collect();
-            let normalised = q.encoder.normalise_query(&query);
-            let q_rot = q.encoder.apply_rotation(&normalised);
-
-            for c in 0..q.storage.nlist {
-                let slow = q.encode_query(&query, c).unwrap();
-                let fast = q.encode_query_prerotated(&q_rot, c).unwrap();
-
-                // R is orthogonal, so the residual norm survives the change of
-                // frame; everything downstream is derived from it.
-                assert_abs_diff_eq!(slow.dist_to_centroid, fast.dist_to_centroid, epsilon = 1e-4);
-                assert_abs_diff_eq!(slow.lut.scale, fast.lut.scale, epsilon = 1e-6);
-                assert_abs_diff_eq!(slow.lut.bias, fast.lut.bias, epsilon = 1e-4);
-                assert_eq!(slow.lut.luts_u8, fast.lut.luts_u8);
-
-                // What actually matters: the estimated distances agree.
-                let size = q.storage.cluster_size(c);
-                let mut a = vec![0.0f32; size.min(RABITQ_BLOCK)];
-                let mut b = vec![0.0f32; size.min(RABITQ_BLOCK)];
-                if a.is_empty() {
-                    continue;
-                }
-                q.rabitq_block_sq_fastscan(&slow, c, 0, &mut a);
-                q.rabitq_block_sq_fastscan(&fast, c, 0, &mut b);
-                for (x, y) in a.iter().zip(&b) {
-                    assert_abs_diff_eq!(x, y, epsilon = 1e-3);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn test_encoder_creation() {
         let encoder = RaBitQEncoder::<f32>::new(4, Dist::SquaredEuclidean, 42);
         assert_eq!(encoder.dim, 4);
@@ -1124,24 +1037,24 @@ mod tests {
     fn test_encode_query_builds_one_sub_table_per_byte_group() {
         let encoder = RaBitQEncoder::<f32>::new(8, Dist::SquaredEuclidean, 42);
         let query = vec![1.0; 8];
-        let centroid = vec![0.0; 8];
 
-        let encoded = encoder.encode_query(&query, &centroid).unwrap();
+        let encoded = encoder.encode_query(&query).unwrap();
 
         assert_eq!(encoded.lut.n_byte_groups, encoder.n_bytes);
         assert_eq!(encoded.lut.luts_u8.len(), encoder.n_bytes * 32);
     }
 
     #[test]
-    fn test_encode_query_cosine_normalises() {
+    fn test_encode_query_rotates_the_normalised_query() {
         let encoder = RaBitQEncoder::<f32>::new(4, Dist::Cosine, 42);
-        let query = vec![2.0, 0.0, 0.0, 0.0]; // Will be normalised
-        let centroid = vec![0.0; 4];
+        let normalised = encoder.normalise_query(&[2.0, 0.0, 0.0, 0.0]);
 
-        let encoded = encoder.encode_query(&query, &centroid).unwrap();
+        let encoded = encoder.encode_query(&normalised).unwrap();
 
-        // Distance should be 1.0 since normalised query - centroid has norm 1
-        assert_abs_diff_eq!(encoded.dist_to_centroid, 1.0, epsilon = 1e-5);
+        // Unit length in, unit length out: the rotation is orthogonal.
+        let norm = encoded.rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert_abs_diff_eq!(norm, 1.0, epsilon = 1e-5);
+        assert_eq!(encoded.rotated, encoder.apply_rotation(&normalised));
     }
 
     #[test]
@@ -1243,10 +1156,10 @@ mod tests {
             RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, Some(2), 42).unwrap();
 
         let query = vec![0.8, 0.2];
-        let encoded = quantiser.encode_query(&query, 0).unwrap();
+        let encoded = quantiser.encoder.encode_query(&query).unwrap();
 
         assert_eq!(encoded.lut.n_byte_groups, quantiser.encoder.n_bytes);
-        assert!(encoded.dist_to_centroid >= 0.0);
+        assert_eq!(encoded.rotated.len(), quantiser.encoder.padded_dim);
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //!
 //! The RaBitQ estimator only ever needs one query-dependent quantity per stored
 //! vector: `<sign(code), q_rot>`, the signed sum of the rotated query
-//! coordinates picked out by the code's sign bits. The default path gets it by
-//! quantising the query to int4 bit-planes and running an AND-popcount per
-//! vector. This module gets it instead from the FAISS fast-scan trick already
+//! coordinates picked out by the code's sign bits. The reference's
+//! single-vector path gets it by quantising the query to int4 bit-planes and
+//! running an AND-popcount per vector. This module gets it instead from the
+//! FAISS fast-scan trick already
 //! implemented for TurboQuant: a nibble-indexed byte table, scanned 32 vectors
 //! at a time with one `vpshufb` / `vqtbl1q_u8` per byte-group.
 //!
@@ -202,20 +203,20 @@ pub fn unpack_rabitq_blocked(
 // LUT //
 /////////
 
-/// Build the per-query lookup table for one cluster.
+/// Build the per-query lookup table.
 ///
 /// ### Params
 ///
-/// * `q_c_rotated` - The rotated, unit-length query residual, `padded_dim` long
+/// * `q_rotated` - The rotated query, `padded_dim` long
 ///
 /// ### Returns
 ///
 /// The table, or an error if `padded_dim` is not a multiple of eight
-pub fn build_sign_lut<T>(q_c_rotated: &[T]) -> Result<QueryLut, AnnSearchErrors>
+pub fn build_sign_lut<T>(q_rotated: &[T]) -> Result<QueryLut, AnnSearchErrors>
 where
     T: ToPrimitive,
 {
-    let q_f32: Vec<f32> = q_c_rotated
+    let q_f32: Vec<f32> = q_rotated
         .iter()
         .map(|x| x.to_f32().unwrap_or(0.0))
         .collect();
@@ -223,16 +224,17 @@ where
     build_query_lut(&q_f32, &SIGN_LEVELS, RABITQ_BITS, q_f32.len())
 }
 
-/// A query prepared for one cluster's fast-scan.
+/// A query prepared for fast-scan, shared by every cluster.
 ///
 /// The table hands back the signed inner product directly, so there are no
 /// bit-planes, quantisation bounds or quantised sum to carry: the counting
 /// corrections those would exist for fall away with them.
 pub struct SignScanQuery<T> {
-    /// Nibble table over the rotated query residual
+    /// Nibble table over the rotated query
     pub lut: QueryLut,
-    /// `||q - c||` in the rotated frame
-    pub dist_to_centroid: T,
+    /// The rotated, metric-normalised query, `padded_dim` long. Each probed
+    /// cluster needs `||q - c||` from it.
+    pub rotated: Vec<T>,
 }
 
 /////////////

@@ -6,7 +6,6 @@ use faer::RowRef;
 use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
 use std::iter::Sum;
 use std::path::Path;
 use thousands::*;
@@ -525,73 +524,22 @@ where
             .min(self.storage.nlist);
         let k = k.min(self.n);
 
-        // Normalise query for cosine
-        let (query_normalised, _): (Vec<T>, T) = match self.encoder.metric {
-            Dist::Cosine => {
-                let norm = compute_l2_norm(query_vec);
-                if norm > T::epsilon() {
-                    (query_vec.iter().map(|&x| x / norm).collect(), norm)
-                } else {
-                    (query_vec.to_vec(), T::one())
-                }
-            }
-            Dist::SquaredEuclidean => (query_vec.to_vec(), T::one()),
-            Dist::Manhattan => unreachable!(),
-        };
+        let query_normalised = self.encoder.normalise_query(query_vec);
 
-        // Use trait method - prenorm version since we've already normalised.
         // Expand nprobe to cover >= k reachable vectors so the query never
         // short-returns due to small/empty cells.
         let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
         let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
 
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+        let query = self.encoder.encode_query(&query_normalised)?;
 
         // The heap ranks on *squared* distance: the square root is monotone, so
         // it only needs applying to the k survivors.
-        let mut block = [T::zero(); RABITQ_BLOCK];
-
-        // One rotation per query, not one per probed cluster
-        let q_rot = self.encoder.apply_rotation(&query_normalised);
-
-        for c_idx in probed {
-            let query_encoded = self
-                .encoder
-                .encode_query_prerotated(&q_rot, self.storage.centroid_rotated(c_idx))?;
-            let cluster_size = self.storage.cluster_size(c_idx);
-            let indices = self.storage.cluster_vector_indices(c_idx);
-
-            let mut local_idx = 0;
-            while local_idx < cluster_size {
-                let take = RABITQ_BLOCK.min(cluster_size - local_idx);
-                let block_min = self.rabitq_block_sq_fastscan(
-                    &query_encoded,
-                    c_idx,
-                    local_idx,
-                    &mut block[..take],
-                );
-
-                if heap.len() < k || block_min < heap.peek().unwrap().0 .0 {
-                    for (j, &dist) in block[..take].iter().enumerate() {
-                        let global_idx = indices[local_idx + j] as usize;
-
-                        if heap.len() < k {
-                            heap.push((OrderedFloat(dist), global_idx));
-                        } else if dist < heap.peek().unwrap().0 .0 {
-                            heap.pop();
-                            heap.push((OrderedFloat(dist), global_idx));
-                        }
-                    }
-                }
-
-                local_idx += take;
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable();
-
-        Ok(results.into_iter().map(|(d, i)| (i, d.0.sqrt())).unzip())
+        Ok(self
+            .rabitq_scan(&query, &probed, k, None::<fn(usize) -> T>)
+            .into_iter()
+            .map(|(d, i)| (i, d.0.sqrt()))
+            .unzip())
     }
 
     /// Query using a row reference
@@ -684,6 +632,64 @@ where
         }
 
         Ok((indices, dists))
+    }
+
+    /// Query with exact distances where the estimate's bound requires them
+    ///
+    /// One pass: every candidate whose lower bound beats the current `k`-th
+    /// exact distance is scored exactly from the vector store, see
+    /// [`VectorDistanceRaBitQ::rabitq_scan`]. No shortlist size to pick.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of IVF cells to probe. If None, uses sqrt(nlist)
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of (indices, distances)
+    #[inline]
+    pub fn query_reranking_bounded(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        nprobe: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let vector_store = self
+            .vector_store
+            .as_ref()
+            .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
+
+        let nprobe = nprobe
+            .unwrap_or_else(|| ((self.storage.nlist as f64).sqrt() as usize).max(1))
+            .min(self.storage.nlist);
+        let k = k.min(self.n);
+
+        let query_normalised = self.encoder.normalise_query(query_vec);
+        let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
+        let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
+        let query = self.encoder.encode_query(&query_normalised)?;
+
+        // The estimate lives in the normalised space for cosine, where the
+        // squared distance is twice the cosine distance.
+        let metric = self.encoder.metric;
+        let query_norm = compute_l2_norm(query_vec);
+        let two = T::one() + T::one();
+        let exact = |idx: usize| match metric {
+            Dist::Cosine => two * vector_store.cosine_distance_to_query(idx, query_vec, query_norm),
+            Dist::SquaredEuclidean => vector_store.euclidean_distance_to_query(idx, query_vec),
+            Dist::Manhattan => unreachable!(),
+        };
+
+        Ok(self
+            .rabitq_scan(&query, &probed, k, Some(exact))
+            .into_iter()
+            .map(|(d, i)| match metric {
+                Dist::Cosine => (i, d.0 / two),
+                _ => (i, d.0),
+            })
+            .unzip())
     }
 
     /// Query row with reranking using exact distances
@@ -1144,5 +1150,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(index.storage.nlist, 10);
+    }
+    #[test]
+    fn test_bounded_reranking_matches_a_full_rerank() {
+        // Probing every cluster, a shortlist covering the whole dataset is the
+        // exact answer. The bound is probabilistic, so allow a near-tie or two
+        // to differ, but the distances must agree almost everywhere.
+        let (n, dim, k) = (400usize, 64usize, 10usize);
+        let data = Mat::from_fn(n, dim, |i, j| {
+            let x = ((i * 7919 + j * 104_729) % 1009) as f32 / 1009.0;
+            x + (i % 5) as f32 * 0.5
+        });
+
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let temp_dir = TempDir::new().unwrap();
+            let index = IvfIndexRaBitQ::build_with_vector_store(
+                data.as_ref(),
+                metric,
+                Some(8),
+                get_default_k_means(),
+                42,
+                Verbosity::Quiet,
+                temp_dir.path(),
+                StoreEncoding::Full,
+            )
+            .unwrap();
+
+            let mut agree = 0;
+            for qi in 0..20 {
+                let query: Vec<f32> = data.row(qi * 13).iter().map(|x| x + 0.01).collect();
+                let (_, full) = index
+                    .query_reranking(&query, k, Some(8), Some(n / k))
+                    .unwrap();
+                let (_, bounded) = index.query_reranking_bounded(&query, k, Some(8)).unwrap();
+
+                assert_eq!(bounded.len(), k);
+                assert!(bounded.windows(2).all(|w| w[0] <= w[1]));
+                agree += full
+                    .iter()
+                    .zip(&bounded)
+                    .filter(|(a, b)| (*a - *b).abs() <= 1e-4 * a.abs().max(1.0))
+                    .count();
+            }
+            assert!(
+                agree >= 20 * k * 95 / 100,
+                "{metric:?}: {agree} / {}",
+                20 * k
+            );
+        }
     }
 }

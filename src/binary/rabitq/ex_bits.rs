@@ -30,7 +30,7 @@ pub const MAX_EX_BITS: usize = 8;
 ///
 /// Chosen there so the bound holds with high probability rather than
 /// absolutely; it is not derived from the data.
-const ERROR_EPSILON: f64 = 1.9;
+pub(crate) const ERROR_EPSILON: f64 = 1.9;
 
 /// Fraction of the scale interval the sweep starts from, per `ex_bits`.
 ///
