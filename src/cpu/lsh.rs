@@ -1182,7 +1182,12 @@ where
                 }
 
                 let (indices, dists, fallback) = self.self_query_at(vec_idx, k, max_cand, n_probes);
-                (self.original_ids[vec_idx] as usize, indices, dists, fallback)
+                (
+                    self.original_ids[vec_idx] as usize,
+                    indices,
+                    dists,
+                    fallback,
+                )
             })
             .collect();
 

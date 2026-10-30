@@ -629,7 +629,8 @@ where
         }
 
         let nnd_start = Instant::now();
-        let knn_params = NNDescentKnnParams::new(params.knn_k, None, None, None, 0.001, false, true);
+        let knn_params =
+            NNDescentKnnParams::new(params.knn_k, None, None, None, 0.001, false, true);
         let nnd = NNDescent::<T>::build_graph_only(data, metric, knn_params, seed, verbose);
         if verbose {
             println!(

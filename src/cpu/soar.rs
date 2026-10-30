@@ -323,8 +323,9 @@ where
         // lists are built by walking the new order directly.
         let mut new_to_old: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            new_to_old
-                .extend_from_slice(&all_indices[offsets[cluster] as usize..offsets[cluster + 1] as usize]);
+            new_to_old.extend_from_slice(
+                &all_indices[offsets[cluster] as usize..offsets[cluster + 1] as usize],
+            );
         }
 
         let mut reordered = Vec::with_capacity(vectors_flat.len());
@@ -344,7 +345,10 @@ where
 
         // Spill lists index the *reordered* rows, so translate the secondary
         // assignment out of caller-id space on the way in.
-        let spill_assign: Vec<u32> = new_to_old.iter().map(|&old| secondary[old as usize]).collect();
+        let spill_assign: Vec<u32> = new_to_old
+            .iter()
+            .map(|&old| secondary[old as usize])
+            .collect();
         let (spill_members, spill_offsets) = invert_assignments_csr(&spill_assign, n, 1, nlist);
 
         // Primary cell of every reordered row, from the contiguous ranges.
@@ -832,11 +836,7 @@ mod tests {
                 &Dist::SquaredEuclidean,
             );
             for i in 0..n {
-                assert_ne!(
-                    sec[i], primary[i],
-                    "rule {:?} collided at {}",
-                    rule, i
-                );
+                assert_ne!(sec[i], primary[i], "rule {:?} collided at {}", rule, i);
             }
         }
     }

@@ -210,9 +210,14 @@ fn main() {
         ..Default::default()
     };
     let start = Instant::now();
-    let cpu_graph =
-        build_knn_graph_nndescent(data.as_ref(), &cli.distance, Some(params), cli.seed as usize, false)
-            .unwrap();
+    let cpu_graph = build_knn_graph_nndescent(
+        data.as_ref(),
+        &cli.distance,
+        Some(params),
+        cli.seed as usize,
+        false,
+    )
+    .unwrap();
     let cpu_build = start.elapsed().as_secs_f64() * 1000.0;
 
     check_graph(&label, &cpu_graph);

@@ -469,7 +469,8 @@ fn main() {
                     cli.alpha_pass2,
                     &cli.distance,
                     cli.seed as usize,
-                ).unwrap();
+                )
+                .unwrap();
                 println!(
                     "degree {}, l_build {} (built in {:.2?})",
                     degree,

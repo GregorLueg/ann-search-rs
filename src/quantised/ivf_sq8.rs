@@ -372,7 +372,9 @@ where
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
 
         for &cluster_idx in probed {
-            for vec_idx in self.offsets[cluster_idx] as usize..self.offsets[cluster_idx + 1] as usize {
+            for vec_idx in
+                self.offsets[cluster_idx] as usize..self.offsets[cluster_idx + 1] as usize
+            {
                 let s = score(vec_idx);
                 if heap.len() < k {
                     heap.push((OrderedFloat(s), vec_idx));

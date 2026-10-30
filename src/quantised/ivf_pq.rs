@@ -297,7 +297,8 @@ where
             .for_each(|(vec_idx, (chunk, &cluster_id))| {
                 let vec_start = vec_idx * dim;
                 let vec = &vectors_flat[vec_start..vec_start + dim];
-                let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
+                let centroid =
+                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
 
                 let residual = T::subtract_simd(vec, centroid);
 

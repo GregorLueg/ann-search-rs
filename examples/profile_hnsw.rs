@@ -232,7 +232,8 @@ fn main() {
             &cli.distance,
             cli.seed as usize,
             false,
-        ).unwrap();
+        )
+        .unwrap();
         println!("Build {}: {:.2?}", run + 1, start.elapsed());
         index = Some(built);
     }

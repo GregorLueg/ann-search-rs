@@ -74,13 +74,7 @@ where
     let pid_mask = SENTINEL_PID as u32;
     let sentinel = SENTINEL_PID;
 
-    let mut knn_graph = vec![
-        (
-            SENTINEL_PID as u32,
-            <T as num_traits::Float>::max_value()
-        );
-        n * k
-    ];
+    let mut knn_graph = vec![(SENTINEL_PID as u32, <T as num_traits::Float>::max_value()); n * k];
 
     knn_graph
         .par_chunks_mut(k)

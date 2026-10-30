@@ -1041,7 +1041,10 @@ mod device_tests {
     fn recall_at_k(got: &[(u32, f32)], truth: &[Vec<usize>], n: usize, k: usize) -> f64 {
         let mut hits = 0usize;
         for i in 0..n {
-            let row: Vec<usize> = got[i * k..(i + 1) * k].iter().map(|e| e.0 as usize).collect();
+            let row: Vec<usize> = got[i * k..(i + 1) * k]
+                .iter()
+                .map(|e| e.0 as usize)
+                .collect();
             hits += truth[i].iter().filter(|t| row.contains(t)).count();
         }
         hits as f64 / (n * k) as f64
@@ -1152,7 +1155,10 @@ mod device_tests {
         for i in 0..n {
             assert_eq!(g.row(i)[0], i as u32);
             assert_eq!(dists[i * g.k], 0.0);
-            assert!(!g.row(i)[1..].contains(&(i as u32)), "row {i} repeats itself");
+            assert!(
+                !g.row(i)[1..].contains(&(i as u32)),
+                "row {i} repeats itself"
+            );
             let row_d = &dists[i * g.k..(i + 1) * g.k];
             assert!(row_d.windows(2).all(|w| w[0] <= w[1]), "row {i} unsorted");
         }
@@ -1317,11 +1323,7 @@ mod device_tests {
             // Guard the silent-zero failure mode before trusting recall: every
             // launch here is `launch_unchecked`, so a cluster that busts a
             // limit returns zeros and reports nothing.
-            let filled = graph
-                .knn_graph
-                .iter()
-                .filter(|e| e.0 != SENTINEL)
-                .count();
+            let filled = graph.knn_graph.iter().filter(|e| e.0 != SENTINEL).count();
             assert_eq!(
                 filled,
                 n * k,
@@ -1405,17 +1407,16 @@ mod device_tests {
         )
         .unwrap();
 
-        let filled = graph
-            .knn_graph
-            .iter()
-            .filter(|e| e.0 != SENTINEL)
-            .count();
+        let filled = graph.knn_graph.iter().filter(|e| e.0 != SENTINEL).count();
         assert_eq!(filled, n * k);
         // Rows stay sorted ascending, which the merge is responsible for.
         for i in 0..n {
             let row = &graph.knn_graph[i * k..(i + 1) * k];
             assert!(row.windows(2).all(|w| w[0].1 <= w[1].1), "row {i} unsorted");
-            assert!(row.iter().all(|e| e.0 as usize != i), "row {i} contains itself");
+            assert!(
+                row.iter().all(|e| e.0 as usize != i),
+                "row {i} contains itself"
+            );
         }
     }
 }

@@ -739,7 +739,8 @@ where
                         for &c in row {
                             let c = c as usize;
                             chosen.push(c);
-                            reachable += (self.cluster_offsets[c + 1] - self.cluster_offsets[c]) as usize;
+                            reachable +=
+                                (self.cluster_offsets[c + 1] - self.cluster_offsets[c]) as usize;
                             if chosen.len() >= nprobe && reachable >= k {
                                 break;
                             }
@@ -1287,7 +1288,7 @@ mod tests {
         let mut sizes: Vec<usize> = index
             .cluster_offsets
             .windows(2)
-                .map(|w| (w[1] - w[0]) as usize)
+            .map(|w| (w[1] - w[0]) as usize)
             .collect();
         sizes.sort_unstable();
 

@@ -202,7 +202,8 @@ where
 
         let mut new_to_old = Vec::with_capacity(n);
         for c in 0..nlist {
-            new_to_old.extend_from_slice(&all_indices[offsets[c] as usize..offsets[c + 1] as usize]);
+            new_to_old
+                .extend_from_slice(&all_indices[offsets[c] as usize..offsets[c + 1] as usize]);
         }
         let mut new_vectors_flat = Vec::with_capacity(n * dim);
         for &old_id in &new_to_old {

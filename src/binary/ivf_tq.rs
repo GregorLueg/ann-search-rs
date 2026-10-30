@@ -271,7 +271,11 @@ where
 
         // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
         let norms_f32_csr: Vec<f32> = (0..n)
-            .map(|s| quantiser.storage.norms[vector_indices[s] as usize].to_f32().unwrap())
+            .map(|s| {
+                quantiser.storage.norms[vector_indices[s] as usize]
+                    .to_f32()
+                    .unwrap()
+            })
             .collect();
         let corrections_f32_csr: Vec<f32> = (0..n)
             .map(|s| {

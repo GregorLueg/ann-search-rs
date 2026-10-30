@@ -3069,14 +3069,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments,
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3138,14 +3131,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments,
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3175,14 +3161,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments,
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3240,14 +3219,7 @@ mod tests {
         let init = vec![-5.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments,
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert_relative_eq!(got[j], want[j], max_relative = 1e-4);

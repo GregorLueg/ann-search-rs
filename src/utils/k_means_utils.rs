@@ -3463,11 +3463,7 @@ where
 /// ### Returns
 ///
 /// Tuple of (all_indices, offsets) for CSR access
-pub fn build_csr_layout(
-    assignments: Vec<u32>,
-    n: usize,
-    nlist: usize,
-) -> (Vec<u32>, Vec<u32>) {
+pub fn build_csr_layout(assignments: Vec<u32>, n: usize, nlist: usize) -> (Vec<u32>, Vec<u32>) {
     let mut offsets = vec![0u32; nlist + 1];
     for &cluster in &assignments {
         offsets[cluster as usize + 1] += 1;

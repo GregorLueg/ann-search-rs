@@ -924,7 +924,9 @@ mod tests {
                 let primary = idx.primary_pos[id] as usize;
                 // Cell owning the primary position.
                 let cell = (0..nlist)
-                    .find(|&c| primary >= idx.offsets[c] as usize && primary < idx.offsets[c + 1] as usize)
+                    .find(|&c| {
+                        primary >= idx.offsets[c] as usize && primary < idx.offsets[c + 1] as usize
+                    })
                     .unwrap();
                 let table = idx.build_lookup_tables_residual(q, cell);
                 let from_primary = idx.compute_distance_adc(primary, &table);

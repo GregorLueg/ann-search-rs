@@ -284,19 +284,22 @@ where
 
         let distances = return_dist.then(|| {
             let mut dists = vec![T::max_value(); n * k];
-            dists.par_chunks_mut(k.max(1)).enumerate().for_each(|(i, row)| {
-                let mut j = 0;
-                if include_self {
-                    row[0] = T::zero();
-                    j = 1;
-                }
-                for &(pid, dist) in &graph[i * k_in..(i + 1) * k_in] {
-                    if pid != SENTINEL_PID as u32 {
-                        row[j] = dist;
-                        j += 1;
+            dists
+                .par_chunks_mut(k.max(1))
+                .enumerate()
+                .for_each(|(i, row)| {
+                    let mut j = 0;
+                    if include_self {
+                        row[0] = T::zero();
+                        j = 1;
                     }
-                }
-            });
+                    for &(pid, dist) in &graph[i * k_in..(i + 1) * k_in] {
+                        if pid != SENTINEL_PID as u32 {
+                            row[j] = dist;
+                            j += 1;
+                        }
+                    }
+                });
             dists
         });
 

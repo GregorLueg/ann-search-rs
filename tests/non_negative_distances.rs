@@ -297,7 +297,8 @@ fn soar_cosine_is_non_negative() {
 #[test]
 fn vamana_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_vamana_index((&data[..], n, dim), 16, 60, None, 1.0, 1.2, "cosine", 42).unwrap();
+    let index =
+        build_vamana_index((&data[..], n, dim), 16, 60, None, 1.0, 1.2, "cosine", 42).unwrap();
 
     let (_, self_d) = query_vamana_self(&index, K, None, true, false).unwrap();
     assert_non_negative("vamana self", &self_d);

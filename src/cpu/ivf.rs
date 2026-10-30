@@ -405,7 +405,11 @@ where
         heap.sort();
 
         let distances = heap.dists().to_vec();
-        let indices = heap.ids().iter().map(|i| self.original_ids[*i] as usize).collect();
+        let indices = heap
+            .ids()
+            .iter()
+            .map(|i| self.original_ids[*i] as usize)
+            .collect();
 
         Ok((indices, distances))
     }
