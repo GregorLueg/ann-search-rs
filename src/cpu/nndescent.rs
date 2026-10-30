@@ -1004,12 +1004,13 @@ pub struct NNDescent<T> {
     metric: Dist,
     /// Forest used for graph initialisation and query entry points. Annoy for
     /// Euclidean/Cosine, Kd for Manhattan. Trees only: leaf ids are original
-    /// ids and distances use `vectors_flat`. `None` only inside
-    /// [`NNDescent::knn_graph`], which never hands the struct out.
+    /// ids and distances use `vectors_flat`. `None` only for the graph-only
+    /// build, [`NNDescent::build_graph_only`], whose callers take the struct
+    /// apart and never hand it out.
     forest: Option<Forest<T>>,
     /// Flat kNN graph of size `n * k`, sorted per node, undiversified. What
     /// `extract_knn`, `graph()` and NSG read.
-    graph: Vec<(u32, T)>,
+    pub(crate) graph: Vec<(u32, T)>,
     /// Flat id-only adjacency of size `n * k` the query walks: the diversified
     /// graph when `diversify_prob > 0`, otherwise the ids of `graph`.
     /// Sentinel-padded. Queries never read the stored distances, so they are
@@ -1410,12 +1411,8 @@ where
 
     /// Build only the kNN graph: matrix in, graph out, nothing retained.
     ///
-    /// Seeds by leaf co-membership from trees that are dropped as soon as
-    /// they are joined (see [`Self::init_with_streamed_trees`]), runs the
-    /// descent and returns the graph flat. No forest, query graph or index
-    /// survives the call. The seeding matches [`Self::new`], Annoy trees for
-    /// Euclidean and Cosine and Kd trees for Manhattan, so the same seed and
-    /// trees give the same graph.
+    /// See [`Self::build_graph_only`]; this flattens its graph and drops the
+    /// rest.
     ///
     /// ### Params
     ///
@@ -1435,6 +1432,45 @@ where
         seed: usize,
         verbose: bool,
     ) -> KnnGraph<T> {
+        let nnd = Self::build_graph_only(data, metric, params, seed, verbose);
+        KnnGraph::from_rows(
+            &nnd.graph,
+            nnd.n,
+            nnd.k,
+            params.include_self,
+            params.return_dist,
+        )
+    }
+
+    /// Run the descent without building an index around it.
+    ///
+    /// Seeds by leaf co-membership from trees that are dropped as soon as
+    /// they are joined (see [`Self::init_with_streamed_trees`]) and runs the
+    /// descent. The seeding matches [`Self::new`], Annoy trees for Euclidean
+    /// and Cosine and Kd trees for Manhattan, so the same seed and trees give
+    /// the same graph. The returned struct holds the vectors, norms and kNN
+    /// graph but no forest or query graph, so it cannot be queried: callers
+    /// take it apart.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Data matrix (samples x features)
+    /// * `metric` - Distance metric
+    /// * `params` - Build parameters; `include_self` and `return_dist` are
+    ///   ignored
+    /// * `seed` - Random seed
+    /// * `verbose` - Print progress
+    ///
+    /// ### Returns
+    ///
+    /// The forest-less struct with `graph` filled.
+    pub(crate) fn build_graph_only(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        params: NNDescentKnnParams,
+        seed: usize,
+        verbose: bool,
+    ) -> Self {
         let (vectors_flat, n, dim) = data.into_row_major();
         let norms = if metric == Dist::Cosine {
             (0..n)
@@ -1451,7 +1487,7 @@ where
             params.n_trees,
         );
 
-        let builder = NNDescent {
+        let mut builder = NNDescent {
             vectors_flat,
             dim,
             n,
@@ -1475,7 +1511,7 @@ where
             println!("Seeded graph from streamed trees: {:.2?}", timings.seed);
         }
 
-        let (graph, _) = builder.generate_index(
+        let (graph, converged) = builder.generate_index(
             seeded,
             k,
             max_iter,
@@ -1485,12 +1521,9 @@ where
             timings,
             verbose,
         );
-        let graph: Vec<(u32, T)> = graph
-            .into_iter()
-            .map(|nb| (nb.pid(), nb.dist))
-            .collect();
-
-        KnnGraph::from_rows(&graph, n, k, params.include_self, params.return_dist)
+        builder.graph = graph.into_iter().map(|nb| (nb.pid(), nb.dist)).collect();
+        builder.converged = converged;
+        builder
     }
 
     /// Forest search for entry points, scored against the index's vectors.

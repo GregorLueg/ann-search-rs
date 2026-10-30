@@ -602,7 +602,9 @@ where
     /// Build an NSG index by first constructing an internal NN-Descent kNN
     /// graph, then refining it via MRNG pruning and DFS connectivity fix.
     ///
-    /// The kNN graph is discarded once the NSG is built.
+    /// The descent runs graph-only (no forest or query graph), and the
+    /// vectors move into the NSG rather than being copied. The kNN graph is
+    /// discarded once the NSG is built.
     ///
     /// ### Params
     ///
@@ -627,18 +629,8 @@ where
         }
 
         let nnd_start = Instant::now();
-        let nnd = NNDescent::<T>::new(
-            data,
-            metric,
-            Some(params.knn_k),
-            None,
-            None,
-            None,
-            T::from_f64(0.001).unwrap(),
-            T::zero(),
-            seed,
-            verbose,
-        )?;
+        let knn_params = NNDescentKnnParams::new(params.knn_k, None, None, None, 0.001, false, true);
+        let nnd = NNDescent::<T>::build_graph_only(data, metric, knn_params, seed, verbose);
         if verbose {
             println!(
                 "NSG timing: NN-Descent build = {:.1} ms",
@@ -646,7 +638,27 @@ where
             );
         }
 
-        Self::build_from_nndescent(&nnd, params, seed, verbose)
+        let NNDescent {
+            vectors_flat,
+            n,
+            dim,
+            k,
+            norms,
+            graph,
+            ..
+        } = nnd;
+        Self::build_from_knn(
+            vectors_flat,
+            n,
+            dim,
+            norms,
+            metric,
+            &graph,
+            k,
+            params,
+            seed,
+            verbose,
+        )
     }
 
     /// Build an NSG index reusing an already-built NN-Descent index as the
