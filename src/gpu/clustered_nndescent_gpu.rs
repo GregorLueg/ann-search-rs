@@ -30,6 +30,7 @@ use crate::utils::k_means_utils::{
     assign_all_parallel_top_m, invert_assignments_csr, sample_vectors,
 };
 use crate::utils::nndescent_utils::SENTINEL_PID;
+use crate::utils::verbosity::BuildLog;
 
 /// [`SENTINEL_PID`] as stored in the `u32` global graph.
 const SENTINEL: u32 = SENTINEL_PID as u32;
@@ -350,7 +351,8 @@ fn merge_cluster_into_global<T>(
 /// * `refine_knn` - Two-hop refinement sweeps per cluster
 /// * `cluster_params` - Optional [`ClusteredBuildParams`]
 /// * `seed` - RNG seed for reproducibility
-/// * `verbose` - Print per-cluster progress
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the k-means,
+///   the partition and one line per cluster
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -380,7 +382,7 @@ pub fn build_clustered_knn_graph_gpu<T>(
     refine_knn: Option<usize>,
     cluster_params: Option<ClusteredBuildParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
@@ -418,9 +420,6 @@ where
     // One cluster means the whole dataset fits, and the batching is then pure
     // overhead: the overlap alone doubles the work.
     if n_clusters == 1 {
-        if verbose {
-            println!("Clustered kNN-Graph-GPU: dataset fits one batch, building directly.");
-        }
         // Hand over the buffer we already flattened. `FlattenData` converts by
         // identity, so this costs nothing.
         return crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
@@ -434,12 +433,13 @@ where
             rho,
             refine_knn,
             seed,
-            verbose,
+            verbosity,
             device,
         );
     }
 
-    let start = Instant::now();
+    let log = BuildLog::new("clustered NNDescent-GPU kNN graph", verbosity);
+    let detailed = verbosity.detailed_verbosity();
     let use_cosine = metric == Dist::Cosine;
 
     let norms: Vec<T> = if use_cosine {
@@ -451,10 +451,9 @@ where
         Vec::new()
     };
 
-    if verbose {
+    if detailed {
         println!(
-            "Clustered kNN-Graph-GPU: {} vectors, dim={}, k={}, build_k={}, {} clusters, {} \
-             assignments per point",
+            " {} vectors, dim {}, k = {}, build_k = {}, {} clusters, {} assignments per point",
             n.separate_with_underscores(),
             dim,
             k,
@@ -487,6 +486,7 @@ where
         .kmeans
         .unwrap_or_else(|| KMeansGpuParams::default().with_balancing(true));
 
+    let start = Instant::now();
     let centroids = train_centroids_gpu::<T>(
         &training_data,
         dim,
@@ -496,8 +496,16 @@ where
         Some(kmeans_params),
         seed,
         &client,
-        verbose,
+        Verbosity::Quiet,
     )?;
+    if detailed {
+        println!(
+            " Trained k-means ({} centroids, {} samples) in {:.2?}",
+            n_clusters.separate_with_underscores(),
+            n_train.separate_with_underscores(),
+            start.elapsed()
+        );
+    }
 
     // ---- Partition ----
 
@@ -511,6 +519,7 @@ where
 
     // `norms` is empty on the Euclidean path, which is fine: only the cosine
     // arm of the assignment indexes it.
+    let start = Instant::now();
     let assignments = assign_all_parallel_top_m(
         &vectors_flat,
         &norms,
@@ -525,16 +534,26 @@ where
 
     let (members, offsets) = invert_assignments_csr(&assignments, n, n_assign, n_clusters);
 
-    if verbose {
+    if detailed {
         let sizes: Vec<usize> = (0..n_clusters)
             .map(|c| (offsets[c + 1] - offsets[c]) as usize)
             .collect();
         println!(
-            "  Partitioned in {:.2?}: cluster sizes {} .. {} (mean {})",
+            " Partitioned in {:.2?}: cluster sizes {} .. {} (mean {})",
             start.elapsed(),
-            sizes.iter().min().copied().unwrap_or(0),
-            sizes.iter().max().copied().unwrap_or(0),
-            (n * n_assign) / n_clusters,
+            sizes
+                .iter()
+                .min()
+                .copied()
+                .unwrap_or(0)
+                .separate_with_underscores(),
+            sizes
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .separate_with_underscores(),
+            ((n * n_assign) / n_clusters).separate_with_underscores(),
         );
     }
 
@@ -597,7 +616,7 @@ where
             &cfg,
             &client,
             &limits,
-            false,
+            Verbosity::Quiet,
         )?;
         converged &= cluster_converged;
 
@@ -610,9 +629,9 @@ where
             cfg.build_k,
         );
 
-        if verbose {
+        if detailed {
             println!(
-                "  Cluster {}/{}: {} points, {:.2?}{}",
+                "  Cluster {} / {}: {} points in {:.2?}{}",
                 c + 1,
                 n_clusters,
                 m.separate_with_underscores(),
@@ -626,15 +645,15 @@ where
         }
     }
 
-    if verbose {
+    if detailed {
         let filled = global.iter().filter(|e| e.0 != SENTINEL).count();
         println!(
-            "  Total build time: {:.2?} ({} of {} graph slots filled)",
-            start.elapsed(),
+            " Merged graph: {} of {} slots filled",
             filled.separate_with_underscores(),
             (n * k).separate_with_underscores(),
         );
     }
+    log.finish();
 
     Ok(KnnGraphGpu {
         vectors_flat,
@@ -1075,7 +1094,7 @@ mod device_tests {
             None,
             Some(params),
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1091,7 +1110,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1146,7 +1165,7 @@ mod device_tests {
             Some(params),
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1174,7 +1193,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1216,7 +1235,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1243,7 +1262,7 @@ mod device_tests {
             Some(KMeansGpuParams::default().with_balancing(true)),
             7,
             &client,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1262,7 +1281,8 @@ mod device_tests {
             graph_idx,
             graph_dist,
             ..
-        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false).unwrap();
+        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, Verbosity::Quiet)
+            .unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
         let mut global = vec![(SENTINEL, f32::MAX); n * k];
@@ -1294,7 +1314,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1315,7 +1335,7 @@ mod device_tests {
                 None,
                 Some(params),
                 7,
-                false,
+                Verbosity::Quiet,
                 device.clone().into(),
             )
             .unwrap();
@@ -1402,7 +1422,7 @@ mod device_tests {
             None,
             Some(params),
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();

@@ -7,8 +7,6 @@ use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::binary::binariser::*;
@@ -16,6 +14,8 @@ use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 ////////////////////
 // IvfIndexBinary //
@@ -138,7 +138,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -152,8 +152,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -165,18 +166,12 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!(
-                "  Generating IVF-Binary index with {} Voronoi cells.",
-                nlist
-            );
-        }
-
         // 1. subsample for training if needed
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
+        let start = Instant::now();
         let centroids_float = train_centroids(
             &training_data,
             dim,
@@ -185,8 +180,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -269,6 +272,8 @@ where
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
+        log.finish();
+
         Ok(idx)
     }
 
@@ -290,7 +295,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Directory to save vector store files
     ///
     /// ### Returns
@@ -305,9 +310,10 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -319,18 +325,12 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!(
-                "  Generating IVF-Binary index with {} Voronoi cells.",
-                nlist
-            );
-        }
-
         // 1. subsample for training if needed
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
+        let start = Instant::now();
         let centroids_float = train_centroids(
             &training_data,
             dim,
@@ -339,8 +339,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             centroids_float
@@ -439,6 +447,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -789,7 +799,7 @@ where
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
     /// * `rerank_factor` - Multiplier for candidate set (only used if vector_store available)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -800,9 +810,9 @@ where
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-Binary index", self.n, true, verbosity);
 
         if let Some(vector_store) = &self.vector_store {
             let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -811,21 +821,13 @@ where
                     let orig_id = self.original_ids[i] as usize;
                     let vec = vector_store.load_vector(orig_id);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
                     let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor)?;
                     Ok((orig_id, indices, dists))
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+            progress.finish();
 
             let mut final_indices = vec![Vec::new(); self.n];
             let mut final_dists = if return_dist {
@@ -852,16 +854,7 @@ where
                     let query_binary = &self.vectors_flat_binarised[start..start + self.n_bytes];
                     let k = k.min(self.n);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
                     let mut block = [0u32; HAMMING_BLOCK];
@@ -898,6 +891,7 @@ where
                     }
 
                     let mut results: Vec<_> = heap.into_iter().collect();
+                    progress.finish();
                     results.sort_unstable_by_key(|&(dist, _)| dist);
 
                     let (distances, indices): (Vec<_>, Vec<_>) = results
@@ -1090,7 +1084,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1125,11 +1119,13 @@ mod tests {
             Some(8),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, _) = index.generate_knn(k, Some(4), None, false, false).unwrap();
+        let (indices, _) = index
+            .generate_knn(k, Some(4), None, false, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), n);
         for (row, neighbours) in indices.iter().enumerate() {
@@ -1156,7 +1152,7 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1281,7 +1277,7 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1332,7 +1328,7 @@ mod tests {
             Some(8),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1386,7 +1382,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1415,7 +1411,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1435,7 +1431,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1457,7 +1453,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1479,7 +1475,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1502,7 +1498,7 @@ mod tests {
             Some(20),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1525,7 +1521,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1547,12 +1543,13 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) =
-            index.generate_knn(5, Some(10), None, true, false).unwrap();
+        let (knn_indices, knn_distances) = index
+            .generate_knn(5, Some(10), None, true, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(knn_indices.len(), 100);
         assert!(knn_distances.is_some());
@@ -1575,7 +1572,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1599,7 +1596,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1630,7 +1627,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1657,13 +1654,13 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
 
         let (knn_indices, knn_distances) = index
-            .generate_knn(5, Some(10), Some(10), true, false)
+            .generate_knn(5, Some(10), Some(10), true, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(knn_indices.len(), 100);
@@ -1685,7 +1682,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
@@ -1707,7 +1704,7 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1730,7 +1727,7 @@ mod tests {
             Some(40),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

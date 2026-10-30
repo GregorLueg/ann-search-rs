@@ -7,13 +7,13 @@ use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use thousands::*;
 
 use crate::binary::binariser::*;
 use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 ///////////////////////////
 // ExhaustiveIndexBinary //
@@ -101,6 +101,7 @@ where
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric. Manhattan is not supported.
     /// * `seed` - Random seed for binariser
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -111,7 +112,9 @@ where
         n_bits: usize,
         metric: Dist,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -143,6 +146,8 @@ where
         let mut vectors_flat_binarised = vec![0u8; n * n_bytes];
         binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
+        log.finish();
+
         Ok(Self {
             vectors_flat_binarised,
             n_bytes,
@@ -169,6 +174,7 @@ where
     ///   Ignored by sign-based binarisation, which always emits `dim` bits.
     /// * `metric` - Distance metric for reranking. Manhattan is not supported.
     /// * `seed` - Random seed for binariser
+    /// * `verbosity` - Prints start and end at `Normal`
     /// * `save_path` - Directory to save vector store files
     ///
     /// ### Returns
@@ -180,8 +186,10 @@ where
         n_bits: usize,
         metric: Dist,
         seed: usize,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -223,6 +231,8 @@ where
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
 
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
+
+        log.finish();
 
         Ok(Self {
             vectors_flat_binarised,
@@ -543,7 +553,7 @@ where
     /// * `rerank_factor` - Multiplier for candidate set (only used if
     ///   vector_store available)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -553,14 +563,9 @@ where
         k: usize,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Exhaustive-Binary index", self.n, true, verbosity);
 
         if let Some(vector_store) = &self.vector_store {
             let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
@@ -568,20 +573,12 @@ where
                 .map(|i| {
                     let vec = vector_store.load_vector(i);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
                     self.query_reranking(vec, k, rerank_factor)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            progress.finish();
 
             Ok(pack_knn_results(results, return_dist))
         } else {
@@ -592,16 +589,7 @@ where
                     let start = i * self.n_bytes;
                     let query_binary = &self.vectors_flat_binarised[start..start + self.n_bytes];
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
                     let k = k.min(self.n);
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
@@ -630,6 +618,7 @@ where
                     }
 
                     let mut results: Vec<(u32, usize)> = heap.into_iter().collect();
+                    progress.finish();
                     results.sort_unstable_by_key(|&(dist, _)| dist);
 
                     let (distances, indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
@@ -762,8 +751,15 @@ mod tests {
         let data = create_signed_test_data(n, dim, 7);
 
         for n_bits in [8, 32, 64, 128] {
-            let index = ExhaustiveIndexBinary::new(data.as_ref(), "sign", n_bits, Dist::Cosine, 42)
-                .unwrap();
+            let index = ExhaustiveIndexBinary::new(
+                data.as_ref(),
+                "sign",
+                n_bits,
+                Dist::Cosine,
+                42,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             assert_eq!(index.n_bytes, dim / 8, "stride tracked n_bits = {}", n_bits);
             assert_eq!(index.vectors_flat_binarised.len(), n * index.n_bytes);
@@ -795,6 +791,7 @@ mod tests {
             128,
             Dist::Cosine,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -859,6 +856,7 @@ mod tests {
             dim,
             Dist::SquaredEuclidean,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -915,6 +913,7 @@ mod tests {
             dim,
             Dist::SquaredEuclidean,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -943,8 +942,15 @@ mod tests {
     fn test_sign_based_handles_partial_last_byte() {
         for dim in [30, 31, 32] {
             let data = create_signed_test_data(64, dim, 7);
-            let index =
-                ExhaustiveIndexBinary::new(data.as_ref(), "sign", 32, Dist::Cosine, 42).unwrap();
+            let index = ExhaustiveIndexBinary::new(
+                data.as_ref(),
+                "sign",
+                32,
+                Dist::Cosine,
+                42,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             assert_eq!(index.n_bytes, dim.div_ceil(8));
             assert_eq!(index.vectors_flat_binarised.len(), 64 * index.n_bytes);
@@ -963,9 +969,15 @@ mod tests {
         let data = create_signed_test_data(64, 32, 7);
 
         for n_bits in [16, 64] {
-            let index =
-                ExhaustiveIndexBinary::new(data.as_ref(), "random", n_bits, Dist::Cosine, 42)
-                    .unwrap();
+            let index = ExhaustiveIndexBinary::new(
+                data.as_ref(),
+                "random",
+                n_bits,
+                Dist::Cosine,
+                42,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             assert_eq!(index.n_bytes, n_bits / 8);
             assert_eq!(index.vectors_flat_binarised.len(), 64 * index.n_bytes);
@@ -975,8 +987,15 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_construction() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.n_bytes, 8);
@@ -986,8 +1005,15 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10).unwrap();
@@ -999,8 +1025,15 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 10).unwrap();
@@ -1013,8 +1046,15 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 100).unwrap();
@@ -1028,8 +1068,15 @@ mod tests {
         // centres on the training mean a whole block of rows shares one code
         // and self-retrieval is a coin flip between ties at Hamming 0
         let data = create_signed_test_data(100, 32, 5);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let (indices1, distances1) = index.query_row(data.as_ref().row(0), 10).unwrap();
 
@@ -1041,10 +1088,18 @@ mod tests {
     #[test]
     fn test_exhaustive_binary_knn_graph_no_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, None, true, false).unwrap();
+        let (knn_indices, knn_distances) =
+            index.generate_knn(5, None, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());
@@ -1058,8 +1113,15 @@ mod tests {
     #[test]
     fn test_hamming_distances_in_valid_range() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 20).unwrap();
@@ -1080,6 +1142,7 @@ mod tests {
             64,
             Dist::Cosine,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1101,6 +1164,7 @@ mod tests {
             64,
             Dist::Cosine,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1127,6 +1191,7 @@ mod tests {
             64,
             Dist::SquaredEuclidean,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1152,11 +1217,14 @@ mod tests {
             64,
             Dist::Cosine,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false).unwrap();
+        let (knn_indices, knn_distances) = index
+            .generate_knn(5, Some(10), true, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());
@@ -1170,8 +1238,15 @@ mod tests {
     #[test]
     fn test_query_reranking_without_vector_store() {
         let data = create_test_data::<f32>(50, 32);
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Cosine, 42).unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Cosine,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let result = index.query_reranking(&query, 10, Some(5));
         assert!(matches!(
@@ -1188,9 +1263,15 @@ mod tests {
     fn test_new_honours_euclidean_metric() {
         let data = create_test_data::<f32>(50, 32);
 
-        let index =
-            ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::SquaredEuclidean, 42)
-                .unwrap();
+        let index = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.metric, Dist::SquaredEuclidean);
 
@@ -1202,6 +1283,7 @@ mod tests {
             "euclidean",
             false,
             None::<&Path>,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1214,7 +1296,14 @@ mod tests {
     #[test]
     fn test_new_rejects_manhattan() {
         let data = create_test_data::<f32>(50, 32);
-        let result = ExhaustiveIndexBinary::new(data.as_ref(), "random", 64, Dist::Manhattan, 42);
+        let result = ExhaustiveIndexBinary::new(
+            data.as_ref(),
+            "random",
+            64,
+            Dist::Manhattan,
+            42,
+            Verbosity::Quiet,
+        );
 
         assert!(matches!(
             result,
@@ -1234,6 +1323,7 @@ mod tests {
             64,
             Dist::Manhattan,
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         );
 

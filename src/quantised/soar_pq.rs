@@ -21,13 +21,13 @@ use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 //////////////////////////
 // Thread-local buffers //
@@ -252,7 +252,7 @@ where
     ///   [KMeansTrainingParams]
     /// * `n_pq_centroids` - Optional codebook size, defaults to 256
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -273,8 +273,9 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         n_pq_centroids: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("SOAR-PQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -295,13 +296,11 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!(
-                "  Generating SOAR-PQ index with {} Voronoi cells, rule {:?}.",
-                nlist, rule
-            );
+        if verbosity.detailed_verbosity() {
+            println!(" Spilling rule {:?}", rule);
         }
 
+        let start = Instant::now();
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -310,8 +309,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         if metric == Dist::Cosine {
             centroids
@@ -333,9 +340,6 @@ where
             &metric,
         );
 
-        if verbose {
-            println!("  Computing primary residuals for PQ training");
-        }
         let mut training_residuals = Vec::with_capacity(training_data.len());
         for (vec_idx, &cluster_id) in training_primary.iter().enumerate() {
             let vec = &training_data[vec_idx * dim..(vec_idx + 1) * dim];
@@ -343,9 +347,7 @@ where
             training_residuals.extend_from_slice(&T::subtract_simd(vec, centroid));
         }
 
-        if verbose {
-            println!("  Training product quantiser with m={}", m);
-        }
+        let start = Instant::now();
         let codebook = ProductQuantiser::train(
             &training_residuals,
             dim,
@@ -354,8 +356,15 @@ where
             &Dist::SquaredEuclidean,
             30,
             seed + 1000,
-            verbose,
+            verbosity,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained product quantiser (m = {}) in {:.2?}",
+                m,
+                start.elapsed()
+            );
+        }
 
         // Full-dataset assignment
         let data_norms = vec![T::one(); n];
@@ -399,9 +408,9 @@ where
             }
         }
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "  Encoding {} residuals",
+                " Encoding {} residuals",
                 n_entries.separate_with_underscores()
             );
         }
@@ -438,6 +447,8 @@ where
         for c in 0..nlist {
             primary_offsets[c + 1] = primary_offsets[c] + primary_counts[c];
         }
+
+        log.finish();
 
         Ok(Self {
             quantised_codes,
@@ -629,7 +640,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -639,10 +650,10 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("SOAR-PQ index", self.n, true, verbosity);
 
         let mut pos_cluster = vec![0u32; self.original_ids.len()];
         for cluster in 0..self.nlist {
@@ -661,21 +672,13 @@ where
                 let residual = self.codebook.decode(codes);
                 let reconstructed: Vec<T> = T::add_simd(centroid, &residual);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(&reconstructed, k, nprobe)?;
                 Ok((self.original_ids[pos] as usize, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -762,7 +765,7 @@ mod tests {
             None,
             Some(N_CENTROIDS),
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         (idx, data)
@@ -1006,7 +1009,7 @@ mod tests {
             None,
             Some(N_CENTROIDS),
             1,
-            false
+            Verbosity::Quiet
         )
         .is_err());
     }
@@ -1022,7 +1025,9 @@ mod tests {
     #[test]
     fn test_soar_pq_generate_knn_shape() {
         let (idx, _) = build(300, 32, 8, Dist::SquaredEuclidean);
-        let (indices, dists) = idx.generate_knn(7, Some(8), true, false).unwrap();
+        let (indices, dists) = idx
+            .generate_knn(7, Some(8), true, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(indices.len(), 300);
         assert!(indices.iter().all(|row| row.len() == 7));
         assert!(dists.unwrap().iter().all(|row| row.len() == 7));

@@ -25,6 +25,7 @@ use ann_search_rs::gpu::nndescent_gpu::{
 };
 use ann_search_rs::gpu::*;
 use ann_search_rs::utils::dist::Dist;
+use ann_search_rs::Verbosity;
 use cubecl_utils_rs::prelude::*;
 
 /// Sampling rate the production NNDescent loop defaults to. Held fixed across
@@ -300,7 +301,7 @@ impl Benchmark for LocalJoinBench {
             n_trees,
             42,
             use_cosine,
-            false,
+            Verbosity::Quiet,
             &self.client,
         )
         .expect("forest init failed");

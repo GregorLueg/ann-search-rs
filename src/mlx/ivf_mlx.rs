@@ -37,6 +37,7 @@ use crate::mlx::ffi::*;
 use crate::mlx::k_means_mlx::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::sample_vectors;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::DimensionValidation;
 
 ////////////
@@ -603,7 +604,8 @@ impl IvfIndexMlx {
     ///   `init` and `balanced` are honoured, `path` is ignored. Every
     ///   iteration runs (no early stop).
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   k-means and the assignment
     ///
     /// ### Returns
     ///
@@ -614,12 +616,13 @@ impl IvfIndexMlx {
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
         install_error_handler();
+        let log = BuildLog::new("IVF-MLX index", verbosity);
 
         let (vectors_flat, n, dim) = data.into_row_major();
         let nlist = nlist
@@ -628,11 +631,8 @@ impl IvfIndexMlx {
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("  Generating MLX IVF index with {} Voronoi cells.", nlist);
-        }
-
         let stream = Stream::default_gpu();
+        let start = Instant::now();
         let centroids = train_centroids_mlx(
             &training,
             dim,
@@ -642,9 +642,25 @@ impl IvfIndexMlx {
             k_means_params,
             seed,
             &stream,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
+        let start = Instant::now();
         let assignments = assign_all_mlx(&vectors_flat, dim, &centroids, nlist, &metric, &stream)?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let (mut vectors_flat, original_indices, cluster_offsets) =
             reorganise_by_cluster(&vectors_flat, dim, &assignments, nlist);
@@ -681,6 +697,8 @@ impl IvfIndexMlx {
             &[&db, &offsets, &xn, &centroid_ops.ct, &centroid_ops.add],
             false,
         )?;
+
+        log.finish();
 
         Ok(Self {
             vectors_flat,
@@ -772,7 +790,8 @@ impl IvfIndexMlx {
     /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
     /// * `nquery` - Queries per device tile (defaults to 100k, capped so the
     ///   query x centroid score matrix stays bounded)
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the queue versus wait time split
     ///
     /// ### Returns
     ///
@@ -783,15 +802,17 @@ impl IvfIndexMlx {
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnResult<f32> {
         let (mut queries, n_query, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
         if self.metric == Dist::Cosine {
             normalise_rows(&mut queries, dim_query);
         }
+        let progress = QueryProgress::new("IVF-MLX index", n_query, false, verbosity);
         let (indices, dists) =
-            self.query_prepared(&queries, n_query, k, nprobe, nquery, verbose)?;
+            self.query_prepared(&queries, n_query, k, nprobe, nquery, &progress, verbosity)?;
+        progress.finish();
         let indices = indices
             .into_iter()
             .map(|row| {
@@ -814,7 +835,8 @@ impl IvfIndexMlx {
     /// * `nprobe` - Number of clusters to search
     /// * `nquery` - Queries per device tile
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the queue versus wait time split
     ///
     /// ### Returns
     ///
@@ -826,10 +848,19 @@ impl IvfIndexMlx {
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<f32> {
-        let (idx_reorg, dist_reorg) =
-            self.query_prepared(&self.vectors_flat, self.n, k, nprobe, nquery, verbose)?;
+        let progress = QueryProgress::new("IVF-MLX index", self.n, true, verbosity);
+        let (idx_reorg, dist_reorg) = self.query_prepared(
+            &self.vectors_flat,
+            self.n,
+            k,
+            nprobe,
+            nquery,
+            &progress,
+            verbosity,
+        )?;
+        progress.finish();
         let mut indices = vec![Vec::new(); self.n];
         let mut dists = if return_dist {
             vec![Vec::new(); self.n]
@@ -1099,11 +1130,13 @@ impl IvfIndexMlx {
     /// * `k` - Number of neighbours, clamped to the index size
     /// * `nprobe` - Clusters to search (defaults to `sqrt(nlist)`)
     /// * `nquery` - Queries per device tile
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `progress` - Progress the queries are counted against
+    /// * `verbosity` - Prints the queue versus wait time split at `Detailed`
     ///
     /// ### Returns
     ///
     /// `(cluster-order positions, distances)` per query, ascending
+    #[allow(clippy::too_many_arguments)]
     fn query_prepared(
         &self,
         queries: &[f32],
@@ -1111,7 +1144,8 @@ impl IvfIndexMlx {
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
-        verbose: bool,
+        progress: &QueryProgress,
+        verbosity: Verbosity,
     ) -> KnnResult<f32> {
         let k = k.min(self.n);
         if k == 0 || n_query == 0 {
@@ -1170,21 +1204,22 @@ impl IvfIndexMlx {
                         .unzip()
                 })
                 .collect();
+            progress.tick_n(rows.len());
             for (ir, dr) in rows {
                 all_indices.push(ir);
                 all_distances.push(dr);
             }
         }
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "MLX IVF: {} queries in tiles of {}, nprobe {} (pool {}), queue {:.1} ms, wait+copy {:.1} ms",
+                " {} queries in tiles of {}, nprobe {} (pool {}): queue {:.2?}, wait + copy {:.2?}",
                 n_query.separate_with_underscores(),
-                tile,
+                tile.separate_with_underscores(),
                 nprobe,
                 pool,
-                (t1 - t0).as_secs_f64() * 1e3,
-                t1.elapsed().as_secs_f64() * 1e3
+                t1 - t0,
+                t1.elapsed()
             );
         }
 
@@ -1271,15 +1306,29 @@ mod tests {
         let queries = blobs(200, dim, 7);
         let params = KMeansTrainingParams::new(10, None, None);
 
-        let mlx =
-            IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), Some(params), 1, false).unwrap();
-        let cpu =
-            IvfIndex::build(data.as_ref(), metric, Some(nlist), Some(params), 1, false).unwrap();
-        let exh = ExhaustiveIndex::new(data.as_ref(), metric);
+        let mlx = IvfIndexMlx::build(
+            data.as_ref(),
+            metric,
+            Some(nlist),
+            Some(params),
+            1,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let cpu = IvfIndex::build(
+            data.as_ref(),
+            metric,
+            Some(nlist),
+            Some(params),
+            1,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let exh = ExhaustiveIndex::new(data.as_ref(), metric, Verbosity::Quiet);
 
         let (q_flat, nq, _) = queries.as_ref().into_row_major();
         let truth: Vec<Vec<usize>> = exh
-            .query_batch(&q_flat, nq, k, None, false)
+            .query_batch(&q_flat, nq, k, None, Verbosity::Quiet)
             .unwrap()
             .into_iter()
             .map(|(i, _)| i)
@@ -1292,7 +1341,7 @@ mod tests {
             })
             .collect();
         let (mlx_nn, mlx_dist) = mlx
-            .query_batch(queries.as_ref(), k, Some(nprobe), None, false)
+            .query_batch(queries.as_ref(), k, Some(nprobe), None, Verbosity::Quiet)
             .unwrap();
 
         let (r_mlx, r_cpu) = (recall(&truth, &mlx_nn), recall(&truth, &cpu_nn));
@@ -1303,7 +1352,7 @@ mod tests {
 
         // Probing every cluster is exact.
         let (all_nn, _) = mlx
-            .query_batch(queries.as_ref(), k, Some(nlist), Some(64), false)
+            .query_batch(queries.as_ref(), k, Some(nlist), Some(64), Verbosity::Quiet)
             .unwrap();
         assert!(recall(&truth, &all_nn) > 0.999);
     }
@@ -1355,17 +1404,30 @@ mod tests {
         let (n, k, nlist, nprobe) = (4_000, 10, 40, 4);
         let data = blobs(n, dim, 42);
         let queries = blobs(300, dim, 7);
-        let mut index = IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), None, 1, false)
-            .unwrap()
-            .with_scan(IvfScanMlx::QueryMajor);
+        let mut index = IvfIndexMlx::build(
+            data.as_ref(),
+            metric,
+            Some(nlist),
+            None,
+            1,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .with_scan(IvfScanMlx::QueryMajor);
         let (qm_nn, qm_dist) = index
-            .query_batch(queries.as_ref(), k, Some(nprobe), None, false)
+            .query_batch(queries.as_ref(), k, Some(nprobe), None, Verbosity::Quiet)
             .unwrap();
         for scan in [IvfScanMlx::ClusterMajor, IvfScanMlx::ClusterMatrix] {
             index = index.with_scan(scan);
             // A small tile so several tiles run.
             let (cm_nn, cm_dist) = index
-                .query_batch(queries.as_ref(), k, Some(nprobe), Some(70), false)
+                .query_batch(
+                    queries.as_ref(),
+                    k,
+                    Some(nprobe),
+                    Some(70),
+                    Verbosity::Quiet,
+                )
                 .unwrap();
             let r = recall(&qm_nn, &cm_nn);
             assert!(r > 0.995, "{scan:?} {metric:?} dim {dim}: overlap {r}");
@@ -1379,7 +1441,7 @@ mod tests {
                 }
             }
             let (self_nn, _) = index
-                .generate_knn(k, Some(nlist), None, false, false)
+                .generate_knn(k, Some(nlist), None, false, Verbosity::Quiet)
                 .unwrap();
             assert!(self_nn.iter().enumerate().all(|(i, row)| row[0] == i));
         }
@@ -1404,12 +1466,21 @@ mod tests {
         let (n, dim, nlist) = (3_000, 20, 30);
         let data = blobs(n, dim, 5);
         let queries = blobs(100, dim, 6);
-        let exh = ExhaustiveIndex::new(data.as_ref(), metric);
+        let exh = ExhaustiveIndex::new(data.as_ref(), metric, Verbosity::Quiet);
         let (q_flat, nq, _) = queries.as_ref().into_row_major();
-        let mut index =
-            IvfIndexMlx::build(data.as_ref(), metric, Some(nlist), None, 1, false).unwrap();
+        let mut index = IvfIndexMlx::build(
+            data.as_ref(),
+            metric,
+            Some(nlist),
+            None,
+            1,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         for k in [1, 10, 15, 16, 31, 32, 33, 50, 64, 100] {
-            let truth = exh.query_batch(&q_flat, nq, k, None, false).unwrap();
+            let truth = exh
+                .query_batch(&q_flat, nq, k, None, Verbosity::Quiet)
+                .unwrap();
             let truth_nn: Vec<Vec<usize>> = truth.iter().map(|(i, _)| i.clone()).collect();
             for scan in [
                 IvfScanMlx::QueryMajor,
@@ -1419,7 +1490,7 @@ mod tests {
             ] {
                 index = index.with_scan(scan);
                 let (nn, dist) = index
-                    .query_batch(queries.as_ref(), k, Some(nlist), None, false)
+                    .query_batch(queries.as_ref(), k, Some(nlist), None, Verbosity::Quiet)
                     .unwrap();
                 let r = recall(&truth_nn, &nn);
                 assert!(r > 0.999, "{scan:?} {metric:?} k {k}: recall {r}");
@@ -1455,12 +1526,12 @@ mod tests {
             Some(50),
             None,
             2,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap()
         .with_scan(IvfScanMlx::ClusterMajor);
         let (idx, _) = index
-            .query_batch(data.as_ref(), 30, Some(1), None, false)
+            .query_batch(data.as_ref(), 30, Some(1), None, Verbosity::Quiet)
             .unwrap();
         assert!(idx.iter().all(|row| row.len() == 30));
     }
@@ -1474,10 +1545,12 @@ mod tests {
             Some(30),
             None,
             5,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
-        let (idx, dist) = index.generate_knn(5, Some(30), None, true, false).unwrap();
+        let (idx, dist) = index
+            .generate_knn(5, Some(30), None, true, Verbosity::Quiet)
+            .unwrap();
         let dist = dist.unwrap();
         for (i, row) in idx.iter().enumerate() {
             assert_eq!(row[0], i);
@@ -1495,11 +1568,11 @@ mod tests {
             Some(50),
             None,
             2,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (idx, _) = index
-            .query_batch(data.as_ref(), 30, Some(1), None, false)
+            .query_batch(data.as_ref(), 30, Some(1), None, Verbosity::Quiet)
             .unwrap();
         assert!(idx.iter().all(|row| row.len() == 30));
     }
@@ -1507,10 +1580,20 @@ mod tests {
     #[test]
     fn test_mlx_ivf_rejects_manhattan_and_bad_dim() {
         let data = blobs(100, 4, 1);
-        assert!(IvfIndexMlx::build(data.as_ref(), Dist::Manhattan, None, None, 1, false).is_err());
-        let index = IvfIndexMlx::build(data.as_ref(), Dist::Cosine, None, None, 1, false).unwrap();
+        assert!(IvfIndexMlx::build(
+            data.as_ref(),
+            Dist::Manhattan,
+            None,
+            None,
+            1,
+            Verbosity::Quiet
+        )
+        .is_err());
+        let index =
+            IvfIndexMlx::build(data.as_ref(), Dist::Cosine, None, None, 1, Verbosity::Quiet)
+                .unwrap();
         assert!(index
-            .query_batch(blobs(2, 5, 2).as_ref(), 3, None, None, false)
+            .query_batch(blobs(2, 5, 2).as_ref(), 3, None, None, Verbosity::Quiet)
             .is_err());
     }
 }

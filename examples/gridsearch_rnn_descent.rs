@@ -27,14 +27,20 @@ fn main() {
     // Exhaustive baseline
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -51,7 +57,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -103,7 +109,7 @@ fn main() {
             &cli.distance,
             None,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -126,7 +132,7 @@ fn main() {
                 ef_search,
                 k_search,
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -158,7 +164,7 @@ fn main() {
         println!("Self-querying RNN-Descent...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_rnn_descent_self(&rnn_idx, cli.k, None, None, true, false).unwrap();
+            query_rnn_descent_self(&rnn_idx, cli.k, None, None, true, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

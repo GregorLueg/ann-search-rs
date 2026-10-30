@@ -16,6 +16,7 @@ pub use crate::utils::nndescent_utils::{KnnGraph, KNN_GRAPH_EMPTY};
 pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;
+pub use crate::utils::verbosity::{parse_annsearch_verbosity, Verbosity};
 pub use crate::utils::DimensionValidation;
 pub use crate::utils::FlattenData;
 

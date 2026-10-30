@@ -22,6 +22,7 @@ use crate::cpu::kd_forest::*;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::*;
 use crate::utils::tree_utils::BacktrackEntry;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ///////////////////
@@ -262,17 +263,10 @@ impl CandStats {
 
 /// Per-phase wall-clock breakdown of a build, accumulated across iterations.
 ///
-/// Only populated when `verbose` is set. Phases are timed from the driving
-/// loop rather than inside the parallel closures.
-///
-/// The phases partition the build: `forest` and `seed` are initialisation,
-/// the remaining four are the descent, and they sum to roughly the total.
+/// Reported at `Detailed`. Phases are timed from the driving loop rather
+/// than inside the parallel closures, and partition the descent.
 #[derive(Default, Clone, Copy)]
 struct BuildTimings {
-    /// RP-forest construction (Annoy, or Kd for Manhattan)
-    forest: Duration,
-    /// Seeding the flat graph by querying the forest once per node
-    seed: Duration,
     /// Sampling forward candidates and building their reverse CSR
     candidates: Duration,
     /// Retiring the is-new flags of sampled edges
@@ -298,38 +292,12 @@ struct BuildTimings {
 }
 
 impl BuildTimings {
-    /// Total time attributed to the descent iterations.
-    fn descent(&self) -> Duration {
-        self.candidates + self.mark_old + self.join + self.sort + self.apply
-    }
-
-    /// Print the breakdown as a table, each phase against its share of the total.
-    ///
-    /// ### Params
-    ///
-    /// * `n` - Number of samples, for the per-node figures
-    /// * `k` - Neighbours per node
-    fn report(&self, n: usize, k: usize) {
-        let total = self.forest + self.seed + self.descent();
-        let secs = total.as_secs_f64().max(f64::MIN_POSITIVE);
-        let row = |name: &str, d: Duration| {
-            println!(
-                "  {:<22} {:>9.3} s  {:>5.1}%",
-                name,
-                d.as_secs_f64(),
-                100.0 * d.as_secs_f64() / secs
-            );
-        };
-
-        println!("\nNN-Descent build breakdown (n={n}, k={k}):");
-        row("forest build", self.forest);
-        row("graph seeding", self.seed);
-        row("candidates", self.candidates);
-        row("mark old", self.mark_old);
-        row("local join", self.join);
-        row("radix sort", self.sort);
-        row("apply updates", self.apply);
-        println!("  {:<22} {:>9.3} s", "total", total.as_secs_f64());
+    /// Print the descent breakdown as `Detailed` stage lines.
+    fn report(&self) {
+        println!(
+            " Descent phases: candidates {:.2?}, mark old {:.2?}, local join {:.2?}, radix sort {:.2?}, apply {:.2?}",
+            self.candidates, self.mark_old, self.join, self.sort, self.apply
+        );
 
         let accept = if self.updates_emitted > 0 {
             100.0 * self.updates_accepted as f64 / self.updates_emitted as f64
@@ -337,7 +305,7 @@ impl BuildTimings {
             0.0
         };
         println!(
-            "  updates: {} emitted, {} accepted ({:.2}%)",
+            " Updates: {} emitted, {} accepted ({:.2}%)",
             self.updates_emitted.separate_with_underscores(),
             self.updates_accepted.separate_with_underscores(),
             accept
@@ -345,12 +313,9 @@ impl BuildTimings {
 
         if self.cand_len_count > 0 {
             println!(
-                "  merged candidate list: mean {:.1}, max {}",
+                " Merged candidate list: mean {:.1}, max {}, {} pairs evaluated",
                 self.cand_len_sum as f64 / self.cand_len_count as f64,
-                self.cand_len_max
-            );
-            println!(
-                "  candidate pairs evaluated: {}",
+                self.cand_len_max,
                 self.pairs.separate_with_underscores()
             );
         }
@@ -1082,7 +1047,8 @@ where
     ///   RNG-rule prune over the forward+reverse candidate pool
     ///   (0 disables).
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   forest, the seeding and the per-iteration lines
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         data: impl AnnMatrix<T>,
@@ -1094,8 +1060,9 @@ where
         delta: T,
         diversify_prob: T,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("NNDescent index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
@@ -1115,9 +1082,8 @@ where
 
         let start = Instant::now();
         let forest = Forest::new(&vectors_flat, n, dim, n_trees, metric, seed);
-        let forest_time = start.elapsed();
-        if verbose {
-            println!("Built forest: {forest_time:.2?}");
+        if verbosity.detailed_verbosity() {
+            println!(" Built forest ({n_trees} trees) in {:.2?}", start.elapsed());
         }
 
         let builder = NNDescent {
@@ -1136,22 +1102,12 @@ where
 
         let start = Instant::now();
         let seeded = builder.init_with_leaf_join(builder.forest(), k);
-        let timings = BuildTimings {
-            forest: forest_time,
-            seed: start.elapsed(),
-            ..Default::default()
-        };
+        if verbosity.detailed_verbosity() {
+            println!(" Seeded graph from forest in {:.2?}", start.elapsed());
+        }
 
-        let (build_graph, converged) = builder.generate_index(
-            seeded,
-            k,
-            max_iter,
-            delta,
-            max_candidates,
-            seed,
-            timings,
-            verbose,
-        );
+        let (build_graph, converged) =
+            builder.generate_index(seeded, k, max_iter, delta, max_candidates, seed, verbosity);
         let graph: Vec<(u32, T)> = build_graph
             .into_iter()
             .map(|nb| (nb.pid(), nb.dist))
@@ -1168,6 +1124,8 @@ where
         } else {
             graph.iter().map(|&(pid, _)| pid).collect()
         };
+
+        log.finish();
 
         Ok(NNDescent {
             vectors_flat: builder.vectors_flat,
@@ -1420,7 +1378,8 @@ where
     /// * `metric` - Distance metric
     /// * `params` - Build parameters
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   seeding and the per-iteration lines
     ///
     /// ### Returns
     ///
@@ -1430,16 +1389,19 @@ where
         metric: Dist,
         params: NNDescentKnnParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnGraph<T> {
-        let nnd = Self::build_graph_only(data, metric, params, seed, verbose);
-        KnnGraph::from_rows(
+        let log = BuildLog::new("NNDescent kNN graph", verbosity);
+        let nnd = Self::build_graph_only(data, metric, params, seed, verbosity);
+        let graph = KnnGraph::from_rows(
             &nnd.graph,
             nnd.n,
             nnd.k,
             params.include_self,
             params.return_dist,
-        )
+        );
+        log.finish();
+        graph
     }
 
     /// Run the descent without building an index around it.
@@ -1459,7 +1421,8 @@ where
     /// * `params` - Build parameters; `include_self` and `return_dist` are
     ///   ignored
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints the seeding and per-iteration lines at
+    ///   `Detailed`; the caller prints start and end
     ///
     /// ### Returns
     ///
@@ -1469,7 +1432,7 @@ where
         metric: Dist,
         params: NNDescentKnnParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Self {
         let (vectors_flat, n, dim) = data.into_row_major();
         let norms = if metric == Dist::Cosine {
@@ -1503,12 +1466,11 @@ where
 
         let start = Instant::now();
         let seeded = builder.init_with_streamed_trees(n_trees, seed, k);
-        let timings = BuildTimings {
-            seed: start.elapsed(),
-            ..Default::default()
-        };
-        if verbose {
-            println!("Seeded graph from streamed trees: {:.2?}", timings.seed);
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Seeded graph from {n_trees} streamed trees in {:.2?}",
+                start.elapsed()
+            );
         }
 
         let (graph, converged) = builder.generate_index(
@@ -1518,8 +1480,7 @@ where
             T::from_f64(params.delta).unwrap(),
             max_candidates,
             seed,
-            timings,
-            verbose,
+            verbosity,
         );
         builder.graph = graph.into_iter().map(|nb| (nb.pid(), nb.dist)).collect();
         builder.converged = converged;
@@ -1652,9 +1613,8 @@ where
     /// * `delta` - Convergence threshold (fraction of edges updated)
     /// * `max_candidates` - Max candidates sampled per node per iteration
     /// * `seed` - Random seed for per-iteration sampling
-    /// * `timings` - Forest and seeding time already spent, so the verbose
-    ///   breakdown accounts for the whole build
-    /// * `verbose` - Print progress information
+    /// * `verbosity` - Prints per-iteration lines and the phase breakdown at
+    ///   `Detailed`
     ///
     /// ### Returns
     ///
@@ -1668,30 +1628,18 @@ where
         delta: T,
         max_candidates: usize,
         seed: usize,
-        mut timings: BuildTimings,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> (Vec<Neighbour<T>>, bool) {
-        if verbose {
-            println!(
-                "Running NN-Descent: {} samples, max_candidates={}",
-                self.n.separate_with_underscores(),
-                max_candidates
-            );
-        }
-
+        let detailed = verbosity.detailed_verbosity();
+        let mut timings = BuildTimings::default();
         let mut converged = false;
-
-        if verbose {
-            println!("Seeded graph from forest: {:.2?}", timings.seed);
-        }
-
         let mut chunk_size = self.initial_chunk_size(max_candidates);
 
-        if verbose {
+        if detailed {
             println!(
-                " Starting chunk size {} for memory-bounded updates ({} MiB budget)",
-                chunk_size.separate_with_underscores(),
-                UPDATE_TARGET_BYTES / (1024 * 1024)
+                " Running NN-Descent iterations (max candidates {}, chunk size {})",
+                max_candidates,
+                chunk_size.separate_with_underscores()
             );
         }
 
@@ -1701,9 +1649,6 @@ where
             let updates_count = AtomicUsize::new(0);
             let iter_seed = (seed as u64).wrapping_add(iter as u64);
 
-            if verbose {
-                println!(" Preparing candidates for iter {}", iter + 1);
-            }
             let t = Instant::now();
             self.build_candidates(&graph, k, max_candidates, iter_seed, &mut cands);
             timings.candidates += t.elapsed();
@@ -1711,10 +1656,6 @@ where
             let t = Instant::now();
             self.mark_as_old(&mut graph, k, &cands);
             timings.mark_old += t.elapsed();
-
-            if verbose {
-                println!(" Processing updates for iter {}", iter + 1);
-            }
 
             let mut chunk_start = 0usize;
             let mut n_chunks = 0usize;
@@ -1748,26 +1689,23 @@ where
                 n_chunks += 1;
             }
 
-            if verbose {
-                println!("  {} chunks, next chunk size {}", n_chunks, chunk_size);
-            }
-
             let update_count = updates_count.load(Ordering::Relaxed);
             timings.updates_accepted += update_count;
             let update_rate = T::from_usize(update_count).unwrap()
                 / T::from_usize(self.n * max_candidates).unwrap();
 
-            if verbose {
+            if detailed {
                 println!(
-                    "  Iter {}: {} edge updates (rate={:.4})",
+                    "  Iteration {}: {} edge updates (rate {:.4}), {} chunks",
                     iter + 1,
                     update_count.separate_with_underscores(),
                     update_rate.to_f64().unwrap(),
+                    n_chunks
                 );
             }
 
             if update_rate < delta {
-                if verbose {
+                if detailed {
                     println!("  Converged after {} iterations", iter + 1);
                 }
                 converged = true;
@@ -1775,8 +1713,8 @@ where
             }
         }
 
-        if verbose {
-            timings.report(self.n, k);
+        if detailed {
+            timings.report();
         }
 
         (graph, converged)
@@ -2368,6 +2306,13 @@ where
     /// rather than reading it back. See [`Self::extract_knn`] for the cheap
     /// path.
     ///
+    /// ### Params
+    ///
+    /// * `k` - Number of neighbours per vector
+    /// * `ef_search` - Beam width, `None` for the default
+    /// * `return_dist` - Whether to return distances
+    /// * `verbosity` - Prints start, progress and end at `Normal`
+    ///
     /// ### Returns
     ///
     /// `(knn_indices, optional distances)`
@@ -2376,14 +2321,9 @@ where
         k: usize,
         ef_search: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("NNDescent index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -2392,20 +2332,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, ef_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -2947,7 +2879,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -2970,7 +2902,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -2991,7 +2923,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3016,7 +2948,7 @@ mod tests {
             0.5,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3037,7 +2969,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let g2 = NNDescent::<f32>::new(
@@ -3050,7 +2982,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3074,7 +3006,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let gk4 = NNDescent::<f32>::new(
@@ -3087,7 +3019,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3121,7 +3053,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3146,7 +3078,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3173,7 +3105,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3209,7 +3141,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3262,13 +3194,19 @@ mod tests {
                 0.001,
                 0.0,
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let (ids, dists) = index.extract_knn(None, false, true);
 
             let params = NNDescentKnnParams::new(k, None, None, Some(6), 0.001, false, true);
-            let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), metric, params, 42, false);
+            let g = NNDescent::<f32>::knn_graph(
+                (&data[..], n, dim),
+                metric,
+                params,
+                42,
+                Verbosity::Quiet,
+            );
             let gd = g.distances.as_ref().unwrap();
 
             assert_eq!((g.n, g.k), (n, k));
@@ -3298,7 +3236,7 @@ mod tests {
             Dist::SquaredEuclidean,
             params,
             1,
-            false,
+            Verbosity::Quiet,
         );
         assert_eq!(g.k, k + 1);
         assert!(g.distances.is_none());
@@ -3313,8 +3251,20 @@ mod tests {
         let (n, dim) = (1000, 6);
         let data = random_flat(n, dim, 9);
         let params = NNDescentKnnParams::default();
-        let a = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::Manhattan, params, 3, false);
-        let b = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::Manhattan, params, 3, false);
+        let a = NNDescent::<f32>::knn_graph(
+            (&data[..], n, dim),
+            Dist::Manhattan,
+            params,
+            3,
+            Verbosity::Quiet,
+        );
+        let b = NNDescent::<f32>::knn_graph(
+            (&data[..], n, dim),
+            Dist::Manhattan,
+            params,
+            3,
+            Verbosity::Quiet,
+        );
         assert_eq!(a.indices, b.indices);
         assert_eq!(a.distances, b.distances);
     }
@@ -3325,7 +3275,13 @@ mod tests {
         let data = random_flat(n, dim, 21);
         for metric in [Dist::Manhattan, Dist::SquaredEuclidean] {
             let params = NNDescentKnnParams::new(k, None, None, None, 0.001, false, false);
-            let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), metric, params, 7, false);
+            let g = NNDescent::<f32>::knn_graph(
+                (&data[..], n, dim),
+                metric,
+                params,
+                7,
+                Verbosity::Quiet,
+            );
             let mut hits = 0;
             let probe: Vec<usize> = (0..n).step_by(20).collect();
             for &i in &probe {
@@ -3354,7 +3310,7 @@ mod tests {
             0.001,
             0.5,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3381,7 +3337,7 @@ mod tests {
             0.001,
             1.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3514,7 +3470,7 @@ mod tests {
             0.0,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3570,7 +3526,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3605,7 +3561,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3644,7 +3600,7 @@ mod tests {
             0.0,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3683,7 +3639,7 @@ mod tests {
             0.0,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3725,7 +3681,7 @@ mod tests {
             0.0,
             0.0,
             7,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3769,7 +3725,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3795,7 +3751,7 @@ mod tests {
             0.001,
             0.0,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3837,7 +3793,7 @@ mod tests {
                 0.0,
                 prune_prob,
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 

@@ -43,10 +43,10 @@ entirely: matrix in, flat `u32` graph out, nothing kept.
 
 ```rust
 use ann_search_rs::build_knn_graph_nndescent;
-use ann_search_rs::prelude::NNDescentKnnParams;
+use ann_search_rs::prelude::{NNDescentKnnParams, Verbosity};
 
 let params = NNDescentKnnParams { k: 15, include_self: true, ..Default::default() };
-let graph = build_knn_graph_nndescent(data.as_ref(), "euclidean", Some(params), 42, false)?;
+let graph = build_knn_graph_nndescent(data.as_ref(), "euclidean", Some(params), 42, Verbosity::Quiet)?;
 let row = graph.row(0); // k + 1 ids, the point itself first
 ```
 
@@ -71,7 +71,7 @@ Optional features:
 ## Usage
 
 ```rust
-use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self};
+use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self, Verbosity};
 use faer::Mat;
 
 let data = Mat::from_fn(10_000, 32, |_, _| rand::random::<f32>());
@@ -81,23 +81,31 @@ let index = build_hnsw_index(
     100,         // ef_construction
     "euclidean", // or "cosine", "manhattan"
     42,          // seed
-    false,       // verbose
+    Verbosity::Normal,
 )?;
 
 // Cross-set query: k = 15, ef_search = 200, return distances
 let query = Mat::from_fn(100, 32, |_, _| rand::random::<f32>());
-let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, false)?;
+let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, Verbosity::Quiet)?;
 
 // Self-kNN graph, indices only
-let (graph, _) = query_hnsw_self(&index, 15, 200, false, false)?;
+let (graph, _) = query_hnsw_self(&index, 15, 200, false, Verbosity::Quiet)?;
 ```
+
+Every build and query takes a `Verbosity`. `Quiet` prints nothing but
+warnings. `Normal` prints one line at the start and end of a build or query,
+plus a progress line every 100_000 queried samples. `Detailed` adds the timed
+build stages and per-iteration lines.
+
+Callers that carry verbosity as an integer (R or Python bindings) can use
+`parse_annsearch_verbosity(0 | 1 | 2)`.
 
 Every index follows the same `build_*` / `query_*` / `query_*_self` pattern.
 Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
 row-major slice with its shape. Rows are samples, columns are features, always:
 
 ```rust
-let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, false)?;
+let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, Verbosity::Quiet)?;
 ```
 
 The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.

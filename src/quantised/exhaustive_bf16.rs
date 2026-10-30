@@ -6,11 +6,11 @@ use half::bf16;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::marker::PhantomData;
-use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 /////////////////////
 // Index structure //
@@ -104,11 +104,17 @@ where
     ///
     /// * `data` - The data for which to generate the index. Samples x features
     /// * `metric` - Which distance metric the index shall be generated for.
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive index
-    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+    pub fn new(
+        data: impl AnnMatrix<T>,
+        metric: Dist,
+        verbosity: Verbosity,
+    ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-BF16 index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -126,6 +132,8 @@ where
         } else {
             Vec::new()
         };
+
+        log.finish();
 
         Ok(Self {
             vectors_flat: encode_bf16_quantisation(&vectors_flat),
@@ -317,7 +325,7 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -327,14 +335,9 @@ where
         &self,
         k: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Exhaustive-BF16 index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -343,20 +346,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query_bf16(vec, k)
             })
             .collect();
+        progress.finish();
 
         pack_knn_results(results, return_dist)
     }
@@ -411,7 +406,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_construction_euclidean() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.dim, 32);
@@ -422,7 +419,8 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_construction_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine, Verbosity::Quiet).unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.dim, 32);
@@ -432,7 +430,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10).unwrap();
@@ -444,7 +444,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 10).unwrap();
@@ -457,7 +459,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 100).unwrap();
@@ -468,7 +472,9 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_row() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
         let (indices, distances) = index.query_row(data.as_ref().row(0), 10).unwrap();
 
@@ -480,7 +486,8 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_query_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::Cosine, Verbosity::Quiet).unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10).unwrap();
@@ -495,9 +502,11 @@ mod tests {
     #[test]
     fn test_exhaustive_bf16_knn_graph() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
+        let index =
+            ExhaustiveIndexBf16::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, true, false);
+        let (knn_indices, knn_distances) = index.generate_knn(5, true, Verbosity::Quiet);
 
         assert_eq!(knn_indices.len(), 50);
         assert!(knn_distances.is_some());

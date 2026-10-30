@@ -123,7 +123,7 @@ fn train_gpu(
         Some(params),
         cli.seed as usize,
         &client,
-        true,
+        Verbosity::Normal,
     )
     .expect("train_centroids_gpu failed")
 }
@@ -285,7 +285,7 @@ fn main() {
                 &metric,
                 Some(params),
                 cli.seed as usize,
-                true,
+                Verbosity::Normal,
             )
             .expect("train_centroids failed")
         };

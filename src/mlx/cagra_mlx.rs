@@ -1593,7 +1593,7 @@ mod wgpu_tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
             true,
             WgpuDevice::default().clone().into(),
         )

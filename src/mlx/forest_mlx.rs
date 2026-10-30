@@ -120,7 +120,7 @@ pub(crate) fn max_leaf_size_mlx(dim_padded: usize) -> Result<usize, AnnSearchErr
 /// * `n_trees` - Trees to build
 /// * `seed` - Base seed; trees and levels derive theirs from it exactly as on
 ///   the wgpu path
-/// * `verbose` - Print phase timings
+/// * `verbosity` - Prints one timed forest line at `Detailed`
 ///
 /// ### Returns
 ///
@@ -132,7 +132,7 @@ pub(crate) fn forest_init_mlx(
     dim: usize,
     n_trees: usize,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<(GraphPair, ForestRouter<f32>), AnnSearchErrors> {
     let n = ctx.n;
     let dim_padded = ctx.d4 * 4;
@@ -143,9 +143,6 @@ pub(crate) fn forest_init_mlx(
     } else {
         (n as f64 / target).log2().ceil() as usize
     };
-    if verbose {
-        println!("  MLX forest init: {n_trees} trees, max_depth={max_depth}, max_leaf={max_leaf}");
-    }
     let start = Instant::now();
 
     let (projections, level_vecs) =
@@ -258,8 +255,11 @@ pub(crate) fn forest_init_mlx(
         g = next;
         eval_all(&[&g.0, &g.1], false)?;
     }
-    if verbose {
-        println!("  MLX forest init: {:.2?}", start.elapsed());
+    if verbosity.detailed_verbosity() {
+        println!(
+            " Built forest ({n_trees} trees, max depth {max_depth}, max leaf {max_leaf}) in {:.2?}",
+            start.elapsed()
+        );
     }
     Ok((g, router))
 }

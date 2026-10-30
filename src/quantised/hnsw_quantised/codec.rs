@@ -28,6 +28,9 @@ where
     /// Per-query state, built once and reused for every node visited.
     type Query: Send + Sync;
 
+    /// What the graph index over this codec is called in progress lines.
+    const INDEX_NAME: &'static str;
+
     /// Number of stored vectors.
     ///
     /// ### Returns

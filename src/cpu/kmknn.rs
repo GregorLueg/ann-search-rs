@@ -5,14 +5,14 @@
 use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::utils::dist::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+use std::time::Instant;
 
 ////////////////
 // KmknnIndex //
@@ -138,7 +138,8 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds timed
+    ///   stages
     ///
     /// ### Returns
     ///
@@ -149,8 +150,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("kMkNN index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -170,10 +172,7 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("Building kMkNN index with {} clusters.", nlist);
-        }
-
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -182,11 +181,20 @@ where
             &Dist::SquaredEuclidean,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let dummy_data_norms = vec![T::one(); n];
         let dummy_centroid_norms = vec![T::one(); nlist];
+        let start = Instant::now();
         let assignments = assign_all_parallel(
             &vectors_flat,
             &dummy_data_norms,
@@ -197,6 +205,13 @@ where
             nlist,
             &Dist::SquaredEuclidean,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
@@ -232,6 +247,8 @@ where
                 max_cluster_radius_sq = max_d_sq;
             }
         }
+
+        log.finish();
 
         Ok(Self {
             vectors_flat: new_vectors_flat,
@@ -419,13 +436,18 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)` indexed by original id
-    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        let progress = QueryProgress::new("kMkNN index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -435,16 +457,7 @@ where
                 let vec = &self.vectors_flat[start..end];
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 // Stored vectors are already normalised in Cosine mode, so
                 // skip query() and hit the internal path directly.
@@ -452,6 +465,7 @@ where
                 (orig_id, indices, dists)
             })
             .collect();
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -545,7 +559,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         );
     }
 
@@ -558,7 +572,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -572,8 +586,15 @@ mod tests {
     #[test]
     fn test_kmknn_query_finds_self_cosine() {
         let data = create_simple_matrix();
-        let index =
-            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false).unwrap();
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(2),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1).unwrap();
@@ -591,7 +612,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -612,7 +633,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -625,8 +646,15 @@ mod tests {
     #[test]
     fn test_kmknn_orthogonal_cosine() {
         let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
-        let index =
-            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false).unwrap();
+        let index = KmknnIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(3),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -647,7 +675,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let idx2 = KmknnIndex::build(
@@ -656,7 +684,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -675,7 +703,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -696,7 +724,7 @@ mod tests {
             Some(10),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -715,11 +743,11 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, dists) = index.generate_knn(3, true, false).unwrap();
+        let (indices, dists) = index.generate_knn(3, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert!(dists.is_some());
@@ -746,10 +774,11 @@ mod tests {
             Some(14),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
-        let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean);
+        let exhaustive =
+            ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0).collect();
         let k = 10;
@@ -770,9 +799,16 @@ mod tests {
         let dim = 16;
         let data = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 97) as f32 / 10.0 + 0.1);
 
-        let kmknn =
-            KmknnIndex::build(data.as_ref(), Dist::Cosine, Some(14), None, 42, false).unwrap();
-        let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::Cosine);
+        let kmknn = KmknnIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(14),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let exhaustive = ExhaustiveIndex::new(data.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         let query: Vec<f32> = (0..dim).map(|j| (j * 3 % 17) as f32 / 5.0 + 0.1).collect();
         let k = 10;

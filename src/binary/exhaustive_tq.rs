@@ -16,9 +16,6 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use thousands::*;
 
 use crate::binary::turboquant::{
     dists::{prepare_scalar_scoring, VectorDistanceTurboQuant},
@@ -29,6 +26,7 @@ use crate::binary::turboquant::{
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 /// Exhaustive TurboQuant index.
 ///
@@ -92,6 +90,7 @@ where
     /// * `metric` - Distance metric (`Cosine` or `SquaredEuclidean`)
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `seed` - Random seed for the rotation
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -101,7 +100,9 @@ where
         metric: &Dist,
         bits: usize,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-TurboQuant index", verbosity);
         if *metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
@@ -136,6 +137,8 @@ where
             .map(|x| x.to_f32().unwrap())
             .collect();
 
+        log.finish();
+
         Ok(Self {
             quantiser,
             blocked,
@@ -156,6 +159,7 @@ where
     /// * `metric` - Distance metric (`Cosine` or `SquaredEuclidean`)
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `seed` - Random seed for the rotation
+    /// * `verbosity` - See [`Verbosity`]
     /// * `save_path` - Directory for the persisted vectors
     ///
     /// ### Returns
@@ -166,11 +170,12 @@ where
         metric: &Dist,
         bits: usize,
         seed: usize,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
         // One walk of the caller's matrix, shared by the index and the store.
         let (vectors_flat, n, dim) = data.into_row_major();
-        let mut index = Self::new((&vectors_flat[..], n, dim), metric, bits, seed)?;
+        let mut index = Self::new((&vectors_flat[..], n, dim), metric, bits, seed, verbosity)?;
 
         let norms: Vec<T> = vectors_flat
             .chunks_exact(dim)
@@ -407,7 +412,7 @@ where
     /// * `rerank` - Whether to re-rank with exact distances
     /// * `rerank_factor` - Candidate multiplier when reranking (defaults to 20)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -419,7 +424,7 @@ where
         rerank: bool,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let bits = self.quantiser.storage.bits;
         let dim = self.quantiser.storage.dim;
@@ -453,19 +458,7 @@ where
             k_eff
         };
 
-        let counter = Arc::new(AtomicUsize::new(0));
-        let report = |counter: &Arc<AtomicUsize>, added: usize| {
-            if verbose {
-                let count = counter.fetch_add(added, Ordering::Relaxed) + added;
-                if count % 100_000 < added {
-                    println!(
-                        "  Processed {} / {} queries.",
-                        count.separate_with_underscores(),
-                        nq.separate_with_underscores()
-                    );
-                }
-            }
-        };
+        let progress = QueryProgress::new("Exhaustive-TurboQuant index", nq, false, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = if bits == 3 {
             // No fused kernel for 3-bit: score each query independently.
@@ -478,7 +471,7 @@ where
                     } else {
                         self.query(qvec, k)?
                     };
-                    report(&counter, 1);
+                    progress.tick_n(1);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?
@@ -551,7 +544,7 @@ where
                             out.push((indices, dists));
                         }
                     }
-                    report(&counter, batch_nq);
+                    progress.tick_n(batch_nq);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
@@ -559,6 +552,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
+        progress.finish();
         Ok(pack_knn_results(results, return_dist))
     }
 
@@ -574,7 +568,7 @@ where
     /// * `k` - Neighbours per vector
     /// * `rerank_factor` - Candidate multiplier (defaults to 20)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -584,7 +578,7 @@ where
         k: usize,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
@@ -596,20 +590,7 @@ where
         let dim = self.quantiser.storage.dim;
         let metric = self.quantiser.encoder.metric;
         let n = self.n;
-        let counter = Arc::new(AtomicUsize::new(0));
-
-        let report = |counter: &Arc<AtomicUsize>, added: usize| {
-            if verbose {
-                let count = counter.fetch_add(added, Ordering::Relaxed) + added;
-                if count % 100_000 < added {
-                    println!(
-                        "  Processed {} / {} samples.",
-                        count.separate_with_underscores(),
-                        n.separate_with_underscores()
-                    );
-                }
-            }
-        };
+        let progress = QueryProgress::new("Exhaustive-TurboQuant index", n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = if bits == 3 {
             (0..n)
@@ -617,7 +598,7 @@ where
                 .map(|i| {
                     let vec = vector_store.load_vector(i);
                     let out = self.query_reranking(vec, k, Some(rerank_factor))?;
-                    report(&counter, 1);
+                    progress.tick_n(1);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?
@@ -674,7 +655,7 @@ where
                         let cands: Vec<usize> = approx[qi].0.iter().map(|&x| x as usize).collect();
                         out.push(self.rerank_candidates(vector_store, qvec, &cands, k));
                     }
-                    report(&counter, batch_nq);
+                    progress.tick_n(batch_nq);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
@@ -682,6 +663,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
+        progress.finish();
         Ok(pack_knn_results(results, return_dist))
     }
 
@@ -791,14 +773,17 @@ mod tests {
     #[test]
     fn test_construction() {
         let data = test_data(100, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
         assert_eq!(index.n_vectors(), 100);
     }
 
     #[test]
     fn test_manhattan_rejected() {
         let data = test_data(10, 64);
-        let res = TurboQuantExhaustive::new(data.as_ref(), &Dist::Manhattan, 4, 42);
+        let res =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Manhattan, 4, 42, Verbosity::Quiet);
         assert!(matches!(
             res,
             Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
@@ -808,7 +793,9 @@ mod tests {
     #[test]
     fn test_query_returns_k_sorted() {
         let data = test_data(100, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
         let query = row(&data, 3);
         let (indices, distances) = index.query(&query, 10).unwrap();
         assert_eq!(indices.len(), 10);
@@ -821,8 +808,14 @@ mod tests {
     #[test]
     fn test_query_k_exceeds_n() {
         let data = test_data(40, 64);
-        let index =
-            TurboQuantExhaustive::new(data.as_ref(), &Dist::SquaredEuclidean, 4, 42).unwrap();
+        let index = TurboQuantExhaustive::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            4,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query = row(&data, 0);
         let (indices, _) = index.query(&query, 1000).unwrap();
         assert_eq!(indices.len(), 40);
@@ -831,7 +824,9 @@ mod tests {
     #[test]
     fn test_query_row_matches_query() {
         let data = test_data(60, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
         let (i_row, _) = index.query_row(data.as_ref().row(5), 8).unwrap();
         let (i_vec, _) = index.query(&row(&data, 5), 8).unwrap();
         assert_eq!(i_row, i_vec);
@@ -843,7 +838,8 @@ mod tests {
         // vector itself, both metrics.
         for metric in [Dist::Cosine, Dist::SquaredEuclidean] {
             let data = test_data(50, 128);
-            let index = TurboQuantExhaustive::new(data.as_ref(), &metric, 4, 42).unwrap();
+            let index =
+                TurboQuantExhaustive::new(data.as_ref(), &metric, 4, 42, Verbosity::Quiet).unwrap();
             for t in 0..50 {
                 let (indices, _) = index.query(&row(&data, t), 1).unwrap();
                 assert_eq!(
@@ -858,7 +854,9 @@ mod tests {
     #[test]
     fn test_3bit_query_returns_k_sorted() {
         let data = test_data(60, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42, Verbosity::Quiet)
+                .unwrap();
         let (indices, distances) = index.query(&row(&data, 1), 10).unwrap();
         assert_eq!(indices.len(), 10);
         for w in distances.windows(2) {
@@ -869,7 +867,9 @@ mod tests {
     #[test]
     fn test_3bit_self_query_recovers_self() {
         let data = test_data(40, 128);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42, Verbosity::Quiet)
+                .unwrap();
         for t in 0..40 {
             let (indices, _) = index.query(&row(&data, t), 1).unwrap();
             assert_eq!(indices[0], t);
@@ -879,7 +879,9 @@ mod tests {
     #[test]
     fn test_reranking_without_store_errors() {
         let data = test_data(30, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
         let res = index.query_reranking(&row(&data, 0), 5, Some(5));
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
@@ -887,8 +889,10 @@ mod tests {
     #[test]
     fn test_generate_knn_without_store_errors() {
         let data = test_data(30, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
-        let res = index.generate_knn(5, Some(5), false, false);
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
+        let res = index.generate_knn(5, Some(5), false, Verbosity::Quiet);
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
 
@@ -901,6 +905,7 @@ mod tests {
             &Dist::Cosine,
             4,
             42,
+            Verbosity::Quiet,
             dir.path(),
         )
         .unwrap();
@@ -930,11 +935,14 @@ mod tests {
             &Dist::Cosine,
             4,
             42,
+            Verbosity::Quiet,
             dir.path(),
         )
         .unwrap();
 
-        let (knn, dists) = index.generate_knn(k, Some(20), true, false).unwrap();
+        let (knn, dists) = index
+            .generate_knn(k, Some(20), true, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(knn.len(), n);
         assert!(dists.is_some());
         assert_eq!(dists.as_ref().unwrap().len(), n);
@@ -964,10 +972,13 @@ mod tests {
             &Dist::SquaredEuclidean,
             4,
             42,
+            Verbosity::Quiet,
             dir.path(),
         )
         .unwrap();
-        let (knn, dists) = index.generate_knn(5, Some(10), false, false).unwrap();
+        let (knn, dists) = index
+            .generate_knn(5, Some(10), false, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(knn.len(), 40);
         assert!(dists.is_none());
     }
@@ -976,7 +987,9 @@ mod tests {
     fn test_2bit_self_query_recovers_self() {
         // 2-bit is coarse; keep dim generous so self stays top-1.
         let data = test_data(40, 256);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 2, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 2, 42, Verbosity::Quiet)
+                .unwrap();
         for t in 0..40 {
             let (indices, _) = index.query(&row(&data, t), 1).unwrap();
             assert_eq!(indices[0], t);
@@ -991,10 +1004,12 @@ mod tests {
             for metric in [Dist::Cosine, Dist::SquaredEuclidean] {
                 let data = test_data(120, dim);
                 let queries = test_data(7, dim); // 7 -> a full batch of 4 + 3
-                let index = TurboQuantExhaustive::new(data.as_ref(), &metric, bits, 42).unwrap();
+                let index =
+                    TurboQuantExhaustive::new(data.as_ref(), &metric, bits, 42, Verbosity::Quiet)
+                        .unwrap();
 
                 let (batch_idx, batch_dist) = index
-                    .query_batch(queries.as_ref(), 10, false, None, true, false)
+                    .query_batch(queries.as_ref(), 10, false, None, true, Verbosity::Quiet)
                     .unwrap();
                 let batch_dist = batch_dist.unwrap();
 
@@ -1021,12 +1036,13 @@ mod tests {
             &Dist::Cosine,
             4,
             42,
+            Verbosity::Quiet,
             dir.path(),
         )
         .unwrap();
 
         let (batch_idx, batch_dist) = index
-            .query_batch(queries.as_ref(), 10, true, Some(10), true, false)
+            .query_batch(queries.as_ref(), 10, true, Some(10), true, Verbosity::Quiet)
             .unwrap();
         let batch_dist = batch_dist.unwrap();
 
@@ -1046,10 +1062,12 @@ mod tests {
     fn test_query_batch_3bit() {
         let data = test_data(60, 128);
         let queries = test_data(5, 128);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42).unwrap();
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 3, 42, Verbosity::Quiet)
+                .unwrap();
 
         let (batch_idx, _) = index
-            .query_batch(queries.as_ref(), 8, false, None, false, false)
+            .query_batch(queries.as_ref(), 8, false, None, false, Verbosity::Quiet)
             .unwrap();
         assert_eq!(batch_idx.len(), 5);
         for i in 0..5 {
@@ -1062,8 +1080,10 @@ mod tests {
     fn test_query_batch_rerank_without_store_errors() {
         let data = test_data(40, 64);
         let queries = test_data(4, 64);
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
-        let res = index.query_batch(queries.as_ref(), 5, true, Some(5), false, false);
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
+        let res = index.query_batch(queries.as_ref(), 5, true, Some(5), false, Verbosity::Quiet);
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
 
@@ -1071,8 +1091,10 @@ mod tests {
     fn test_query_batch_dimension_mismatch() {
         let data = test_data(40, 64);
         let queries = test_data(4, 32); // wrong dim
-        let index = TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42).unwrap();
-        let res = index.query_batch(queries.as_ref(), 5, false, None, false, false);
+        let index =
+            TurboQuantExhaustive::new(data.as_ref(), &Dist::Cosine, 4, 42, Verbosity::Quiet)
+                .unwrap();
+        let res = index.query_batch(queries.as_ref(), 5, false, None, false, Verbosity::Quiet);
         assert!(matches!(
             res,
             Err(AnnSearchErrors::DimensionMismatch {

@@ -29,6 +29,8 @@ pub mod errors;
 pub mod prelude;
 pub mod utils;
 
+pub use crate::utils::verbosity::{parse_annsearch_verbosity, Verbosity};
+
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
@@ -54,12 +56,6 @@ pub mod synthetic;
 
 use rayon::prelude::*;
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use thousands::*;
-
 #[cfg(feature = "gpu")]
 use cubecl::Device;
 #[cfg(feature = "quantised")]
@@ -80,6 +76,7 @@ use crate::cpu::{
 use crate::prelude::*;
 use crate::utils::nndescent_utils::ApplySortedUpdates;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::QueryProgress;
 
 #[cfg(feature = "binary")]
 use faer_traits::ComplexField;
@@ -142,9 +139,10 @@ fn check_n_samples(n: usize, max: usize) -> Result<(), AnnSearchErrors> {
 ///
 /// ### Params
 ///
+/// * `name` - What is queried, as printed (`"HNSW index"`)
 /// * `n_samples` - Number of samples to query
 /// * `return_dist` - Whether to return distances alongside indices
-/// * `verbose` - Print progress information every 100,000 samples
+/// * `verbosity` - Prints start, progress and end lines at `Normal`
 /// * `query_fn` - Closure that takes a sample index and returns (indices,
 ///   distances)
 ///
@@ -152,16 +150,24 @@ fn check_n_samples(n: usize, max: usize) -> Result<(), AnnSearchErrors> {
 ///
 /// A tuple of `(knn_indices, optional distances)`
 fn query_parallel<T, F>(
+    name: &'static str,
     n_samples: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
     T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
-    query_parallel_init(n_samples, return_dist, verbose, || (), |_, i| query_fn(i))
+    query_parallel_init(
+        name,
+        n_samples,
+        return_dist,
+        verbosity,
+        || (),
+        |_, i| query_fn(i),
+    )
 }
 
 /// Helper function to execute parallel queries across samples with per-thread
@@ -169,9 +175,10 @@ where
 ///
 /// ### Params
 ///
+/// * `name` - What is queried, as printed (`"HNSW index"`)
 /// * `n_samples` - Number of samples to query
 /// * `return_dist` - Whether to return distances alongside indices
-/// * `verbose` - Print progress information every 100,000 samples
+/// * `verbosity` - Prints start, progress and end lines at `Normal`
 /// * `init` - Creates one scratch value per rayon work split
 /// * `query_fn` - Closure that takes the scratch and a sample index and
 ///   returns (indices, distances)
@@ -180,9 +187,10 @@ where
 ///
 /// A tuple of `(knn_indices, optional distances)`
 fn query_parallel_init<T, S, I, F>(
+    name: &'static str,
     n_samples: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
     init: I,
     query_fn: F,
 ) -> KnnOptionResult<T>
@@ -191,25 +199,17 @@ where
     I: Fn() -> S + Sync + Send,
     F: Fn(&mut S, usize) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> + Sync,
 {
-    let counter = Arc::new(AtomicUsize::new(0));
+    let progress = QueryProgress::new(name, n_samples, false, verbosity);
 
     let results: Vec<(Vec<usize>, Vec<T>)> = (0..n_samples)
         .into_par_iter()
         .map_init(init, |scratch, i| {
             let result = query_fn(scratch, i)?;
-            if verbose {
-                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if count.is_multiple_of(100_000) {
-                    println!(
-                        "  Processed {} / {} samples.",
-                        count.separate_with_underscores(),
-                        n_samples.separate_with_underscores()
-                    );
-                }
-            }
+            progress.tick();
             Ok(result)
         })
         .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+    progress.finish();
 
     Ok(pack_knn_results(results, return_dist))
 }
@@ -218,9 +218,10 @@ where
 ///
 /// ### Params
 ///
+/// * `name` - What is queried, as printed (`"HNSW index"`)
 /// * `n_samples` - Number of samples to query
 /// * `return_dist` - Whether to return distances alongside indices
-/// * `verbose` - Print progress information every 100,000 samples
+/// * `verbosity` - Prints start, progress and end lines at `Normal`
 /// * `query_fn` - Closure that takes a sample index and returns (indices,
 ///   distances, flag)
 ///
@@ -235,34 +236,27 @@ where
 /// for LSH queries where the flag indicates samples not represented in hash
 /// buckets.
 fn query_parallel_with_flags<T, F>(
+    name: &'static str,
     n_samples: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
     query_fn: F,
 ) -> KnnOptionResult<T>
 where
     T: Send + num_traits::Zero + PartialOrd,
     F: Fn(usize) -> Result<(Vec<usize>, Vec<T>, bool), AnnSearchErrors> + Sync,
 {
-    let counter = Arc::new(AtomicUsize::new(0));
+    let progress = QueryProgress::new(name, n_samples, false, verbosity);
 
     let results: Vec<(Vec<usize>, Vec<T>, bool)> = (0..n_samples)
         .into_par_iter()
         .map(|i| {
             let result = query_fn(i)?;
-            if verbose {
-                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if count.is_multiple_of(100_000) {
-                    println!(
-                        " Processed {} / {} samples.",
-                        count.separate_with_underscores(),
-                        n_samples.separate_with_underscores()
-                    );
-                }
-            }
+            progress.tick();
             Ok(result)
         })
         .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+    progress.finish();
 
     let mut random: usize = 0;
     let mut indices: Vec<Vec<usize>> = Vec::with_capacity(results.len());
@@ -277,8 +271,7 @@ where
     }
 
     if (random as f32) / (n_samples as f32) >= 0.01 {
-        println!("More than 1% of samples were not represented in the buckets.");
-        println!("Please verify underlying data");
+        println!("[WARNING] More than 1% of samples were not represented in the buckets. Please verify the underlying data.");
     }
 
     if return_dist {
@@ -350,11 +343,16 @@ where
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan"
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
 /// The initialised `ExhausiveIndex`
-pub fn build_exhaustive_index<T>(mat: impl AnnMatrix<T>, dist_metric: &str) -> ExhaustiveIndex<T>
+pub fn build_exhaustive_index<T>(
+    mat: impl AnnMatrix<T>,
+    dist_metric: &str,
+    verbosity: Verbosity,
+) -> ExhaustiveIndex<T>
 where
     T: AnnSearchFloat,
 {
@@ -363,7 +361,7 @@ where
         Dist::default()
     });
 
-    ExhaustiveIndex::new(mat, metric)
+    ExhaustiveIndex::new(mat, metric, verbosity)
 }
 
 /// Helper function to query a given exhaustive index
@@ -376,7 +374,7 @@ where
 /// * `index` - The exhaustive index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -386,13 +384,13 @@ pub fn query_exhaustive_index<T>(
     index: &ExhaustiveIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, _) = query_mat.into_row_major();
-    let results = index.query_batch(&queries, nq, k, None, verbose)?;
+    let results = index.query_batch(&queries, nq, k, None, verbosity)?;
 
     Ok(pack_knn_results(results, return_dist))
 }
@@ -406,7 +404,7 @@ where
 /// * `index` - The exhaustive index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -415,12 +413,12 @@ pub fn query_exhaustive_self<T>(
     index: &ExhaustiveIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, return_dist, verbose)
+    index.generate_knn(k, return_dist, verbosity)
 }
 
 ///////////
@@ -441,7 +439,7 @@ where
 ///   [KMeansTrainingParams]. If not provided, will default to sensible
 ///   defaults.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print build progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -452,7 +450,7 @@ pub fn build_kmknn_index<T>(
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<KmknnIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -463,7 +461,7 @@ where
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
+    KmknnIndex::build(mat, metric, nlist, k_means_params, seed, verbosity)
 }
 
 /// Helper function to query a given kMkNN index
@@ -476,7 +474,7 @@ where
 /// * `index` - The kMkNN index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -486,14 +484,14 @@ pub fn query_kmknn_index<T>(
     index: &KmknnIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("kMkNN index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
@@ -507,7 +505,7 @@ where
 /// * `index` - The kMkNN index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -516,12 +514,12 @@ pub fn query_kmknn_self<T>(
     index: &KmknnIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, return_dist, verbose)
+    index.generate_knn(k, return_dist, verbosity)
 }
 
 ///////////
@@ -539,6 +537,7 @@ where
 ///   not supported.
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -548,6 +547,7 @@ pub fn build_annoy_index<T>(
     dist_metric: &str,
     n_trees: usize,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<AnnoyIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -559,7 +559,7 @@ where
         Dist::default()
     });
 
-    AnnoyIndex::new(mat, n_trees, metric, seed)
+    AnnoyIndex::new(mat, n_trees, metric, seed, verbosity)
 }
 
 /// Helper function to query a given Annoy index
@@ -574,7 +574,7 @@ where
 /// * `search_budget` - Search budget per tree
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -585,17 +585,24 @@ pub fn query_annoy_index<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel_init(nq, return_dist, verbose, AnnoyScratch::new, |scratch, i| {
-        index.query_into(&queries[i * dim..(i + 1) * dim], k, search_budget, scratch)?;
-        Ok(scratch.results().iter().map(|&(d, i)| (i, d)).unzip())
-    })
+    query_parallel_init(
+        "Annoy index",
+        nq,
+        return_dist,
+        verbosity,
+        AnnoyScratch::new,
+        |scratch, i| {
+            index.query_into(&queries[i * dim..(i + 1) * dim], k, search_budget, scratch)?;
+            Ok(scratch.results().iter().map(|&(d, i)| (i, d)).unzip())
+        },
+    )
 }
 
 /// Helper function to self query the Annoy index
@@ -609,7 +616,7 @@ where
 /// * `search_budget` - Search budget per tree
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -619,12 +626,12 @@ pub fn query_annoy_self<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, search_budget, return_dist, verbose)
+    index.generate_knn(k, search_budget, return_dist, verbosity)
 }
 
 //////////////
@@ -641,6 +648,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -649,6 +657,7 @@ pub fn build_balltree_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<BallTreeIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -659,7 +668,7 @@ where
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    BallTreeIndex::new(mat, metric, seed)
+    BallTreeIndex::new(mat, metric, seed, verbosity)
 }
 
 /// Helper function to query a given BallTree index
@@ -674,7 +683,7 @@ where
 /// * `search_budget` - Search budget (number of items to examine)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -685,14 +694,14 @@ pub fn query_balltree_index<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("BallTree index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
     })
 }
@@ -708,7 +717,7 @@ where
 /// * `search_budget` - Search budget (number of items to examine)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -718,12 +727,12 @@ pub fn query_balltree_self<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, search_budget, return_dist, verbose)
+    index.generate_knn(k, search_budget, return_dist, verbosity)
 }
 
 //////////
@@ -741,6 +750,7 @@ where
 /// * `ef_construction` - Size of candidate list during construction.
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -751,7 +761,7 @@ pub fn build_hnsw_index<T>(
     ef_construction: usize,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<HnswIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -770,7 +780,7 @@ where
         ef_construction,
         &metric,
         seed,
-        verbose,
+        verbosity,
     ))
 }
 
@@ -787,7 +797,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -803,7 +813,7 @@ pub fn query_hnsw_index<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
@@ -811,7 +821,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("HNSW index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -829,7 +839,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -839,13 +849,13 @@ pub fn query_hnsw_self<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     HnswIndex<T>: HnswState<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 /////////
@@ -866,7 +876,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -877,7 +887,7 @@ pub fn build_ivf_index<T>(
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -889,7 +899,7 @@ where
         Dist::default()
     });
 
-    IvfIndex::build(mat, metric, nlist, k_means_params, seed, verbose)
+    IvfIndex::build(mat, metric, nlist, k_means_params, seed, verbosity)
 }
 
 /// Helper function to query a given IVF index
@@ -906,7 +916,7 @@ where
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -922,14 +932,14 @@ pub fn query_ivf_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("IVF index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -952,7 +962,7 @@ where
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -967,12 +977,12 @@ pub fn query_ivf_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 //////////
@@ -1003,7 +1013,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -1019,7 +1029,7 @@ pub fn build_soar_index<T>(
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<SoarIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1031,7 +1041,7 @@ where
         Dist::default()
     });
 
-    SoarIndex::build(mat, metric, nlist, rule, k_means_params, seed, verbose)
+    SoarIndex::build(mat, metric, nlist, rule, k_means_params, seed, verbosity)
 }
 
 /// Helper function to query a given SOAR index
@@ -1047,7 +1057,7 @@ where
 ///   the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1063,14 +1073,14 @@ pub fn query_soar_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("SOAR index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -1088,7 +1098,7 @@ where
 ///   the cost of speed
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1103,12 +1113,12 @@ pub fn query_soar_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 ////////////
@@ -1125,6 +1135,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan".
 /// * `n_trees` - Number of trees to use to build the index
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -1134,6 +1145,7 @@ pub fn build_kd_tree_index<T>(
     dist_metric: &str,
     n_trees: usize,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<KdTreeIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1145,7 +1157,7 @@ where
         Dist::default()
     });
 
-    Ok(KdTreeIndex::new(mat, n_trees, metric, seed))
+    Ok(KdTreeIndex::new(mat, n_trees, metric, seed, verbosity))
 }
 
 /// Helper function to query a given Kd-Tree index
@@ -1160,7 +1172,7 @@ where
 /// * `search_budget` - Search budget (total items to examine)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1171,14 +1183,14 @@ pub fn query_kd_tree_index<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("KdForest index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, search_budget)
     })
 }
@@ -1194,7 +1206,7 @@ where
 /// * `search_budget` - Search budget (total items to examine)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1204,12 +1216,12 @@ pub fn query_kd_tree_self<T>(
     k: usize,
     search_budget: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, search_budget, return_dist, verbose)
+    index.generate_knn(k, search_budget, return_dist, verbosity)
 }
 
 /////////
@@ -1236,6 +1248,7 @@ where
 ///   the median) and 2 for squared Euclidean, which needs more than a sign to
 ///   see vector magnitude.
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1247,6 +1260,7 @@ pub fn build_lsh_index<T>(
     bits_per_hash: usize,
     slot_bits: Option<usize>,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<LSHIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1258,7 +1272,15 @@ where
         Dist::default()
     });
 
-    LSHIndex::new(mat, metric, num_tables, bits_per_hash, slot_bits, seed)
+    LSHIndex::new(
+        mat,
+        metric,
+        num_tables,
+        bits_per_hash,
+        slot_bits,
+        seed,
+        verbosity,
+    )
 }
 
 /// Helper function to query a given LSH index
@@ -1278,7 +1300,7 @@ where
 /// * `nprobe` - Number of additional buckets to probe per table, ordered by how
 ///   close the query sits to each slot boundary.
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1290,14 +1312,14 @@ pub fn query_lsh_index<T>(
     n_probe: usize,
     max_candidates: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel_with_flags(nq, return_dist, verbose, |i| {
+    query_parallel_with_flags("LSH index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, max_candidates, n_probe)
     })
 }
@@ -1316,7 +1338,7 @@ where
 ///   Defaults to the number of projections per table, which is half of the
 ///   `2 * n_proj` single-slot shifts available.
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1327,14 +1349,14 @@ pub fn query_lsh_self<T>(
     n_probe: Option<usize>,
     max_candidates: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let n_probe = n_probe.unwrap_or(index.num_projections());
 
-    Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbose))
+    Ok(index.generate_knn(k, max_candidates, n_probe, return_dist, verbosity))
 }
 
 ///////////////
@@ -1365,7 +1387,7 @@ where
 /// * `n_tree` - Random-projection trees seeding the graph (default
 ///   `5 + sqrt(n) / 20`, capped at 64).
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Controls verbosity of the algorithm
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -1381,7 +1403,7 @@ pub fn build_nndescent_index<T>(
     max_candidates: Option<usize>,
     n_tree: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NNDescent<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1405,7 +1427,7 @@ where
         delta,
         diversify_prob,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -1421,7 +1443,7 @@ where
 /// * `ef_search` -
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1437,7 +1459,7 @@ pub fn query_nndescent_index<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
@@ -1446,7 +1468,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("NNDescent index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -1462,7 +1484,7 @@ where
 /// * `ef_search` -
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1477,14 +1499,14 @@ pub fn query_nndescent_self<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     NNDescent<T>: ApplySortedUpdates<T>,
     NNDescent<T>: NNDescentQuery<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 /// Extract the kNN graph NN-Descent already built.
@@ -1542,7 +1564,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhattan".
 /// * `params` - Optional [`NNDescentKnnParams`]; `None` uses the defaults
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Controls verbosity of the algorithm
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1552,7 +1574,7 @@ pub fn build_knn_graph_nndescent<T>(
     dist_metric: &str,
     params: Option<NNDescentKnnParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<KnnGraph<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1571,7 +1593,7 @@ where
         metric,
         params.unwrap_or_default(),
         seed,
-        verbose,
+        verbosity,
     ))
 }
 
@@ -1595,6 +1617,7 @@ where
 /// * `alpha_pass2` - Pruning alpha for pass 2 (typically 1.2–1.5).
 /// * `dist_metric` - Distance metric: "euclidean", "cosine" or "manhatten".
 /// * `seed` - Random seed for reproducibility.
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1610,6 +1633,7 @@ pub fn build_vamana_index<T>(
     alpha_pass2: f32,
     dist_metric: &str,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<VamanaIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1631,6 +1655,7 @@ where
         alpha_pass1,
         alpha_pass2,
         seed,
+        verbosity,
     ))
 }
 
@@ -1646,7 +1671,7 @@ where
 /// * `ef_search` - Optional beam width override. Defaults to 100 inside the
 ///   index if `None`.
 /// * `return_dist` - Whether to return distances.
-/// * `verbose` - Print progress every 100,000 samples.
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1657,7 +1682,7 @@ pub fn query_vamana_index<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
@@ -1665,7 +1690,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("Vamana index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -1678,7 +1703,7 @@ where
 /// * `k` - Number of neighbours to return.
 /// * `ef_search` - Optional beam width override.
 /// * `return_dist` - Whether to return distances.
-/// * `verbose` - Print progress every 100,000 samples.
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1688,13 +1713,13 @@ pub fn query_vamana_self<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     VamanaIndex<T>: VamanaState<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 /////////
@@ -1721,7 +1746,7 @@ where
 /// * `dist_metric` - Distance metric: `"euclidean"`, `"cosine"`, or
 ///   `"manhattan"`
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1735,7 +1760,7 @@ pub fn build_nsg_index<T>(
     knn_k: usize,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NsgIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1750,7 +1775,7 @@ where
     });
 
     let params = NsgBuildParams::new(r, l_build, c, knn_k);
-    NsgIndex::build(mat, metric, params, seed, verbose)
+    NsgIndex::build(mat, metric, params, seed, verbosity)
 }
 
 /// Build an NSG index reusing an already-built NN-Descent index.
@@ -1766,7 +1791,7 @@ where
 /// * `l_build` - Beam width for the per-node candidate search
 /// * `c` - Cap on the candidate-set size before MRNG pruning
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1778,7 +1803,7 @@ pub fn build_nsg_from_knn_index<T>(
     l_build: usize,
     c: usize,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NsgIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1786,7 +1811,7 @@ where
     NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
 {
     let params = NsgBuildParams::new(r, l_build, c, nndescent_idx.k);
-    NsgIndex::build_from_nndescent(nndescent_idx, params, seed, verbose)
+    NsgIndex::build_from_nndescent(nndescent_idx, params, seed, verbosity)
 }
 
 /// Query an NSG index with an external query matrix.
@@ -1800,7 +1825,7 @@ where
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override. Defaults to `100` if `None`
 /// * `return_dist` - Whether to return distances
-/// * `verbose` - Print progress every 100_000 samples
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1811,7 +1836,7 @@ pub fn query_nsg_index<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
@@ -1819,7 +1844,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("NSG index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -1832,7 +1857,7 @@ where
 /// * `k` - Number of neighbours to return
 /// * `ef_search` - Optional beam width override
 /// * `return_dist` - Whether to return distances
-/// * `verbose` - Print progress every 100_000 samples
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1842,13 +1867,13 @@ pub fn query_nsg_self<T>(
     k: usize,
     ef_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     NsgIndex<T>: NsgState<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 /////////////////////////
@@ -1875,7 +1900,7 @@ where
 /// * `n_trees` - Kd-forest size for query entry points. `None` picks a
 ///   dataset-scaled default `min(5 + n^0.25 / 2, 16)`.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1890,7 +1915,7 @@ pub fn build_rnn_descent_index<T>(
     dist_metric: &str,
     n_trees: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<RnnDescentIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -1904,7 +1929,7 @@ where
     });
 
     let params = RnnDescentBuildParams::new(s, r, t1, t2);
-    RnnDescentIndex::build(mat, metric, params, n_trees, seed, verbose)
+    RnnDescentIndex::build(mat, metric, params, n_trees, seed, verbosity)
 }
 
 /// Query an RNN-Descent index with an external query matrix.
@@ -1920,7 +1945,7 @@ where
 /// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`),
 ///   the paper's search-time `K` (Ono & Matsui 2023, Section 4.4)
 /// * `return_dist` - Whether to return distances
-/// * `verbose` - Print progress every 100_000 samples
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1932,7 +1957,7 @@ pub fn query_rnn_descent_index<T>(
     ef_search: Option<usize>,
     k_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
@@ -1940,7 +1965,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("RNNDescent index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search, k_search)
     })
 }
@@ -1954,7 +1979,7 @@ where
 /// * `ef_search` - Optional beam width override
 /// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
 /// * `return_dist` - Whether to return distances
-/// * `verbose` - Print progress every 100_000 samples
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -1965,13 +1990,13 @@ pub fn query_rnn_descent_self<T>(
     ef_search: Option<usize>,
     k_search: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
     RnnDescentIndex<T>: RnnDescentState<T>,
 {
-    index.generate_knn(k, ef_search, k_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, k_search, return_dist, verbosity)
 }
 
 ///////////////
@@ -1992,7 +2017,7 @@ where
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2000,7 +2025,7 @@ where
 pub fn build_exhaustive_bf16_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexBf16<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Bf16Compatible,
@@ -2013,10 +2038,7 @@ where
     let (vectors_flat, n, dim) = mat.into_row_major();
     check_n_samples(n, MAX_SAMPLES_U32)?;
 
-    if verbose {
-        println!("Building exhaustive BF16 index with {} samples", n);
-    }
-    ExhaustiveIndexBf16::new((vectors_flat, n, dim), metric)
+    ExhaustiveIndexBf16::new((vectors_flat, n, dim), metric, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2030,7 +2052,7 @@ where
 /// * `index` - Reference to the built Exhaustive-BF16 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2040,14 +2062,14 @@ pub fn query_exhaustive_bf16_index<T>(
     index: &ExhaustiveIndexBf16<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("Exhaustive-BF16 index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
@@ -2062,7 +2084,7 @@ where
 /// * `index` - Reference to the built Exhaustive-BF16 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2071,12 +2093,12 @@ pub fn query_exhaustive_bf16_self<T>(
     index: &ExhaustiveIndexBf16<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    Ok(index.generate_knn(k, return_dist, verbose))
+    Ok(index.generate_knn(k, return_dist, verbosity))
 }
 
 ////////////////////
@@ -2095,7 +2117,7 @@ where
 ///   not supported.
 /// * `quant_params` - Optional calibration settings, see
 ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2104,7 +2126,7 @@ pub fn build_exhaustive_sq8_index<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     quant_params: Option<UniformQuantParams>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveSq8Index<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -2117,10 +2139,7 @@ where
     let (vectors_flat, n, dim) = mat.into_row_major();
     check_n_samples(n, MAX_SAMPLES_U32)?;
 
-    if verbose {
-        println!("Building exhaustive SQ8 index with {} samples", n);
-    }
-    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric, quant_params)
+    ExhaustiveSq8Index::new((vectors_flat, n, dim), metric, quant_params, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2134,7 +2153,7 @@ where
 /// * `index` - Reference to the built Exhaustive-SQ8 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2144,14 +2163,14 @@ pub fn query_exhaustive_sq8_index<T>(
     index: &ExhaustiveSq8Index<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("Exhaustive-SQ8 index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
@@ -2166,7 +2185,7 @@ where
 /// * `index` - Reference to the built Exhaustive-SQ8 index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2175,12 +2194,12 @@ pub fn query_exhaustive_sq8_self<T>(
     index: &ExhaustiveSq8Index<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    Ok(index.generate_knn(k, return_dist, verbose))
+    Ok(index.generate_knn(k, return_dist, verbosity))
 }
 
 ////////////////////
@@ -2202,7 +2221,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2215,7 +2234,7 @@ pub fn build_exhaustive_pq_index<T>(
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<ExhaustivePqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -2227,7 +2246,7 @@ where
         Dist::default()
     });
 
-    ExhaustivePqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
+    ExhaustivePqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2241,7 +2260,7 @@ where
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2251,14 +2270,14 @@ pub fn query_exhaustive_pq_index<T>(
     index: &ExhaustivePqIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("Exhaustive-PQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
@@ -2275,7 +2294,7 @@ where
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2284,12 +2303,12 @@ pub fn query_exhaustive_pq_index_self<T>(
     index: &ExhaustivePqIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, return_dist, verbose)
+    index.generate_knn(k, return_dist, verbosity)
 }
 
 ////////////////////
@@ -2311,7 +2330,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2324,7 +2343,7 @@ pub fn build_exhaustive_opq_index<T>(
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveOpqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + AddAssign,
@@ -2335,7 +2354,7 @@ where
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    ExhaustiveOpqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbose)
+    ExhaustiveOpqIndex::build(mat, m, metric, max_iters, n_pq_centroids, seed, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2349,7 +2368,7 @@ where
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2359,14 +2378,14 @@ pub fn query_exhaustive_opq_index<T>(
     index: &ExhaustiveOpqIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("Exhaustive-OPQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k)
     })
 }
@@ -2383,7 +2402,7 @@ where
 /// * `index` - Reference to the built Exhaustive-PQ index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2392,12 +2411,12 @@ pub fn query_exhaustive_opq_index_self<T>(
     index: &ExhaustiveOpqIndex<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
-    index.generate_knn(k, return_dist, verbose)
+    index.generate_knn(k, return_dist, verbosity)
 }
 
 //////////////
@@ -2420,7 +2439,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2431,7 +2450,7 @@ pub fn build_ivf_bf16_index<T>(
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfIndexBf16<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Bf16Compatible,
@@ -2443,7 +2462,7 @@ where
         Dist::default()
     });
 
-    IvfIndexBf16::build(mat, metric, nlist, k_means_params, seed, verbose)
+    IvfIndexBf16::build(mat, metric, nlist, k_means_params, seed, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2460,7 +2479,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2471,14 +2490,14 @@ pub fn query_ivf_bf16_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("IVF-BF16 index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -2499,7 +2518,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2509,12 +2528,12 @@ pub fn query_ivf_bf16_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Bf16Compatible,
 {
-    Ok(index.generate_knn(k, nprobe, return_dist, verbose))
+    Ok(index.generate_knn(k, nprobe, return_dist, verbosity))
 }
 
 /////////////
@@ -2539,7 +2558,7 @@ where
 /// * `seed` - Random seed for reproducibility
 /// * `quant_params` - Optional calibration settings, see
 ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2552,7 +2571,7 @@ pub fn build_ivf_sq8_index<T>(
     dist_metric: &str,
     seed: usize,
     quant_params: Option<UniformQuantParams>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfSq8Index<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -2571,7 +2590,7 @@ where
         k_means_params,
         seed,
         quant_params,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2589,7 +2608,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2600,14 +2619,14 @@ pub fn query_ivf_sq8_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("IVF-SQ8 index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -2628,7 +2647,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the inner product scores be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2638,12 +2657,12 @@ pub fn query_ivf_sq8_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    Ok(index.generate_knn(k, nprobe, return_dist, verbose))
+    Ok(index.generate_knn(k, nprobe, return_dist, verbosity))
 }
 
 ////////////////
@@ -2668,7 +2687,7 @@ where
 /// * `seed` - Random seed for reproducibility
 /// * `quant_params` - Optional calibration settings, see
 ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2688,7 +2707,7 @@ pub fn build_hnsw_sq8u_index<T>(
     dist_metric: &str,
     seed: usize,
     quant_params: Option<UniformQuantParams>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<HnswSq8uIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
@@ -2707,7 +2726,7 @@ where
         &metric,
         seed,
         quant_params,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2725,7 +2744,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2736,14 +2755,14 @@ pub fn query_hnsw_sq8u_index<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("HNSW-SQ8U index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -2762,7 +2781,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -2772,12 +2791,12 @@ pub fn query_hnsw_sq8u_self<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 ////////////
@@ -2801,7 +2820,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2815,7 +2834,7 @@ pub fn build_ivf_pq_index<T>(
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfPqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -2835,7 +2854,7 @@ where
         k_means_params,
         n_pq_centroids,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2867,7 +2886,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2886,7 +2905,7 @@ pub fn build_soar_pq_index<T>(
     n_pq_centroids: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<SoarPqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -2907,7 +2926,7 @@ where
         k_means_params,
         n_pq_centroids,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2934,7 +2953,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -2950,7 +2969,7 @@ pub fn build_soar_opq_index<T>(
     opq_iter: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<SoarOpqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + AddAssign,
@@ -2972,7 +2991,7 @@ where
         n_opq_centroids,
         opq_iter,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2989,7 +3008,7 @@ where
 /// * `nprobe` - Number of clusters to search
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3000,14 +3019,14 @@ pub fn query_soar_opq_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("SOAR-OPQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -3025,7 +3044,7 @@ where
 /// * `nprobe` - Number of clusters to search
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3035,12 +3054,12 @@ pub fn query_soar_opq_index_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3056,7 +3075,7 @@ where
 /// * `nprobe` - Number of clusters to search
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3067,14 +3086,14 @@ pub fn query_soar_pq_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("SOAR-PQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -3093,7 +3112,7 @@ where
 /// * `nprobe` - Number of clusters to search
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3103,12 +3122,12 @@ pub fn query_soar_pq_index_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3125,7 +3144,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3136,14 +3155,14 @@ pub fn query_ivf_pq_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("IVF-PQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -3163,7 +3182,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3173,12 +3192,12 @@ pub fn query_ivf_pq_index_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 /////////////
@@ -3202,7 +3221,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Return
 ///
@@ -3217,7 +3236,7 @@ pub fn build_ivf_opq_index<T>(
     n_opq_iter: Option<usize>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfOpqIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + AddAssign,
@@ -3238,7 +3257,7 @@ where
         n_opq_iter,
         n_opq_centroids,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -3256,7 +3275,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3267,14 +3286,14 @@ pub fn query_ivf_opq_index<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("IVF-OPQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
     })
 }
@@ -3294,7 +3313,7 @@ where
 ///   at nlist)
 ///   Higher values improve recall at the cost of speed
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3304,12 +3323,12 @@ pub fn query_ivf_opq_index_self<T>(
     k: usize,
     nprobe: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + AddAssign,
 {
-    index.generate_knn(k, nprobe, return_dist, verbose)
+    index.generate_knn(k, nprobe, return_dist, verbosity)
 }
 
 /////////
@@ -3331,6 +3350,7 @@ where
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `device` - The GPU device to use
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3339,6 +3359,7 @@ pub fn build_exhaustive_index_gpu<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
     device: Device,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexGpu<T>, AnnSearchErrors>
 where
     T: CubeclFloat + AnnSearchFloat,
@@ -3349,7 +3370,7 @@ where
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    ExhaustiveIndexGpu::new(mat, metric, device)
+    ExhaustiveIndexGpu::new(mat, metric, device, verbosity)
 }
 
 #[cfg(feature = "gpu")]
@@ -3363,6 +3384,7 @@ where
 /// * `index` - The exhaustive GPU index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3372,12 +3394,12 @@ pub fn query_exhaustive_index_gpu<T>(
     index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, verbose)?;
+    let (indices, distances) = index.query_batch(query_mat, k, verbosity)?;
 
     if return_dist {
         Ok((indices, Some(distances)))
@@ -3399,6 +3421,7 @@ where
 /// * `index` - The exhaustive GPU index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3407,12 +3430,12 @@ pub fn query_exhaustive_index_gpu_self<T>(
     index: &ExhaustiveIndexGpu<T>,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: CubeclFloat + AnnSearchFloat,
 {
-    let res = index.generate_knn(k, return_dist, verbose)?;
+    let res = index.generate_knn(k, return_dist, verbosity)?;
 
     Ok(res)
 }
@@ -3431,6 +3454,7 @@ where
 ///   `(&[f32], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
 ///   not supported.
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3438,6 +3462,7 @@ where
 pub fn build_exhaustive_index_mlx(
     mat: impl AnnMatrix<f32>,
     dist_metric: &str,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexMlx, AnnSearchErrors> {
     let mat = mat.into_row_major();
     check_n_samples(mat.1, MAX_SAMPLES_U32)?;
@@ -3445,7 +3470,7 @@ pub fn build_exhaustive_index_mlx(
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    let index = ExhaustiveIndexMlx::new(mat.into_row_major(), metric)?;
+    let index = ExhaustiveIndexMlx::new(mat.into_row_major(), metric, verbosity)?;
     crate::mlx::clear_cache()?;
     Ok(index)
 }
@@ -3461,7 +3486,7 @@ pub fn build_exhaustive_index_mlx(
 /// * `index` - The exhaustive MLX index
 /// * `k` - Number of neighbours to return
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print the device versus host time split
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3471,9 +3496,9 @@ pub fn query_exhaustive_index_mlx(
     index: &ExhaustiveIndexMlx,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
-    let (indices, distances) = index.query_batch(query_mat.into_row_major(), k, verbose)?;
+    let (indices, distances) = index.query_batch(query_mat.into_row_major(), k, verbosity)?;
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3485,7 +3510,7 @@ pub fn query_exhaustive_index_mlx(
 /// * `index` - The exhaustive MLX index
 /// * `k` - Number of neighbours to return, self included
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Print the device versus host time split
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3494,9 +3519,9 @@ pub fn query_exhaustive_index_mlx_self(
     index: &ExhaustiveIndexMlx,
     k: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
-    index.generate_knn(k, return_dist, verbose)
+    index.generate_knn(k, return_dist, verbosity)
 }
 
 //////////////////////
@@ -3519,6 +3544,7 @@ pub fn query_exhaustive_index_mlx_self(
 /// * `entry_points` - Optional `[n_queries * n_entry]` entry node ids; `None`
 ///   uses the medoid plus random nodes
 /// * `return_dist` - Return distances
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3530,10 +3556,13 @@ pub fn query_cagra_index_mlx(
     query_params: Option<CagraMlxSearchParams>,
     entry_points: Option<&[u32]>,
     return_dist: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
     let (queries_flat, n_queries, _) = query_mat.into_row_major();
+    let progress = QueryProgress::new("CAGRA-MLX index", n_queries, false, verbosity);
     let (indices, distances) =
         index.search(&queries_flat, n_queries, k, query_params, entry_points, 42)?;
+    progress.finish();
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3549,6 +3578,7 @@ pub fn query_cagra_index_mlx(
 ///   [`crate::mlx::cagra_mlx::self_entry_points`]; `None` derives them from
 ///   the navigational graph
 /// * `return_dist` - Return distances
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3559,8 +3589,11 @@ pub fn query_cagra_index_mlx_self(
     query_params: Option<CagraMlxSearchParams>,
     entry_points: Option<&[u32]>,
     return_dist: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
+    let progress = QueryProgress::new("CAGRA-MLX index", index.n, true, verbosity);
     let (indices, distances) = index.self_search(k, query_params, entry_points, 42)?;
+    progress.finish();
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3584,7 +3617,7 @@ pub fn query_cagra_index_mlx_self(
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhattan" is
 ///   not supported.
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3595,7 +3628,7 @@ pub fn build_ivf_index_mlx(
     k_means_params: Option<KMeansTrainingParams>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfIndexMlx, AnnSearchErrors> {
     let mat = mat.into_row_major();
     check_n_samples(mat.1, MAX_SAMPLES_U32)?;
@@ -3609,7 +3642,7 @@ pub fn build_ivf_index_mlx(
         nlist,
         k_means_params,
         seed,
-        verbose,
+        verbosity,
     )?;
     // The k-means transients sit in MLX's buffer cache once dropped.
     crate::mlx::clear_cache()?;
@@ -3629,7 +3662,7 @@ pub fn build_ivf_index_mlx(
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `nquery` - Queries per device tile
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3641,10 +3674,10 @@ pub fn query_ivf_index_mlx(
     nprobe: Option<usize>,
     nquery: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
     let (indices, distances) =
-        index.query_batch(query_mat.into_row_major(), k, nprobe, nquery, verbose)?;
+        index.query_batch(query_mat.into_row_major(), k, nprobe, nquery, verbosity)?;
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3658,7 +3691,7 @@ pub fn query_ivf_index_mlx(
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `nquery` - Queries per device tile
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3669,9 +3702,9 @@ pub fn query_ivf_index_mlx_self(
     nprobe: Option<usize>,
     nquery: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
-    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+    index.generate_knn(k, nprobe, nquery, return_dist, verbosity)
 }
 
 ///////////////////
@@ -3696,7 +3729,7 @@ pub fn query_ivf_index_mlx_self(
 /// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3713,7 +3746,7 @@ pub fn build_knn_graph_mlx(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<KnnGraphMlx, AnnSearchErrors> {
     let mat = mat.into_row_major();
     check_n_samples(mat.1, MAX_SAMPLES_NND)?;
@@ -3733,7 +3766,7 @@ pub fn build_knn_graph_mlx(
         rho,
         refine_knn,
         seed,
-        verbose,
+        verbosity,
     )?;
     crate::mlx::clear_cache()?;
     Ok(graph)
@@ -3760,7 +3793,7 @@ pub fn build_knn_graph_mlx(
 /// * `rho` - Sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3777,7 +3810,7 @@ pub fn build_nndescent_index_mlx(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NNDescentIndexMlx, AnnSearchErrors> {
     let mat = mat.into_row_major();
     check_n_samples(mat.1, MAX_SAMPLES_NND)?;
@@ -3797,7 +3830,7 @@ pub fn build_nndescent_index_mlx(
         rho,
         refine_knn,
         seed,
-        verbose,
+        verbosity,
     )?;
     crate::mlx::clear_cache()?;
     Ok(index)
@@ -3815,7 +3848,7 @@ pub fn build_nndescent_index_mlx(
 /// * `k` - Number of neighbours
 /// * `query_params` - Optional beam search parameters
 /// * `return_dist` - Return distances
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3826,13 +3859,12 @@ pub fn query_nndescent_index_mlx(
     k: usize,
     query_params: Option<CagraMlxSearchParams>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
     let (queries_flat, n_queries, _) = query_mat.into_row_major();
-    if verbose {
-        println!("  MLX batch query: {} vectors, k={}...", n_queries, k);
-    }
+    let progress = QueryProgress::new("NNDescent-MLX index", n_queries, false, verbosity);
     let (indices, distances) = index.query_batch(&queries_flat, n_queries, query_params, k)?;
+    progress.finish();
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3845,6 +3877,7 @@ pub fn query_nndescent_index_mlx(
 /// * `k` - Number of neighbours, self included
 /// * `query_params` - Optional beam search parameters
 /// * `return_dist` - Return distances
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3854,8 +3887,11 @@ pub fn query_nndescent_index_mlx_self(
     k: usize,
     query_params: Option<CagraMlxSearchParams>,
     return_dist: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<f32> {
+    let progress = QueryProgress::new("NNDescent-MLX index", index.n, true, verbosity);
     let (indices, distances) = index.self_query(k, query_params, 42)?;
+    progress.finish();
     Ok((indices, return_dist.then_some(distances)))
 }
 
@@ -3880,7 +3916,7 @@ pub fn query_nndescent_index_mlx_self(
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `device` - GPU device
 pub fn build_ivf_index_gpu<T>(
     mat: impl AnnMatrix<T>,
@@ -3888,7 +3924,7 @@ pub fn build_ivf_index_gpu<T>(
     k_means_params: Option<crate::gpu::k_means_gpu::KMeansGpuParams>,
     dist_metric: &str,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<IvfIndexGpu<T>, AnnSearchErrors>
 where
@@ -3900,7 +3936,7 @@ where
         println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
-    IvfIndexGpu::build(mat, metric, nlist, k_means_params, seed, verbose, device)
+    IvfIndexGpu::build(mat, metric, nlist, k_means_params, seed, verbosity, device)
 }
 
 #[cfg(feature = "gpu")]
@@ -3916,7 +3952,7 @@ where
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3928,12 +3964,12 @@ pub fn query_ivf_index_gpu<T>(
     nprobe: Option<usize>,
     nquery: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + CubeclFloat,
 {
-    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbose)?;
+    let (indices, distances) = index.query_batch(query_mat, k, nprobe, nquery, verbosity)?;
 
     if return_dist {
         Ok((indices, Some(distances)))
@@ -3957,7 +3993,7 @@ where
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `nquery` - Number of queries to load into the GPU.
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -3968,12 +4004,12 @@ pub fn query_ivf_index_gpu_self<T>(
     nprobe: Option<usize>,
     nquery: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + CubeclFloat,
 {
-    index.generate_knn(k, nprobe, nquery, return_dist, verbose)
+    index.generate_knn(k, nprobe, nquery, return_dist, verbosity)
 }
 
 ///////////////////
@@ -4000,7 +4036,7 @@ where
 /// * `rho` - Sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after the main loop (default 0)
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `retain_gpu` - Keep the vectors device-resident after the build, so a
 ///   later GPU beam search does not re-upload them
 /// * `device` - GPU device
@@ -4016,7 +4052,7 @@ pub fn build_nndescent_index_gpu<T>(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     retain_gpu: bool,
     device: Device,
 ) -> Result<NNDescentGpu<T>, AnnSearchErrors>
@@ -4031,7 +4067,7 @@ where
     });
 
     NNDescentGpu::build(
-        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose,
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbosity,
         retain_gpu, device,
     )
 }
@@ -4049,7 +4085,7 @@ where
 /// * `query_params` - Optional GPU beam search parameters. Pass
 ///   `CagraGpuSearchParams::new(Some(ef), None, None, None)` to widen the beam.
 /// * `return_dist` - Return distances
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4060,19 +4096,17 @@ pub fn query_nndescent_index_gpu<T>(
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + CubeclFloat,
 {
     let (queries_flat, n_queries, _) = query_mat.into_row_major();
 
-    if verbose {
-        println!("  GPU batch query: {} vectors, k={}...", n_queries, k);
-    }
-
+    let progress = QueryProgress::new("NNDescent-GPU index", n_queries, false, verbosity);
     let (indices, distances) =
         index.query_batch_gpu(&queries_flat, n_queries, query_params, k, 42)?;
+    progress.finish();
 
     if return_dist {
         Ok((indices, Some(distances)))
@@ -4160,6 +4194,7 @@ where
 /// * `k` - Number of neighbours
 /// * `query_params` - Optional GPU beam search parameters
 /// * `return_dist` - Return distances
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4169,11 +4204,14 @@ pub fn query_nndescent_index_gpu_self<T>(
     k: usize,
     query_params: Option<CagraGpuSearchParams>,
     return_dist: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + CubeclFloat,
 {
+    let progress = QueryProgress::new("NNDescent-GPU index", index.n, true, verbosity);
     let (indices, distances) = index.self_query_gpu(k, query_params, 42)?;
+    progress.finish();
 
     if return_dist {
         Ok((indices, Some(distances)))
@@ -4205,7 +4243,7 @@ where
 /// * `rho` - Local-join sampling rate (default 1.0, meaning no sampling)
 /// * `refine_knn` - 2-hop refinement sweeps after main loop (default 0)
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -4223,7 +4261,7 @@ pub fn build_knn_graph_gpu<T>(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
@@ -4237,7 +4275,8 @@ where
     });
 
     crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
-        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbose, device,
+        mat, metric, k, build_k, max_iters, n_trees, delta, rho, refine_knn, seed, verbosity,
+        device,
     )
 }
 
@@ -4266,7 +4305,7 @@ where
 /// * `cluster_params` - Optional [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`];
 ///   `None` plans the cluster count from the device limits
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -4293,7 +4332,7 @@ pub fn build_clustered_knn_graph_gpu<T>(
     refine_knn: Option<usize>,
     cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
@@ -4318,7 +4357,7 @@ where
         refine_knn,
         cluster_params,
         seed,
-        verbose,
+        verbosity,
         device,
     )
 }
@@ -4343,7 +4382,7 @@ where
 ///   [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`]; `None`
 ///   plans the cluster count from the device limits
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -4359,7 +4398,7 @@ pub fn build_knn_graph_nndescent_gpu<T>(
     params: Option<crate::gpu::nndescent_gpu::NNDescentGpuKnnParams>,
     cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraph<T>, AnnSearchErrors>
 where
@@ -4387,7 +4426,7 @@ where
         p.refine_knn,
         cluster_params,
         seed,
-        verbose,
+        verbosity,
         device,
     )?;
 
@@ -4415,14 +4454,14 @@ where
 /// * `l_build` - Beam width for the per-node candidate search
 /// * `c` - Cap on the candidate-set size before MRNG pruning
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 pub fn build_nsg_from_gpu_knn<T>(
     knn_gpu: &KnnGraphGpu<T>,
     r: usize,
     l_build: usize,
     c: usize,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NsgIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -4430,7 +4469,7 @@ where
     NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
 {
     let params = NsgBuildParams::new(r, l_build, c, knn_gpu.k);
-    NsgIndex::build_from_gpu_knn(knn_gpu, params, seed, verbose)
+    NsgIndex::build_from_gpu_knn(knn_gpu, params, seed, verbosity)
 }
 
 #[cfg(feature = "gpu")]
@@ -4460,7 +4499,7 @@ where
 ///   [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`]; `None`
 ///   plans the cluster count from the device limits
 /// * `seed` - Random seed
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -4480,7 +4519,7 @@ pub fn build_nsg_index_gpu<T>(
     knn_params: Option<crate::gpu::nndescent_gpu::NNDescentGpuKnnParams>,
     cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<NsgIndex<T>, AnnSearchErrors>
 where
@@ -4517,7 +4556,7 @@ where
         p.refine_knn,
         cluster_params,
         seed,
-        verbose,
+        verbosity,
         device,
     )?;
 
@@ -4532,7 +4571,7 @@ where
         k,
         params,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -4565,10 +4604,12 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
 /// The initialised `ExhaustiveIndexBinary`
+#[allow(clippy::too_many_arguments)]
 pub fn build_exhaustive_index_binary<T>(
     mat: impl AnnMatrix<T>,
     n_bits: usize,
@@ -4577,6 +4618,7 @@ pub fn build_exhaustive_index_binary<T>(
     dist_metric: &str,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -4590,9 +4632,17 @@ where
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        ExhaustiveIndexBinary::new_with_vector_store(mat, binary_init, n_bits, metric, seed, path)
+        ExhaustiveIndexBinary::new_with_vector_store(
+            mat,
+            binary_init,
+            n_bits,
+            metric,
+            seed,
+            verbosity,
+            path,
+        )
     } else {
-        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, metric, seed)
+        ExhaustiveIndexBinary::new(mat, binary_init, n_bits, metric, seed, verbosity)
     }
 }
 
@@ -4610,7 +4660,7 @@ where
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
 ///   is true)
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4622,7 +4672,7 @@ pub fn query_exhaustive_index_binary<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
@@ -4630,20 +4680,21 @@ where
     let (queries, nq, dim) = query_mat.into_row_major();
 
     if rerank {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("Exhaustive-Binary index", nq, return_dist, verbosity, |i| {
             index.query_reranking(&queries[i * dim..(i + 1) * dim], k, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
             // path where asymmetric queries are sensible
-            query_parallel(nq, return_dist, verbose, |i| {
+            query_parallel("Exhaustive-Binary index", nq, return_dist, verbosity, |i| {
                 index.query_asymmetric(&queries[i * dim..(i + 1) * dim], k, rerank_factor)
             })?
         } else {
             // path where asymmetric queries are not sensible/possible
-            let (indices, distances_u32) = query_parallel(nq, return_dist, verbose, |i| {
-                index.query(&queries[i * dim..(i + 1) * dim], k)
-            })?;
+            let (indices, distances_u32) =
+                query_parallel("Exhaustive-Binary index", nq, return_dist, verbosity, |i| {
+                    index.query(&queries[i * dim..(i + 1) * dim], k)
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -4670,7 +4721,7 @@ where
 /// * `rerank_factor` - Multiplier for candidate set (only used if vector store
 ///   available)
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4680,12 +4731,12 @@ pub fn query_exhaustive_index_binary_self<T>(
     k: usize,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    let res = index.generate_knn(k, rerank_factor, return_dist, verbose)?;
+    let res = index.generate_knn(k, rerank_factor, return_dist, verbosity)?;
 
     Ok(res)
 }
@@ -4716,7 +4767,7 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store
 ///   is true)
-/// * `verbose` - Print progress
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4732,7 +4783,7 @@ pub fn build_ivf_index_binary<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfIndexBinary<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -4754,7 +4805,7 @@ where
             nlist,
             k_means_params,
             seed,
-            verbose,
+            verbosity,
             path,
         )
     } else {
@@ -4766,7 +4817,7 @@ where
             nlist,
             k_means_params,
             seed,
-            verbose,
+            verbosity,
         )
     }
 }
@@ -4786,7 +4837,7 @@ where
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
 ///   is true)
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4800,7 +4851,7 @@ pub fn query_ivf_index_binary<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
@@ -4808,18 +4859,19 @@ where
     let (queries, nq, dim) = query_mat.into_row_major();
 
     if rerank {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("IVF-Binary index", nq, return_dist, verbosity, |i| {
             index.query_reranking(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
         })
     } else {
         let (indices, dist) = if index.use_asymmetric() {
-            query_parallel(nq, return_dist, verbose, |i| {
+            query_parallel("IVF-Binary index", nq, return_dist, verbosity, |i| {
                 index.query_asymmetric(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
             })?
         } else {
-            let (indices, distances_u32) = query_parallel(nq, return_dist, verbose, |i| {
-                index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-            })?;
+            let (indices, distances_u32) =
+                query_parallel("IVF-Binary index", nq, return_dist, verbosity, |i| {
+                    index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
+                })?;
             let distances_t = distances_u32.map(|dists| {
                 dists
                     .into_iter()
@@ -4847,7 +4899,7 @@ where
 /// * `nprobe` - Clusters to search (defaults to √nlist)
 /// * `rerank_factor` - Multiplier for candidate set (only used if vector store available)
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4858,12 +4910,12 @@ pub fn query_ivf_index_binary_self<T>(
     nprobe: Option<usize>,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
+    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbosity)
 }
 
 ///////////////////////
@@ -4885,6 +4937,7 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4896,6 +4949,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -4909,9 +4963,16 @@ where
 
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        ExhaustiveIndexRaBitQ::new_with_vector_store(mat, &metric, n_clust_rabitq, seed, path)
+        ExhaustiveIndexRaBitQ::new_with_vector_store(
+            mat,
+            &metric,
+            n_clust_rabitq,
+            seed,
+            verbosity,
+            path,
+        )
     } else {
-        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed)
+        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed, verbosity)
     }
 }
 
@@ -4929,7 +4990,7 @@ where
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4943,7 +5004,7 @@ pub fn query_exhaustive_index_rabitq<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
@@ -4951,11 +5012,11 @@ where
     let (queries, nq, dim) = query_mat.into_row_major();
 
     if rerank {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("Exhaustive-RaBitQ index", nq, return_dist, verbosity, |i| {
             index.query_reranking(&queries[i * dim..(i + 1) * dim], k, n_probe, rerank_factor)
         })
     } else {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("Exhaustive-RaBitQ index", nq, return_dist, verbosity, |i| {
             index.query(&queries[i * dim..(i + 1) * dim], k, n_probe)
         })
     }
@@ -4974,7 +5035,7 @@ where
 /// * `n_probe` - Number of clusters to search (None for default 20%)
 /// * `rerank_factor` - Multiplier for candidate set size
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -4985,12 +5046,12 @@ pub fn query_exhaustive_index_rabitq_self<T>(
     n_probe: Option<usize>,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, n_probe, rerank_factor, return_dist, verbose)
+    index.generate_knn(k, n_probe, rerank_factor, return_dist, verbosity)
 }
 
 ////////////////
@@ -5015,7 +5076,7 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
-/// * `verbose` - Print progress during build
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5029,7 +5090,7 @@ pub fn build_ivf_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfIndexRaBitQ<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -5049,11 +5110,11 @@ where
             nlist,
             k_means_params,
             seed,
-            verbose,
+            verbosity,
             path,
         )
     } else {
-        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbose)
+        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbosity)
     }
 }
 
@@ -5071,7 +5132,7 @@ where
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5085,7 +5146,7 @@ pub fn query_ivf_index_rabitq<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
@@ -5093,11 +5154,11 @@ where
     let (queries, nq, dim) = query_mat.into_row_major();
 
     if rerank {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("IVF-RaBitQ index", nq, return_dist, verbosity, |i| {
             index.query_reranking(&queries[i * dim..(i + 1) * dim], k, nprobe, rerank_factor)
         })
     } else {
-        query_parallel(nq, return_dist, verbose, |i| {
+        query_parallel("IVF-RaBitQ index", nq, return_dist, verbosity, |i| {
             index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
         })
     }
@@ -5116,7 +5177,7 @@ where
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
 /// * `rerank_factor` - Multiplier for candidate set size
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5127,12 +5188,12 @@ pub fn query_ivf_index_rabitq_self<T>(
     nprobe: Option<usize>,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
+    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbosity)
 }
 
 ///////////////////////////
@@ -5154,6 +5215,7 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5165,6 +5227,7 @@ pub fn build_exhaustive_index_turboquant<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    verbosity: Verbosity,
 ) -> Result<TurboQuantExhaustive<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -5177,9 +5240,9 @@ where
     });
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        TurboQuantExhaustive::new_with_vector_store(mat, &metric, bits, seed, path)
+        TurboQuantExhaustive::new_with_vector_store(mat, &metric, bits, seed, verbosity, path)
     } else {
-        TurboQuantExhaustive::new(mat, &metric, bits, seed)
+        TurboQuantExhaustive::new(mat, &metric, bits, seed, verbosity)
     }
 }
 
@@ -5199,7 +5262,7 @@ where
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5212,12 +5275,12 @@ pub fn query_exhaustive_index_turboquant<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.query_batch(query_mat, k, rerank, rerank_factor, return_dist, verbose)
+    index.query_batch(query_mat, k, rerank, rerank_factor, return_dist, verbosity)
 }
 
 #[cfg(feature = "binary")]
@@ -5232,7 +5295,7 @@ where
 /// * `k` - Number of neighbours
 /// * `rerank_factor` - Multiplier for candidate set size
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5242,12 +5305,12 @@ pub fn query_exhaustive_index_turboquant_self<T>(
     k: usize,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, rerank_factor, return_dist, verbose)
+    index.generate_knn(k, rerank_factor, return_dist, verbosity)
 }
 
 ////////////////////
@@ -5273,7 +5336,7 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
-/// * `verbose` - Print progress during build
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5288,7 +5351,7 @@ pub fn build_ivf_index_turboquant<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<IvfTurboQuant<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + Pod,
@@ -5309,11 +5372,11 @@ where
             k_means_params,
             bits,
             seed,
-            verbose,
+            verbosity,
             path,
         )
     } else {
-        IvfTurboQuant::build(mat, metric, nlist, k_means_params, bits, seed, verbose)
+        IvfTurboQuant::build(mat, metric, nlist, k_means_params, bits, seed, verbosity)
     }
 }
 
@@ -5336,7 +5399,7 @@ where
 /// * `rerank_factor` - Multiplier for candidate set size (only used if rerank
 ///   is true)
 /// * `return_dist` - Shall the distances be returned
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5350,7 +5413,7 @@ pub fn query_ivf_index_turboquant<T>(
     rerank: bool,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
@@ -5362,7 +5425,7 @@ where
         rerank,
         rerank_factor,
         return_dist,
-        verbose,
+        verbosity,
     )
 }
 
@@ -5379,7 +5442,7 @@ where
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
 /// * `rerank_factor` - Multiplier for candidate set size
 /// * `return_dist` - Return distances
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5390,12 +5453,12 @@ pub fn query_ivf_index_turboquant_self<T>(
     nprobe: Option<usize>,
     rerank_factor: Option<usize>,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + Pod,
 {
-    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbose)
+    index.generate_knn(k, nprobe, rerank_factor, return_dist, verbosity)
 }
 
 /////////////////////
@@ -5432,6 +5495,7 @@ where
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`. Manhattan is
 ///   not supported.
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5446,6 +5510,7 @@ pub fn build_qg_index<T>(
     alpha_pass2: f32,
     dist_metric: &str,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<QgIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -5468,6 +5533,7 @@ where
         alpha_pass2,
         None,
         seed,
+        verbosity,
     )
 }
 
@@ -5490,6 +5556,7 @@ where
 /// * `dist_metric` - One of `"euclidean"`/`"l2"` or `"cosine"`
 /// * `rotator_kind` - Which rotation to encode with
 /// * `seed` - Random seed for reproducibility
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5506,6 +5573,7 @@ pub fn build_qg_index_with_rotator<T>(
     dist_metric: &str,
     rotator_kind: RotatorKind,
     seed: usize,
+    verbosity: Verbosity,
 ) -> Result<QgIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -5528,6 +5596,7 @@ where
         alpha_pass2,
         Some(rotator_kind),
         seed,
+        verbosity,
     )
 }
 
@@ -5542,7 +5611,7 @@ where
 /// * `ef_search` - Beam width; higher means better recall and slower queries
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5553,7 +5622,7 @@ pub fn query_qg_index<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -5561,7 +5630,7 @@ where
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("QG index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -5576,7 +5645,7 @@ where
 /// * `ef_search` - Beam width; higher means better recall and slower queries
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5586,13 +5655,13 @@ pub fn query_qg_self<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
     VamanaIndex<T>: VamanaState<T>,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }
 
 ///////////////////
@@ -5623,7 +5692,7 @@ where
 /// * `k_means_params` - Optional k-means settings, see
 ///   [`KMeansTrainingParams`]
 /// * `seed` - Random seed for reproducibility
-/// * `verbose` - Print progress information during index construction
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5645,7 +5714,7 @@ pub fn build_hnsw_rabitq_index<T>(
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<HnswRaBitQIndex<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
@@ -5666,7 +5735,7 @@ where
         nlist,
         k_means_params,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -5684,7 +5753,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5695,14 +5764,14 @@ pub fn query_hnsw_rabitq_index<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
     let (queries, nq, dim) = query_mat.into_row_major();
 
-    query_parallel(nq, return_dist, verbose, |i| {
+    query_parallel("HNSW-RaBitQ index", nq, return_dist, verbosity, |i| {
         index.query(&queries[i * dim..(i + 1) * dim], k, ef_search)
     })
 }
@@ -5721,7 +5790,7 @@ where
 ///   recall, slower)
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
-/// * `verbose` - Print progress information
+/// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
@@ -5731,10 +5800,10 @@ pub fn query_hnsw_rabitq_self<T>(
     k: usize,
     ef_search: usize,
     return_dist: bool,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat + ThreadLocalSearchState,
 {
-    index.generate_knn(k, ef_search, return_dist, verbose)
+    index.generate_knn(k, ef_search, return_dist, verbosity)
 }

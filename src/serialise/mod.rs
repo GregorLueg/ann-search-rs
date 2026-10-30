@@ -447,64 +447,78 @@ mod tests {
     round_trip!(
         test_round_trip_exhaustive,
         ExhaustiveIndex<f32>,
-        |m| build_exhaustive_index(m, "euclidean"),
-        |i, q| unwrap_knn(query_exhaustive_index(q, i, K, true, false))
+        |m| build_exhaustive_index(m, "euclidean", Verbosity::Quiet),
+        |i, q| unwrap_knn(query_exhaustive_index(q, i, K, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_kmknn,
         KmknnIndex<f32>,
-        |m| build_kmknn_index(m, "euclidean", Some(NLIST), None, 1, false).unwrap(),
-        |i, q| unwrap_knn(query_kmknn_index(q, i, K, true, false))
+        |m| build_kmknn_index(m, "euclidean", Some(NLIST), None, 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_kmknn_index(q, i, K, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_annoy,
         AnnoyIndex<f32>,
-        |m| build_annoy_index(m, "euclidean", 4, 1).unwrap(),
-        |i, q| unwrap_knn(query_annoy_index(q, i, K, None, true, false))
+        |m| build_annoy_index(m, "euclidean", 4, 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_annoy_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_ball_tree,
         BallTreeIndex<f32>,
-        |m| build_balltree_index(m, "euclidean", 1).unwrap(),
-        |i, q| unwrap_knn(query_balltree_index(q, i, K, None, true, false))
+        |m| build_balltree_index(m, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_balltree_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_hnsw,
         HnswIndex<f32>,
-        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false).unwrap(),
-        |i, q| unwrap_knn(query_hnsw_index(q, i, K, 32, true, false))
+        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_hnsw_index(q, i, K, 32, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_ivf,
         IvfIndex<f32>,
-        |m| build_ivf_index(m, Some(NLIST), None, "euclidean", 1, false).unwrap(),
-        |i, q| unwrap_knn(query_ivf_index(q, i, K, Some(NLIST), true, false))
+        |m| build_ivf_index(m, Some(NLIST), None, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_ivf_index(
+            q,
+            i,
+            K,
+            Some(NLIST),
+            true,
+            Verbosity::Quiet
+        ))
     );
 
     round_trip!(
         test_round_trip_soar,
         SoarIndex<f32>,
-        |m| build_soar_index(m, Some(NLIST), None, None, "euclidean", 1, false).unwrap(),
-        |i, q| unwrap_knn(query_soar_index(q, i, K, Some(NLIST), true, false))
+        |m| build_soar_index(m, Some(NLIST), None, None, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_soar_index(
+            q,
+            i,
+            K,
+            Some(NLIST),
+            true,
+            Verbosity::Quiet
+        ))
     );
 
     round_trip!(
         test_round_trip_kd_forest,
         KdTreeIndex<f32>,
-        |m| build_kd_tree_index(m, "euclidean", 4, 1).unwrap(),
-        |i, q| unwrap_knn(query_kd_tree_index(q, i, K, None, true, false))
+        |m| build_kd_tree_index(m, "euclidean", 4, 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_kd_tree_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_lsh,
         LSHIndex<f32>,
-        |m| build_lsh_index(m, "euclidean", 4, 8, None, 1).unwrap(),
-        |i, q| unwrap_knn(query_lsh_index(q, i, K, 2, None, true, false))
+        |m| build_lsh_index(m, "euclidean", 4, 8, None, 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_lsh_index(q, i, K, 2, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
@@ -520,31 +534,41 @@ mod tests {
             None,
             None,
             1,
-            false
+            Verbosity::Quiet
         )
         .unwrap(),
-        |i, q| unwrap_knn(query_nndescent_index(q, i, K, None, true, false))
+        |i, q| unwrap_knn(query_nndescent_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1).unwrap(),
-        |i, q| unwrap_knn(query_vamana_index(q, i, K, None, true, false))
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1, Verbosity::Quiet)
+            .unwrap(),
+        |i, q| unwrap_knn(query_vamana_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_nsg,
         NsgIndex<f32>,
-        |m| build_nsg_index(m, 16, 32, 64, 10, "euclidean", 1, false).unwrap(),
-        |i, q| unwrap_knn(query_nsg_index(q, i, K, None, true, false))
+        |m| build_nsg_index(m, 16, 32, 64, 10, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i, q| unwrap_knn(query_nsg_index(q, i, K, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
         test_round_trip_rnn_descent,
         RnnDescentIndex<f32>,
-        |m| build_rnn_descent_index(m, 8, 16, 2, 4, "euclidean", None, 1, false).unwrap(),
-        |i, q| unwrap_knn(query_rnn_descent_index(q, i, K, None, None, true, false))
+        |m| build_rnn_descent_index(m, 8, 16, 2, 4, "euclidean", None, 1, Verbosity::Quiet)
+            .unwrap(),
+        |i, q| unwrap_knn(query_rnn_descent_index(
+            q,
+            i,
+            K,
+            None,
+            None,
+            true,
+            Verbosity::Quiet
+        ))
     );
 
     // -- quantised --
@@ -569,37 +593,61 @@ mod tests {
         round_trip!(
             test_round_trip_exhaustive_bf16,
             ExhaustiveIndexBf16<f32>,
-            |m| build_exhaustive_bf16_index(m, "euclidean", false).unwrap(),
-            |i, q| unwrap_knn(query_exhaustive_bf16_index(q, i, K, true, false))
+            |m| build_exhaustive_bf16_index(m, "euclidean", Verbosity::Quiet).unwrap(),
+            |i, q| unwrap_knn(query_exhaustive_bf16_index(q, i, K, true, Verbosity::Quiet))
         );
 
         round_trip!(
             test_round_trip_ivf_bf16,
             IvfIndexBf16<f32>,
-            |m| build_ivf_bf16_index(m, Some(NLIST), None, "euclidean", 1, false).unwrap(),
-            |i, q| unwrap_knn(query_ivf_bf16_index(q, i, K, Some(NLIST), true, false))
+            |m| build_ivf_bf16_index(m, Some(NLIST), None, "euclidean", 1, Verbosity::Quiet)
+                .unwrap(),
+            |i, q| unwrap_knn(query_ivf_bf16_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
             test_round_trip_exhaustive_sq8,
             ExhaustiveSq8Index<f32>,
-            |m| build_exhaustive_sq8_index(m, "euclidean", None, false).unwrap(),
-            |i, q| unwrap_knn(query_exhaustive_sq8_index(q, i, K, true, false))
+            |m| build_exhaustive_sq8_index(m, "euclidean", None, Verbosity::Quiet).unwrap(),
+            |i, q| unwrap_knn(query_exhaustive_sq8_index(q, i, K, true, Verbosity::Quiet))
         );
 
         round_trip!(
             test_round_trip_ivf_sq8,
             IvfSq8Index<f32>,
-            |m| build_ivf_sq8_index(m, Some(NLIST), None, "euclidean", 1, None, false).unwrap(),
-            |i, q| unwrap_knn(query_ivf_sq8_index(q, i, K, Some(NLIST), true, false))
+            |m| build_ivf_sq8_index(m, Some(NLIST), None, "euclidean", 1, None, Verbosity::Quiet)
+                .unwrap(),
+            |i, q| unwrap_knn(query_ivf_sq8_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
             test_round_trip_exhaustive_pq,
             ExhaustivePqIndex<f32>,
-            |m| build_exhaustive_pq_index(m, M, None, Some(N_CENTROIDS), "euclidean", 1, false)
-                .unwrap(),
-            |i, q| unwrap_knn(query_exhaustive_pq_index(q, i, K, true, false))
+            |m| build_exhaustive_pq_index(
+                m,
+                M,
+                None,
+                Some(N_CENTROIDS),
+                "euclidean",
+                1,
+                Verbosity::Quiet
+            )
+            .unwrap(),
+            |i, q| unwrap_knn(query_exhaustive_pq_index(q, i, K, true, Verbosity::Quiet))
         );
 
         round_trip!(
@@ -613,10 +661,17 @@ mod tests {
                 Some(N_CENTROIDS),
                 "euclidean",
                 1,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
-            |i, q| unwrap_knn(query_ivf_pq_index(q, i, K, Some(NLIST), true, false))
+            |i, q| unwrap_knn(query_ivf_pq_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
@@ -631,10 +686,17 @@ mod tests {
                 Some(N_CENTROIDS),
                 "euclidean",
                 1,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
-            |i, q| unwrap_knn(query_soar_pq_index(q, i, K, Some(NLIST), true, false))
+            |i, q| unwrap_knn(query_soar_pq_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
@@ -650,18 +712,33 @@ mod tests {
                 None,
                 "euclidean",
                 1,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
-            |i, q| unwrap_knn(query_soar_opq_index(q, i, K, Some(NLIST), true, false))
+            |i, q| unwrap_knn(query_soar_opq_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
             test_round_trip_exhaustive_opq,
             ExhaustiveOpqIndex<f32>,
-            |m| build_exhaustive_opq_index(m, M, None, Some(N_CENTROIDS), "euclidean", 1, false)
-                .unwrap(),
-            |i, q| unwrap_knn(query_exhaustive_opq_index(q, i, K, true, false))
+            |m| build_exhaustive_opq_index(
+                m,
+                M,
+                None,
+                Some(N_CENTROIDS),
+                "euclidean",
+                1,
+                Verbosity::Quiet
+            )
+            .unwrap(),
+            |i, q| unwrap_knn(query_exhaustive_opq_index(q, i, K, true, Verbosity::Quiet))
         );
 
         round_trip!(
@@ -676,17 +753,24 @@ mod tests {
                 Some(2),
                 "euclidean",
                 1,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
-            |i, q| unwrap_knn(query_ivf_opq_index(q, i, K, Some(NLIST), true, false))
+            |i, q| unwrap_knn(query_ivf_opq_index(
+                q,
+                i,
+                K,
+                Some(NLIST),
+                true,
+                Verbosity::Quiet
+            ))
         );
 
         round_trip!(
             test_round_trip_hnsw_sq8u,
             HnswSq8uIndex<f32>,
-            |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, false).unwrap(),
-            |i, q| unwrap_knn(query_hnsw_sq8u_index(q, i, K, 32, true, false))
+            |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, Verbosity::Quiet).unwrap(),
+            |i, q| unwrap_knn(query_hnsw_sq8u_index(q, i, K, 32, true, Verbosity::Quiet))
         );
     }
 
@@ -722,10 +806,25 @@ mod tests {
         round_trip!(
             test_round_trip_exhaustive_binary,
             ExhaustiveIndexBinary<f32>,
-            |m| build_exhaustive_index_binary(m, N_BITS, 1, "random", "cosine", false, NO_PATH)
-                .unwrap(),
+            |m| build_exhaustive_index_binary(
+                m,
+                N_BITS,
+                1,
+                "random",
+                "cosine",
+                false,
+                NO_PATH,
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_binary(
-                q, i, K, false, None, true, false
+                q,
+                i,
+                K,
+                false,
+                None,
+                true,
+                Verbosity::Quiet
             ))
         );
 
@@ -742,7 +841,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_binary(
@@ -753,7 +852,7 @@ mod tests {
                 false,
                 None,
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -775,7 +874,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_binary(
@@ -786,15 +885,23 @@ mod tests {
                 false,
                 None,
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
         round_trip!(
             test_round_trip_exhaustive_rabitq,
             ExhaustiveIndexRaBitQ<f32>,
-            |m| build_exhaustive_index_rabitq(m, Some(NLIST), "euclidean", 1, false, NO_PATH)
-                .unwrap(),
+            |m| build_exhaustive_index_rabitq(
+                m,
+                Some(NLIST),
+                "euclidean",
+                1,
+                false,
+                NO_PATH,
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_rabitq(
                 q,
                 i,
@@ -803,22 +910,32 @@ mod tests {
                 false,
                 None,
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
         round_trip!(
             test_round_trip_qg,
             QgIndex<f32>,
-            |m| build_qg_index(m, 32, 64, None, 1.2, 1.2, "euclidean", 1).unwrap(),
-            |i, q| unwrap_knn(query_qg_index(q, i, K, 64, true, false))
+            |m| build_qg_index(m, 32, 64, None, 1.2, 1.2, "euclidean", 1, Verbosity::Quiet)
+                .unwrap(),
+            |i, q| unwrap_knn(query_qg_index(q, i, K, 64, true, Verbosity::Quiet))
         );
 
         round_trip!(
             test_round_trip_ivf_rabitq,
             IvfIndexRaBitQ<f32>,
-            |m| build_ivf_index_rabitq(m, Some(NLIST), None, "euclidean", 1, false, NO_PATH, false)
-                .unwrap(),
+            |m| build_ivf_index_rabitq(
+                m,
+                Some(NLIST),
+                None,
+                "euclidean",
+                1,
+                false,
+                NO_PATH,
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_rabitq(
                 q,
                 i,
@@ -827,17 +944,31 @@ mod tests {
                 false,
                 None,
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
         round_trip!(
             test_round_trip_exhaustive_tq,
             TurboQuantExhaustive<f32>,
-            |m| build_exhaustive_index_turboquant(m, "euclidean", TQ_BITS, 1, false, NO_PATH)
-                .unwrap(),
+            |m| build_exhaustive_index_turboquant(
+                m,
+                "euclidean",
+                TQ_BITS,
+                1,
+                false,
+                NO_PATH,
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_turboquant(
-                q, i, K, false, None, true, false
+                q,
+                i,
+                K,
+                false,
+                None,
+                true,
+                Verbosity::Quiet
             ))
         );
 
@@ -853,7 +984,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_turboquant(
@@ -864,7 +995,7 @@ mod tests {
                 false,
                 None,
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -894,7 +1025,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -906,7 +1037,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false,
+                Verbosity::Quiet,
             ));
 
             index.save_index(index_dir.path()).unwrap();
@@ -925,7 +1056,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false,
+                Verbosity::Quiet,
             ));
 
             assert_same_knn(&before, &after);
@@ -949,7 +1080,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -961,7 +1092,7 @@ mod tests {
                 false,
                 None,
                 true,
-                false,
+                Verbosity::Quiet,
             ));
 
             let dir = TempDir::new().unwrap();
@@ -976,7 +1107,7 @@ mod tests {
                 false,
                 None,
                 true,
-                false,
+                Verbosity::Quiet,
             ));
 
             assert_same_knn(&before, &after);
@@ -1025,8 +1156,17 @@ mod tests {
         store_round_trip!(
             test_store_round_trip_exhaustive_binary,
             ExhaustiveIndexBinary<f32>,
-            |m, p| build_exhaustive_index_binary(m, N_BITS, 1, "random", "cosine", true, Some(p))
-                .unwrap(),
+            |m, p| build_exhaustive_index_binary(
+                m,
+                N_BITS,
+                1,
+                "random",
+                "cosine",
+                true,
+                Some(p),
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_binary(
                 q,
                 i,
@@ -1034,7 +1174,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -1051,7 +1191,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_binary(
@@ -1062,15 +1202,23 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
         store_round_trip!(
             test_store_round_trip_exhaustive_rabitq,
             ExhaustiveIndexRaBitQ<f32>,
-            |m, p| build_exhaustive_index_rabitq(m, Some(NLIST), "euclidean", 1, true, Some(p))
-                .unwrap(),
+            |m, p| build_exhaustive_index_rabitq(
+                m,
+                Some(NLIST),
+                "euclidean",
+                1,
+                true,
+                Some(p),
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_rabitq(
                 q,
                 i,
@@ -1079,7 +1227,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -1094,7 +1242,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_rabitq(
@@ -1105,15 +1253,23 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
         store_round_trip!(
             test_store_round_trip_exhaustive_tq,
             TurboQuantExhaustive<f32>,
-            |m, p| build_exhaustive_index_turboquant(m, "euclidean", TQ_BITS, 1, true, Some(p))
-                .unwrap(),
+            |m, p| build_exhaustive_index_turboquant(
+                m,
+                "euclidean",
+                TQ_BITS,
+                1,
+                true,
+                Some(p),
+                Verbosity::Quiet
+            )
+            .unwrap(),
             |i, q| unwrap_knn(query_exhaustive_index_turboquant(
                 q,
                 i,
@@ -1121,7 +1277,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -1137,7 +1293,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
-                false
+                Verbosity::Quiet
             )
             .unwrap(),
             |i, q| unwrap_knn(query_ivf_index_turboquant(
@@ -1148,7 +1304,7 @@ mod tests {
                 true,
                 Some(RERANK_FACTOR),
                 true,
-                false
+                Verbosity::Quiet
             ))
         );
 
@@ -1170,21 +1326,32 @@ mod tests {
                 "cosine",
                 true,
                 Some(store_dir.path()),
+                Verbosity::Quiet,
             )
             .unwrap();
 
-            let (before, _) =
-                query_exhaustive_index_binary_self(&index, K, Some(RERANK_FACTOR), false, false)
-                    .unwrap();
+            let (before, _) = query_exhaustive_index_binary_self(
+                &index,
+                K,
+                Some(RERANK_FACTOR),
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             index.save_index(index_dir.path()).unwrap();
             drop(index);
             store_dir.close().unwrap();
 
             let loaded = ExhaustiveIndexBinary::<f64>::load_index(index_dir.path()).unwrap();
-            let (after, _) =
-                query_exhaustive_index_binary_self(&loaded, K, Some(RERANK_FACTOR), false, false)
-                    .unwrap();
+            let (after, _) = query_exhaustive_index_binary_self(
+                &loaded,
+                K,
+                Some(RERANK_FACTOR),
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             assert_eq!(before, after);
         }
@@ -1211,7 +1378,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1224,7 +1391,7 @@ mod tests {
                     true,
                     Some(RERANK_FACTOR),
                     true,
-                    false,
+                    Verbosity::Quiet,
                 ))
             };
 
@@ -1255,6 +1422,7 @@ mod tests {
                 1,
                 true,
                 Some(dir.path()),
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1287,6 +1455,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
+                Verbosity::Quiet,
             )
             .unwrap();
             index.save_index(saved.path()).unwrap();
@@ -1347,6 +1516,7 @@ mod tests {
                 1,
                 true,
                 Some(dir.path()),
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1361,7 +1531,7 @@ mod tests {
                     true,
                     Some(RERANK_FACTOR),
                     true,
-                    false,
+                    Verbosity::Quiet,
                 ))
             };
 
@@ -1399,6 +1569,7 @@ mod tests {
                     1,
                     true,
                     Some(dir.path()),
+                    Verbosity::Quiet,
                 )
                 .unwrap()
             };
@@ -1410,7 +1581,7 @@ mod tests {
                     true,
                     Some(RERANK_FACTOR),
                     true,
-                    false,
+                    Verbosity::Quiet,
                 ))
             };
 
@@ -1446,8 +1617,16 @@ mod tests {
             let saved = TempDir::new().unwrap();
 
             let build = |m: MatRef<f32>, p: &Path| {
-                build_exhaustive_index_turboquant(m, "euclidean", TQ_BITS, 1, true, Some(p))
-                    .unwrap()
+                build_exhaustive_index_turboquant(
+                    m,
+                    "euclidean",
+                    TQ_BITS,
+                    1,
+                    true,
+                    Some(p),
+                    Verbosity::Quiet,
+                )
+                .unwrap()
             };
             let rerank = |i: &TurboQuantExhaustive<f32>| {
                 unwrap_knn(query_exhaustive_index_turboquant(
@@ -1457,7 +1636,7 @@ mod tests {
                     true,
                     Some(RERANK_FACTOR),
                     true,
-                    false,
+                    Verbosity::Quiet,
                 ))
             };
 
@@ -1519,7 +1698,7 @@ mod tests {
     /// The temporary directory. Kept alive by the caller.
     fn saved_exhaustive() -> TempDir {
         let data = random_matrix(64, DIM, 7);
-        let index = build_exhaustive_index(data.as_ref(), "euclidean");
+        let index = build_exhaustive_index(data.as_ref(), "euclidean", Verbosity::Quiet);
 
         let dir = TempDir::new().unwrap();
         index.save_index(dir.path()).unwrap();
@@ -1667,14 +1846,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let data = Mat::<f64>::from_fn(64, DIM, |_, _| rng.random::<f64>());
 
-        let index = build_exhaustive_index(data.as_ref(), "cosine");
-        let (before, _) = query_exhaustive_self(&index, K, false, false).unwrap();
+        let index = build_exhaustive_index(data.as_ref(), "cosine", Verbosity::Quiet);
+        let (before, _) = query_exhaustive_self(&index, K, false, Verbosity::Quiet).unwrap();
 
         let dir = TempDir::new().unwrap();
         index.save_index(dir.path()).unwrap();
 
         let loaded = ExhaustiveIndex::<f64>::load_index(dir.path()).unwrap();
-        let (after, _) = query_exhaustive_self(&loaded, K, false, false).unwrap();
+        let (after, _) = query_exhaustive_self(&loaded, K, false, Verbosity::Quiet).unwrap();
 
         assert_eq!(before, after);
     }
@@ -1684,15 +1863,15 @@ mod tests {
     #[test]
     fn test_free_function_wrappers_round_trip() {
         let data = random_matrix(64, DIM, 7);
-        let index = build_exhaustive_index(data.as_ref(), "euclidean");
+        let index = build_exhaustive_index(data.as_ref(), "euclidean", Verbosity::Quiet);
 
         let dir = TempDir::new().unwrap();
         crate::save_index(&index, dir.path()).unwrap();
 
         let loaded: ExhaustiveIndex<f32> = crate::load_index(dir.path()).unwrap();
 
-        let (before, _) = query_exhaustive_self(&index, K, false, false).unwrap();
-        let (after, _) = query_exhaustive_self(&loaded, K, false, false).unwrap();
+        let (before, _) = query_exhaustive_self(&index, K, false, Verbosity::Quiet).unwrap();
+        let (after, _) = query_exhaustive_self(&loaded, K, false, Verbosity::Quiet).unwrap();
 
         assert_eq!(before, after);
     }
@@ -1735,31 +1914,39 @@ mod tests {
             None,
             None,
             1,
-            false
+            Verbosity::Quiet
         )
         .unwrap(),
-        |i| query_nndescent_self(i, K, None, false, false).unwrap().0
+        |i| query_nndescent_self(i, K, None, false, Verbosity::Quiet)
+            .unwrap()
+            .0
     );
 
     self_round_trip!(
         test_self_round_trip_vamana,
         VamanaIndex<f32>,
-        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1).unwrap(),
-        |i| query_vamana_self(i, K, None, false, false).unwrap().0
+        |m| build_vamana_index(m, 16, 32, None, 1.2, 1.2, "euclidean", 1, Verbosity::Quiet)
+            .unwrap(),
+        |i| query_vamana_self(i, K, None, false, Verbosity::Quiet)
+            .unwrap()
+            .0
     );
 
     self_round_trip!(
         test_self_round_trip_nsg,
         NsgIndex<f32>,
-        |m| build_nsg_index(m, 16, 32, 64, 10, "euclidean", 1, false).unwrap(),
-        |i| query_nsg_self(i, K, None, false, false).unwrap().0
+        |m| build_nsg_index(m, 16, 32, 64, 10, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i| query_nsg_self(i, K, None, false, Verbosity::Quiet)
+            .unwrap()
+            .0
     );
 
     self_round_trip!(
         test_self_round_trip_rnn_descent,
         RnnDescentIndex<f32>,
-        |m| build_rnn_descent_index(m, 8, 16, 2, 4, "euclidean", None, 1, false).unwrap(),
-        |i| query_rnn_descent_self(i, K, None, None, false, false)
+        |m| build_rnn_descent_index(m, 8, 16, 2, 4, "euclidean", None, 1, Verbosity::Quiet)
+            .unwrap(),
+        |i| query_rnn_descent_self(i, K, None, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     );
@@ -1767,16 +1954,20 @@ mod tests {
     self_round_trip!(
         test_self_round_trip_hnsw,
         HnswIndex<f32>,
-        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, false).unwrap(),
-        |i| query_hnsw_self(i, K, 32, false, false).unwrap().0
+        |m| build_hnsw_index(m, 8, 32, "euclidean", 1, Verbosity::Quiet).unwrap(),
+        |i| query_hnsw_self(i, K, 32, false, Verbosity::Quiet)
+            .unwrap()
+            .0
     );
 
     #[cfg(feature = "quantised")]
     self_round_trip!(
         test_self_round_trip_hnsw_sq8u,
         crate::quantised::hnsw_quantised::index::HnswSq8uIndex<f32>,
-        |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, false).unwrap(),
-        |i| query_hnsw_sq8u_self(i, K, 32, false, false).unwrap().0
+        |m| build_hnsw_sq8u_index(m, 8, 32, "euclidean", 1, None, Verbosity::Quiet).unwrap(),
+        |i| query_hnsw_sq8u_self(i, K, 32, false, Verbosity::Quiet)
+            .unwrap()
+            .0
     );
 
     /// Two indices sharing a `KIND` would cross-load straight past the header

@@ -7,12 +7,12 @@ use rand::{rng, rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Ordering, Reverse};
-use std::sync::{atomic::AtomicUsize, Arc};
-use thousands::*;
+use std::time::Instant;
 
 use crate::prelude::*;
 use crate::utils::dist::{cosine_distance_static, euclidean_distance_static};
 use crate::utils::graph_utils::SearchState;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ///////////////////
@@ -464,6 +464,7 @@ where
     /// * `alpha_pass1` - Pruning alpha for pass 1
     /// * `alpha_pass2` - Pruning alpha for pass 2
     /// * `seed` - Random seed
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -478,7 +479,9 @@ where
         alpha_pass1: f32,
         alpha_pass2: f32,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Self {
+        let log = BuildLog::new("Vamana index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
 
         let medoid = compute_medoid(&vectors_flat, n, dim, metric);
@@ -518,7 +521,8 @@ where
             (alpha_pass2, l_build),
         ];
 
-        for (alpha, l_build) in passes {
+        for (pass, (alpha, l_build)) in passes.into_iter().enumerate() {
+            let start = Instant::now();
             // random permutation of nodes for unbiased parallel updates
             let mut permutation: Vec<u32> = (0..n as u32).collect();
             permutation.shuffle(&mut rng());
@@ -593,9 +597,19 @@ where
                     }
                 });
             });
+
+            if verbosity.detailed_verbosity() {
+                println!(
+                    " Pass {} (alpha {alpha}, L {l_build}) in {:.2?}",
+                    pass + 1,
+                    start.elapsed()
+                );
+            }
         }
 
         index.graph = build_graph.into_flat();
+        log.finish();
+
         index
     }
 
@@ -974,7 +988,7 @@ where
     /// * `ef_search` - Optional Beam width (higher = better recall, slower).
     ///   If not provided, it will default to `100`.
     /// * `return_dist` - Shall the distances be returned
-    /// * `verbose` - Controls the verbosity of the function
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -985,9 +999,9 @@ where
         k: usize,
         ef_search: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Vamana index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -996,20 +1010,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, ef_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -1105,6 +1111,7 @@ mod tests {
             1.0,
             1.2,
             42,
+            Verbosity::Quiet,
         )
     }
 
@@ -1191,6 +1198,7 @@ mod tests {
             1.0,
             1.2,
             42,
+            Verbosity::Quiet,
         );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
@@ -1224,6 +1232,7 @@ mod tests {
             1.0,
             1.2,
             42,
+            Verbosity::Quiet,
         );
 
         let query = vec![0.0_f32, 0.0, 0.0];
@@ -1361,10 +1370,11 @@ mod tests {
             1.0,
             1.2,
             42,
+            Verbosity::Quiet,
         );
 
         let k = 5;
-        let (indices, distances) = index.generate_knn(k, None, true, false).unwrap();
+        let (indices, distances) = index.generate_knn(k, None, true, Verbosity::Quiet).unwrap();
         assert_eq!(indices.len(), n);
         assert!(distances.is_some());
         let dists = distances.unwrap();
@@ -1398,6 +1408,7 @@ mod tests {
                 1.0,
                 1.2,
                 42,
+                Verbosity::Quiet,
             );
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
             let (indices, _) = index.query(&query, 10, None).unwrap();
@@ -1422,6 +1433,7 @@ mod tests {
             1.0,
             1.4,
             42,
+            Verbosity::Quiet,
         );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();

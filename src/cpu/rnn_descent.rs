@@ -13,10 +13,7 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    Arc,
-};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use thousands::*;
 
@@ -26,6 +23,7 @@ use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{
     ApplySortedUpdates, Neighbour, UnsafeMutPtr, Update, UpdateGrouper, SENTINEL_PID,
 };
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ///////////////////
@@ -167,14 +165,9 @@ impl PruneStats {
 /// Per-phase wall-clock breakdown of a build, accumulated across passes.
 ///
 /// Timed from the driving loop rather than from inside the parallel closures.
-/// Reported only under `verbose`. The phases partition the build and sum to
-/// roughly the total.
+/// Reported at `Detailed`. The phases partition the descent passes.
 #[derive(Default, Clone, Copy)]
 struct BuildTimings {
-    /// Kd-forest construction for the query-time entry points
-    forest: Duration,
-    /// Random seed graph initialisation
-    seed: Duration,
     /// The RNG prune: pairwise distances plus the greedy accept
     prune: Duration,
     /// Grouping the emitted updates by target node
@@ -192,37 +185,12 @@ struct BuildTimings {
 }
 
 impl BuildTimings {
-    /// Total time attributed to the descent passes.
-    fn descent(&self) -> Duration {
-        self.prune + self.group + self.apply + self.reverse
-    }
-
-    /// Print the breakdown as a table, each phase against its share of the total.
-    ///
-    /// ### Params
-    ///
-    /// * `n` - Number of samples
-    /// * `r` - Maximum per-node adjacency
-    fn report(&self, n: usize, r: usize) {
-        let total = self.forest + self.seed + self.descent();
-        let secs = total.as_secs_f64().max(f64::MIN_POSITIVE);
-        let row = |name: &str, d: Duration| {
-            println!(
-                "  {:<22} {:>9.3} s  {:>5.1}%",
-                name,
-                d.as_secs_f64(),
-                100.0 * d.as_secs_f64() / secs
-            );
-        };
-
-        println!("\nRNN-Descent build breakdown (n={n}, R={r}):");
-        row("forest build", self.forest);
-        row("seed graph", self.seed);
-        row("prune", self.prune);
-        row("group updates", self.group);
-        row("apply updates", self.apply);
-        row("reverse edges", self.reverse);
-        println!("  {:<22} {:>9.3} s", "total", total.as_secs_f64());
+    /// Print the pass breakdown as `Detailed` stage lines.
+    fn report(&self) {
+        println!(
+            " Descent phases: prune {:.2?}, group {:.2?}, apply {:.2?}, reverse edges {:.2?}",
+            self.prune, self.group, self.apply, self.reverse
+        );
 
         let accept = if self.updates_emitted > 0 {
             100.0 * self.updates_accepted as f64 / self.updates_emitted as f64
@@ -230,7 +198,7 @@ impl BuildTimings {
             0.0
         };
         println!(
-            "  updates: {} emitted, {} accepted ({:.2}%)",
+            " Updates: {} emitted, {} accepted ({:.2}%)",
             self.updates_emitted.separate_with_underscores(),
             self.updates_accepted.separate_with_underscores(),
             accept
@@ -239,12 +207,9 @@ impl BuildTimings {
         let st = self.prune_stats;
         if st.deg_count > 0 {
             println!(
-                "  adjacency: mean {:.1}, max {}",
+                " Adjacency: mean {:.1}, max {}; {} of {} node passes skipped as all-old ({:.1}%)",
                 st.deg_sum as f64 / st.deg_count as f64,
-                st.deg_max
-            );
-            println!(
-                "  node passes: {} of {} skipped as all-old ({:.1}%)",
+                st.deg_max,
                 st.skipped.separate_with_underscores(),
                 st.deg_count.separate_with_underscores(),
                 100.0 * st.skipped as f64 / st.deg_count as f64
@@ -576,7 +541,8 @@ where
     ///   NN-Descent's rule since the forest is only queried at search time
     ///   (not per build node), so a lower budget is sufficient.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   forest, the seed graph and the per-pass lines
     ///
     /// ### Returns
     ///
@@ -587,8 +553,10 @@ where
         params: RnnDescentBuildParams,
         n_trees: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("RNNDescent index", verbosity);
+        let detailed = verbosity.detailed_verbosity();
         let (vectors_flat, n, dim) = data.into_row_major();
         let norms = if metric_needs_norms(metric) {
             precompute_norms(&vectors_flat, n, dim)
@@ -603,10 +571,18 @@ where
         // multi-seeds the beam from `forest.query()` results.
         let mut timings = BuildTimings::default();
         let start = Instant::now();
-        let forest = KdTreeIndex::new((&vectors_flat[..], n, dim), n_trees, metric, seed);
-        timings.forest = start.elapsed();
-        if verbose {
-            println!("Built KdForest ({} trees): {:.2?}", n_trees, timings.forest);
+        let forest = KdTreeIndex::new(
+            (&vectors_flat[..], n, dim),
+            n_trees,
+            metric,
+            seed,
+            Verbosity::Quiet,
+        );
+        if detailed {
+            println!(
+                " Built KdForest ({n_trees} trees) in {:.2?}",
+                start.elapsed()
+            );
         }
 
         let mut index = Self {
@@ -630,8 +606,15 @@ where
         let mut grouper = UpdateGrouper::new();
 
         let start = Instant::now();
-        index.initialise_random_graph(&mut build_graph, params.s, params.r, seed, verbose);
-        timings.seed = start.elapsed();
+        index.initialise_random_graph(&mut build_graph, params.s, params.r, seed);
+        if detailed {
+            println!(
+                " Seeded random graph (S = {}, R = {}) in {:.2?}",
+                params.s,
+                params.r,
+                start.elapsed()
+            );
+        }
 
         for t1 in 0..params.t1 {
             for t2 in 0..params.t2 {
@@ -641,9 +624,9 @@ where
                     &mut grouper,
                     &mut timings,
                 );
-                if verbose {
+                if detailed {
                     println!(
-                        "  t1={} t2={}: emitted {} reinsert updates",
+                        "  Pass {}.{}: {} reinsert updates",
                         t1 + 1,
                         t2 + 1,
                         changes.separate_with_underscores()
@@ -657,9 +640,9 @@ where
                     &mut grouper,
                     &mut timings,
                 );
-                if verbose {
+                if detailed {
                     println!(
-                        "  t1={}: AddReverseEdges applied {} edge updates",
+                        "  Pass {}: {} reverse-edge updates",
                         t1 + 1,
                         changes.separate_with_underscores()
                     );
@@ -667,8 +650,8 @@ where
             }
         }
 
-        if verbose {
-            timings.report(n, params.r);
+        if detailed {
+            timings.report();
         }
 
         // Flatten to compact ids-only storage.
@@ -676,6 +659,8 @@ where
         // release the surplus capacity.
         index.graph = build_graph.into_iter().map(|n| n.pid()).collect();
         index.graph.shrink_to_fit();
+
+        log.finish();
 
         Ok(index)
     }
@@ -692,24 +677,7 @@ where
     /// * `s` - Initial out-degree
     /// * `r` - Slot capacity per node
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
-    fn initialise_random_graph(
-        &self,
-        graph: &mut [Neighbour<T>],
-        s: usize,
-        r: usize,
-        seed: usize,
-        verbose: bool,
-    ) {
-        if verbose {
-            println!(
-                "Random seed graph: {} nodes, S={}, R={}",
-                self.n.separate_with_underscores(),
-                s,
-                r
-            );
-        }
-
+    fn initialise_random_graph(&self, graph: &mut [Neighbour<T>], s: usize, r: usize, seed: usize) {
         let n = self.n;
         let actual_s = s.min(n.saturating_sub(1));
         graph.par_chunks_mut(r).enumerate().for_each(|(u, slot)| {
@@ -746,7 +714,7 @@ where
     /// * `graph` - Build-time graph (mutated in place)
     /// * `r` - Slot capacity per node
     /// * `grouper` - Reused counting-sort scratch for the emitted updates
-    /// * `timings` - Phase accumulator for the verbose breakdown
+    /// * `timings` - Phase accumulator for the `Detailed` breakdown
     ///
     /// ### Returns
     ///
@@ -900,7 +868,7 @@ where
     /// * `graph` - Build-time graph (mutated in place)
     /// * `r` - Slot capacity per node
     /// * `grouper` - Reused counting-sort scratch for the emitted updates
-    /// * `timings` - Phase accumulator for the verbose breakdown
+    /// * `timings` - Phase accumulator for the `Detailed` breakdown
     ///
     /// ### Returns
     ///
@@ -1126,7 +1094,7 @@ where
     /// * `ef_search` - Optional beam width override
     /// * `k_search` - Optional per-hop out-degree cap (default `min(32, R)`)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress every 100_000 samples
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -1137,9 +1105,9 @@ where
         ef_search: Option<usize>,
         k_search: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("RNNDescent index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -1148,20 +1116,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, ef_search, k_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -1239,7 +1199,8 @@ mod tests {
 
     fn build_default(mat: &Mat<f32>, metric: Dist) -> RnnDescentIndex<f32> {
         let params = RnnDescentBuildParams::new(10, 32, 3, 8);
-        RnnDescentIndex::<f32>::build(mat.as_ref(), metric, params, None, 42, false).unwrap()
+        RnnDescentIndex::<f32>::build(mat.as_ref(), metric, params, None, 42, Verbosity::Quiet)
+            .unwrap()
     }
 
     #[test]
@@ -1310,7 +1271,7 @@ mod tests {
             params,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1340,7 +1301,7 @@ mod tests {
             params,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1387,7 +1348,7 @@ mod tests {
             params,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1420,7 +1381,7 @@ mod tests {
             params,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1440,7 +1401,7 @@ mod tests {
             params,
             None,
             7,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let b = RnnDescentIndex::<f32>::build(
@@ -1449,7 +1410,7 @@ mod tests {
             params,
             None,
             7,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(a.graph, b.graph);

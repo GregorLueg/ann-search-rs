@@ -76,8 +76,8 @@ fn main() {
     let (data, _): (Mat<f32>, _) = generate_data(&cli);
 
     let start = Instant::now();
-    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let (truth, _) = query_exhaustive_self(&cpu, cli.k, false, false).unwrap();
+    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
+    let (truth, _) = query_exhaustive_self(&cpu, cli.k, false, Verbosity::Quiet).unwrap();
     println!(
         "CPU exhaustive (ground truth): {:.1} ms",
         start.elapsed().as_secs_f64() * 1e3
@@ -85,21 +85,25 @@ fn main() {
 
     let device: cubecl::wgpu::WgpuDevice = Default::default();
     let start = Instant::now();
-    let wgpu =
-        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
-            .unwrap();
+    let wgpu = build_exhaustive_index_gpu::<f32>(
+        data.as_ref(),
+        &cli.distance,
+        device.clone().into(),
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let wgpu_build = start.elapsed().as_secs_f64() * 1e3;
     let (wgpu_cold, wgpu_warm, wgpu_nn) = time_cold_warm(|| {
-        query_exhaustive_index_gpu_self(&wgpu, cli.k, false, false)
+        query_exhaustive_index_gpu_self(&wgpu, cli.k, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
 
     let start = Instant::now();
-    let mlx = build_exhaustive_index_mlx(data.as_ref(), &cli.distance).unwrap();
+    let mlx = build_exhaustive_index_mlx(data.as_ref(), &cli.distance, Verbosity::Quiet).unwrap();
     let mlx_build = start.elapsed().as_secs_f64() * 1e3;
     let (mlx_cold, mlx_warm, mlx_nn) = time_cold_warm(|| {
-        query_exhaustive_index_mlx_self(&mlx, cli.k, false, true)
+        query_exhaustive_index_mlx_self(&mlx, cli.k, false, Verbosity::Normal)
             .unwrap()
             .0
     });

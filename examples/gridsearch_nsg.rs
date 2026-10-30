@@ -27,15 +27,21 @@ fn main() {
     // Exhaustive baseline
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +58,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -96,7 +102,7 @@ fn main() {
             knn_k,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -110,9 +116,15 @@ fn main() {
             println!("Querying NSG index (ef_search={})...", ef_label);
 
             let start = Instant::now();
-            let (approx_neighbors, approx_distances) =
-                query_nsg_index(query_data.as_ref(), &nsg_idx, cli.k, ef_search, true, false)
-                    .unwrap();
+            let (approx_neighbors, approx_distances) = query_nsg_index(
+                query_data.as_ref(),
+                &nsg_idx,
+                cli.k,
+                ef_search,
+                true,
+                Verbosity::Quiet,
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let recall = calculate_recall(&true_neighbors, &approx_neighbors, cli.k);
@@ -142,7 +154,7 @@ fn main() {
         println!("Self-querying NSG index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_nsg_self(&nsg_idx, cli.k, None, true, false).unwrap();
+            query_nsg_self(&nsg_idx, cli.k, None, true, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

@@ -38,14 +38,20 @@ fn main() {
     // Ground truth
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -62,7 +68,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -103,6 +109,7 @@ fn main() {
                 1.2,
                 &cli.distance,
                 cli.seed as usize,
+                Verbosity::Quiet,
             )
             .unwrap();
             let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -114,8 +121,15 @@ fn main() {
                     degree, l_build, ef
                 );
                 let start = Instant::now();
-                let (neighbors, _) =
-                    query_qg_index(query_data.as_ref(), &qg_idx, cli.k, ef, false, false).unwrap();
+                let (neighbors, _) = query_qg_index(
+                    query_data.as_ref(),
+                    &qg_idx,
+                    cli.k,
+                    ef,
+                    false,
+                    Verbosity::Quiet,
+                )
+                .unwrap();
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
                 let approx = exact_distances(&data, &query_data, &neighbors, &cli.distance);
@@ -141,7 +155,8 @@ fn main() {
                 degree, l_build
             );
             let start = Instant::now();
-            let (neighbors_self, _) = query_qg_self(&qg_idx, cli.k, ef_self, false, false).unwrap();
+            let (neighbors_self, _) =
+                query_qg_self(&qg_idx, cli.k, ef_self, false, Verbosity::Quiet).unwrap();
             let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let approx_self = exact_distances(&data, &data, &neighbors_self, &cli.distance);
@@ -190,7 +205,7 @@ fn main() {
                 None,
                 None,
                 cli.seed as usize,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -208,7 +223,7 @@ fn main() {
                     cli.k,
                     ef,
                     false,
-                    false,
+                    Verbosity::Quiet,
                 )
                 .unwrap();
                 let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -237,7 +252,7 @@ fn main() {
             );
             let start = Instant::now();
             let (neighbors_self, _) =
-                query_hnsw_rabitq_self(&hnsw_idx, cli.k, ef_self, false, false).unwrap();
+                query_hnsw_rabitq_self(&hnsw_idx, cli.k, ef_self, false, Verbosity::Quiet).unwrap();
             let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             let approx_self = exact_distances(&data, &data, &neighbors_self, &cli.distance);

@@ -111,14 +111,20 @@ fn main() {
     // Ground truth
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let exhaustive_build_ms = start.elapsed().as_secs_f64() * 1000.0;
     let exhaustive_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let exhaustive_query_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let baseline_row = |name: &str, query_ms: f64| BenchmarkResultSize {
@@ -156,7 +162,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let ivf_build_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -171,7 +177,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let soar_build_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -188,7 +194,7 @@ fn main() {
                 cli.k,
                 Some(nprobe),
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let ivf_query_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -219,7 +225,7 @@ fn main() {
                 cli.k,
                 Some(nprobe),
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let soar_query_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -277,7 +283,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -286,9 +292,15 @@ fn main() {
         for nprobe in nprobe_values(nlist) {
             println!("  Querying rule={}, nprobe={}...", tag, nprobe);
             let start = Instant::now();
-            let (nb, d) =
-                query_soar_index(query_data.as_ref(), &idx, cli.k, Some(nprobe), true, false)
-                    .unwrap();
+            let (nb, d) = query_soar_index(
+                query_data.as_ref(),
+                &idx,
+                cli.k,
+                Some(nprobe),
+                true,
+                Verbosity::Quiet,
+            )
+            .unwrap();
             let query_ms = start.elapsed().as_secs_f64() * 1000.0;
 
             results_b.push(BenchmarkResultSize {

@@ -16,6 +16,7 @@ use crate::gpu::topk_gpu::{radix_select_topk, radix_select_usable, RADIX_SELECT_
 use crate::gpu::*;
 use crate::prelude::KnnResult;
 use crate::utils::dist::Dist;
+use crate::utils::verbosity::QueryProgress;
 
 /////////////
 // Helpers //
@@ -492,7 +493,7 @@ pub fn extract_topk<F: Float>(
 /// * `dim` - Embedding dimensionality (must be divisible by LINE_SIZE)
 /// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `device` - CubeCL runtime device
-/// * `verbose` - Print progress for large batches
+/// * `verbosity` - Prints query progress at `Normal`
 ///
 /// ### Returns
 ///
@@ -504,7 +505,7 @@ pub fn query_batch_gpu<T>(
     dim: usize,
     metric: &Dist,
     device: Device,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnResult<T>
 where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
@@ -512,7 +513,7 @@ where
     let client = device.client();
     let db_gpu = GpuTensor::<T>::from_slice(db_data.data, vec![db_data.n, dim], &client)?;
     query_batch_gpu_resident(
-        k, query_data, &db_gpu, db_data.n, dim, metric, &client, verbose,
+        k, query_data, &db_gpu, db_data.n, dim, metric, &client, verbosity,
     )
 }
 
@@ -532,7 +533,8 @@ where
 /// * `dim` - Embedding dimensionality (must be divisible by LINE_SIZE)
 /// * `metric` - Distance metric (Euclidean or Cosine)
 /// * `client` - Compute client the tensors live on
-/// * `verbose` - Print progress for large batches
+/// * `verbosity` - Prints query progress at `Normal`; the caller prints start
+///   and end
 ///
 /// ### Returns
 ///
@@ -546,7 +548,7 @@ pub fn query_batch_gpu_resident<T>(
     dim: usize,
     metric: &Dist,
     client: &Client,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> KnnResult<T>
 where
     T: Float + Sum + cubecl::CubeElement + num_traits::Float + num_traits::FromPrimitive,
@@ -587,17 +589,13 @@ where
     // the query-major layout.
     let candidate_major = staging.is_some() && !use_radix;
 
-    for query_chunk_idx in 0..n_query_chunks {
-        if verbose && query_chunk_idx % 10 == 0 {
-            println!(
-                "Processed {} query chunks out of {}",
-                query_chunk_idx, n_query_chunks
-            );
-        }
+    let progress = QueryProgress::ticker(query_data.n, verbosity);
 
+    for query_chunk_idx in 0..n_query_chunks {
         let query_start = query_chunk_idx * QUERY_CHUNK_SIZE;
         let query_end = (query_start + QUERY_CHUNK_SIZE).min(query_data.n);
         let n_q = query_end - query_start;
+        progress.tick_n(n_q);
 
         let query_gpu = GpuTensor::<T>::from_slice(
             &query_data.data[query_start * dim..query_end * dim],
@@ -1336,7 +1334,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1384,7 +1382,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1444,7 +1442,7 @@ mod tests {
             dim,
             &Dist::Cosine,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1483,7 +1481,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1525,7 +1523,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1565,7 +1563,7 @@ mod tests {
             4,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1602,7 +1600,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1635,7 +1633,7 @@ mod tests {
             dim,
             &Dist::SquaredEuclidean,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

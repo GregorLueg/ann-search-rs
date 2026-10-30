@@ -12,15 +12,11 @@ use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::heap_structs::*;
 use crate::utils::tree_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 /////////////
@@ -659,11 +655,19 @@ where
     ///   slower build)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `seed` - Random seed for reproducibility
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Constructed index ready for querying
-    pub fn new(data: impl AnnMatrix<T>, n_trees: usize, metric: Dist, seed: usize) -> Self {
+    pub fn new(
+        data: impl AnnMatrix<T>,
+        n_trees: usize,
+        metric: Dist,
+        seed: usize,
+        verbosity: Verbosity,
+    ) -> Self {
+        let log = BuildLog::new("KdForest index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
@@ -700,6 +704,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         idx
     }
@@ -910,7 +916,7 @@ where
     /// * `search_k` - Search budget (defaults to k * n_trees * 20 if
     ///   None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity of the function
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -921,9 +927,9 @@ where
         k: usize,
         search_k: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("KdForest index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -934,21 +940,13 @@ where
 
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(vec, k, search_k)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -1041,7 +1039,13 @@ mod tests {
     #[test]
     fn test_kd_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let _ = KdTreeIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         // just verify it doesn't panic
     }
@@ -1072,7 +1076,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, None).unwrap();
@@ -1085,7 +1095,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1103,7 +1119,7 @@ mod tests {
     #[test]
     fn test_kd_tree_query_cosine() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Cosine, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::Cosine, 42, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1116,7 +1132,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -1129,7 +1151,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_search_k() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -1146,8 +1174,20 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = KdTreeIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42);
-        let index_many = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
+        let index_few = KdTreeIndex::new(
+            mat.as_ref(),
+            2,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
+        let index_many = KdTreeIndex::new(
+            mat.as_ref(),
+            16,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, None).unwrap();
@@ -1160,7 +1200,13 @@ mod tests {
     #[test]
     fn test_kd_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
 
@@ -1173,8 +1219,20 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
+        let index1 = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
+        let index2 = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None).unwrap();
@@ -1187,8 +1245,20 @@ mod tests {
     fn test_kd_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42);
-        let index2 = KdTreeIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123);
+        let index1 = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
+        let index2 = KdTreeIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            123,
+            Verbosity::Quiet,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1212,7 +1282,13 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = KdTreeIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            16,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -1226,7 +1302,7 @@ mod tests {
     fn test_kd_tree_orthogonal_vectors() {
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Cosine, 42);
+        let index = KdTreeIndex::new(mat.as_ref(), 4, Dist::Cosine, 42, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1247,7 +1323,13 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = KdTreeIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42);
+        let index = KdTreeIndex::new(
+            mat.as_ref(),
+            32,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None).unwrap();

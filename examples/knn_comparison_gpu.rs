@@ -172,15 +172,20 @@ fn main() {
     // Ground truth: GPU exhaustive self-query
     println!("Building GPU exhaustive index...");
     let start = Instant::now();
-    let gpu_exhaustive_idx =
-        build_exhaustive_index_gpu::<f32>(data.as_ref(), &cli.distance, device.clone().into())
-            .unwrap();
+    let gpu_exhaustive_idx = build_exhaustive_index_gpu::<f32>(
+        data.as_ref(),
+        &cli.distance,
+        device.clone().into(),
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let ex_build = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Self-querying GPU exhaustive (ground truth)...");
     let start = Instant::now();
     let (true_neighbors, true_distances) =
-        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_index_gpu_self(&gpu_exhaustive_idx, cli.k, true, Verbosity::Quiet)
+            .unwrap();
     let ex_query = start.elapsed().as_secs_f64() * 1000.0;
     let true_distances = true_distances.unwrap();
 
@@ -215,7 +220,7 @@ fn main() {
         &cli.distance,
         Some(params),
         cli.seed as usize,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     let cpu_build = start.elapsed().as_secs_f64() * 1000.0;
@@ -264,7 +269,7 @@ fn main() {
                 Some(params),
                 None,
                 cli.seed as usize,
-                false,
+                Verbosity::Quiet,
                 device.clone().into(),
             )
             .unwrap();

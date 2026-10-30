@@ -54,9 +54,6 @@ use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use thousands::*;
 
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, score_sign_block, unpack_rabitq_blocked, BLOCKED_ARCH,
@@ -68,7 +65,9 @@ use crate::cpu::vamana::{VamanaIndex, VamanaState};
 use crate::prelude::*;
 use crate::utils::graph_utils::ThreadLocalSearchState;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::KnnValidation;
+use std::time::Instant;
 
 ////////////
 // Consts //
@@ -288,6 +287,8 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed, for reproducibility
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   graph build
     ///
     /// ### Returns
     ///
@@ -303,7 +304,9 @@ where
         alpha_pass2: f32,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("QG index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -337,6 +340,7 @@ where
 
         // The graph is built in the space the walk searches, which for cosine
         // is the normalised one.
+        let start = Instant::now();
         let graph_index = VamanaIndex::build(
             (&vectors_flat[..], n, dim),
             Dist::SquaredEuclidean,
@@ -346,7 +350,14 @@ where
             alpha_pass1,
             alpha_pass2,
             seed,
+            Verbosity::Quiet,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Built Vamana graph (R = {degree}) in {:.2?}",
+                start.elapsed()
+            );
+        }
         let edges = graph_index.graph;
         let entry_point = graph_index.medoid;
 
@@ -434,6 +445,8 @@ where
                     Ok(())
                 },
             )?;
+
+        log.finish();
 
         Ok(Self {
             vectors_flat,
@@ -638,7 +651,7 @@ where
     /// * `k` - Number of neighbours per sample
     /// * `ef_search` - Beam width
     /// * `return_dist` - Whether to return distances alongside indices
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -648,23 +661,14 @@ where
         k: usize,
         ef_search: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("QG index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(
                     &self.vectors_flat[i * self.dim..(i + 1) * self.dim],
@@ -673,6 +677,7 @@ where
                 )
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -867,7 +872,19 @@ mod tests {
     }
 
     fn build(data: &Mat<f32>, metric: Dist, degree: usize) -> QgIndex<f32> {
-        QgIndex::build(data.as_ref(), metric, degree, 128, None, 1.2, 1.2, None, 42).unwrap()
+        QgIndex::build(
+            data.as_ref(),
+            metric,
+            degree,
+            128,
+            None,
+            1.2,
+            1.2,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap()
     }
 
     fn brute_force(data: &Mat<f32>, query: &[f32], k: usize, metric: Dist) -> Vec<usize> {
@@ -1024,7 +1041,8 @@ mod tests {
                 1.2,
                 1.2,
                 None,
-                42
+                42,
+                Verbosity::Quiet,
             ),
             Err(AnnSearchErrors::DistanceNotSupported(_))
         ));
@@ -1045,7 +1063,8 @@ mod tests {
                         1.2,
                         1.2,
                         None,
-                        42
+                        42,
+                        Verbosity::Quiet,
                     ),
                     Err(AnnSearchErrors::QgInvalidDegree { .. })
                 ),
@@ -1068,7 +1087,7 @@ mod tests {
     fn test_generate_knn_returns_k_per_row() {
         let data = clustered(600, 64, 8, 41);
         let index = build(&data, Dist::SquaredEuclidean, 32);
-        let (ids, dists) = index.generate_knn(5, 64, true, false).unwrap();
+        let (ids, dists) = index.generate_knn(5, 64, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(ids.len(), 600);
         assert!(ids.iter().all(|row| row.len() == 5));
@@ -1089,6 +1108,7 @@ mod tests {
             1.2,
             None,
             42,
+            Verbosity::Quiet,
         )
         .unwrap();
 

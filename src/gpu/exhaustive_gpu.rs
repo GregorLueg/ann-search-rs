@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use crate::gpu::dist_gpu::*;
 use crate::gpu::normalise_rows;
 use crate::prelude::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 ////////////////////////
 // ExhaustiveIndexGpu //
@@ -67,6 +68,7 @@ where
     /// * `data` - The data for which to generate the index. Samples x features
     /// * `metric` - Which distance metric the index shall be generated for.
     /// * `device` - The runtime device for the cubecl
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -75,7 +77,9 @@ where
         data: impl AnnMatrix<T>,
         metric: Dist,
         device: Device,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-GPU index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -103,6 +107,8 @@ where
         } else {
             Vec::new()
         };
+
+        log.finish();
 
         Ok(Self {
             vectors_flat: vectors_padded,
@@ -167,7 +173,7 @@ where
     /// * `query_mat` - The samples x features matrix to query. n(features) must
     ///   match the index; padding to `dim_padded` happens here.
     /// * `k` - Number of neighbours to return
-    /// * `verbose` - Controls verbosity of the function
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -176,10 +182,11 @@ where
         &self,
         query_mat: impl AnnMatrix<T>,
         k: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnResult<T> {
         let (vectors_query, n_query, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
+        let progress = QueryProgress::new("Exhaustive-GPU index", n_query, false, verbosity);
 
         let dim_padded = self.dim_padded;
         let mut vectors_query_padded = if dim_padded != self.dim {
@@ -203,8 +210,9 @@ where
             dim_padded,
             &self.metric,
             &client,
-            verbose,
+            verbosity,
         )?;
+        progress.finish();
 
         Ok(res)
     }
@@ -218,13 +226,19 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        let progress = QueryProgress::new("Exhaustive-GPU index", self.n, true, verbosity);
         let queries = self.metric_rows(&self.vectors_flat);
         let query_data = BatchData::new(&queries, self.n);
         let client = self.device.client();
@@ -238,8 +252,9 @@ where
             self.dim_padded,
             &self.metric,
             &client,
-            verbose,
+            verbosity,
         )?;
+        progress.finish();
 
         if return_dist {
             Ok((indices, Some(distances)))
@@ -296,12 +311,15 @@ mod tests {
             data.as_ref(),
             Dist::SquaredEuclidean,
             device.clone().into(),
+            Verbosity::Quiet,
         )
         .unwrap();
 
         let query = Mat::from_fn(2, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, false).unwrap();
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 3, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(distances.len(), 2);
@@ -330,6 +348,7 @@ mod tests {
             data.as_ref(),
             Dist::SquaredEuclidean,
             device.clone().into(),
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -337,7 +356,9 @@ mod tests {
 
         let query = Mat::from_fn(2, 6, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
-        let (indices, distances) = index.query_batch(query.as_ref(), 3, false).unwrap();
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 3, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), 2);
         assert_eq!(indices[0][0], 0);
@@ -353,11 +374,18 @@ mod tests {
 
         let data = Mat::from_fn(4, 4, |i, _j| i as f32 + 1.0);
 
-        let index =
-            ExhaustiveIndexGpu::<f32>::new(data.as_ref(), Dist::Cosine, device.into()).unwrap();
+        let index = ExhaustiveIndexGpu::<f32>::new(
+            data.as_ref(),
+            Dist::Cosine,
+            device.into(),
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = Mat::from_fn(1, 4, |_, _| 1.0_f32);
-        let (indices, distances) = index.query_batch(query.as_ref(), 2, false).unwrap();
+        let (indices, distances) = index
+            .query_batch(query.as_ref(), 2, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].len(), 2);
@@ -376,10 +404,11 @@ mod tests {
             data.as_ref(),
             Dist::SquaredEuclidean,
             device.clone().into(),
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, distances) = index.generate_knn(3, true, false).unwrap();
+        let (indices, distances) = index.generate_knn(3, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(indices.len(), 6);
         assert!(distances.is_some());

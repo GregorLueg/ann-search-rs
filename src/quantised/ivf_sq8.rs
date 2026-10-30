@@ -3,13 +3,7 @@
 
 use faer::RowRef;
 use rayon::prelude::*;
-use std::{
-    collections::BinaryHeap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
@@ -17,6 +11,8 @@ use crate::quantised::hnsw_quantised::codec::GraphCodec;
 use crate::quantised::sq8u_codec::*;
 use crate::quantised::uniform_quant::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 /////////////////
 // IvfSq8Index //
@@ -153,7 +149,7 @@ where
     /// * `seed` - Random seed for reproducibility
     /// * `quant_params` - Optional calibration settings, see
     ///   [`UniformQuantParams`]. Defaults trim 0.1% from each tail.
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -166,8 +162,9 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
         quant_params: Option<UniformQuantParams>,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-SQ8 index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -178,9 +175,6 @@ where
 
         // normalise for cosine distance
         if metric == Dist::Cosine {
-            if verbose {
-                println!("  Normalising vectors for cosine distance");
-            }
             vectors_flat
                 .par_chunks_mut(dim)
                 .for_each(|chunk| normalise_vector(chunk));
@@ -190,11 +184,8 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("  Generating IVF-SQ8 index with {} Voronoi cells.", nlist);
-        }
-
         // 2. train centroids
+        let start = Instant::now();
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -203,14 +194,19 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // normalise centroids for cosine
         if metric == Dist::Cosine {
-            if verbose {
-                println!("  Normalising centroids");
-            }
             centroids
                 .par_chunks_mut(dim)
                 .for_each(|chunk| normalise_vector(chunk));
@@ -250,15 +246,13 @@ where
         drop(vectors_flat);
 
         // 5. quantise
-        if verbose {
-            println!("  Quantising vectors");
+        if verbosity.detailed_verbosity() {
+            println!(" Quantising vectors ...");
         }
         let codec = Sq8uCodec::new(&reordered, n, dim, metric, quant_params)?;
         drop(reordered);
 
-        if verbose {
-            println!("  Quantisation complete");
-        }
+        log.finish();
 
         Ok(Self {
             codec,
@@ -433,7 +427,7 @@ where
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if
     ///   None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -444,30 +438,22 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-SQ8 index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query_stored(i, k, nprobe);
                 (orig_id, indices, dists)
             })
             .collect();
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -558,7 +544,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -580,7 +566,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -598,7 +584,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -619,7 +605,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -639,7 +625,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -663,7 +649,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -684,7 +670,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -707,7 +693,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -732,7 +718,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -753,7 +739,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -777,7 +763,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -795,7 +781,7 @@ mod tests {
             get_default_k_means(),
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

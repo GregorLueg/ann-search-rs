@@ -5,13 +5,13 @@
 use faer::RowRef;
 use half::*;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 /// IVF index with bf16 quantisation
 ///
@@ -159,7 +159,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -170,8 +170,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-BF16 index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -197,11 +198,8 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("  Generating IVF index with {} Voronoi cells.", nlist);
-        }
-
         // 2. train the centroids
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -210,8 +208,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -266,6 +272,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -391,7 +399,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -402,9 +410,9 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-BF16 index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -414,21 +422,13 @@ where
                 let vec = &self.vectors_flat[start..end];
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query_bf16(vec, k, nprobe);
                 (orig_id, indices, dists)
             })
             .collect();
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -621,7 +621,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -641,7 +641,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -660,7 +660,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -680,7 +680,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -701,7 +701,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -721,7 +721,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -744,11 +744,11 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, false);
+        let (knn_indices, knn_distances) = index.generate_knn(5, Some(10), true, Verbosity::Quiet);
 
         assert_eq!(knn_indices.len(), 100);
         assert!(knn_distances.is_some());
@@ -767,7 +767,7 @@ mod tests {
             Some(20),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -790,7 +790,7 @@ mod tests {
             Some(100),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

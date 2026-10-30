@@ -51,6 +51,7 @@ use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
 pub use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
+use crate::utils::verbosity::BuildLog;
 
 ///////////
 // Const //
@@ -1943,7 +1944,8 @@ where
     /// * `refine_knn` - 2-hop refinement sweeps after the main NNDescent loop
     ///   (default `0`)
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   forest, the iterations and the CAGRA prune
     /// * `retain_gpu` - Keep the vectors and navigational graph
     ///   device-resident after the build so a later beam search does not
     ///   re-upload them
@@ -1964,13 +1966,14 @@ where
         rho: Option<f32>,
         refine_knn: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         retain_gpu: bool,
         device: Device,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
+        let log = BuildLog::new("NNDescent-GPU index", verbosity);
 
         let (vectors_flat, n, dim) = data.into_row_major();
         let k = k.unwrap_or(30);
@@ -1996,9 +1999,9 @@ where
             Vec::new()
         };
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "NNDescent-GPU: {} vectors, dim={} (padded to {}), k={}, build_k={}",
+                " {} vectors, dim {} (padded to {}), k = {}, build_k = {}",
                 n.separate_with_underscores(),
                 dim,
                 dim_padded,
@@ -2006,8 +2009,6 @@ where
                 build_k,
             );
         }
-
-        let start = Instant::now();
 
         let client = device.client();
         let limits = GpuLimits::from_client(&client);
@@ -2038,7 +2039,7 @@ where
             &cfg,
             &client,
             &limits,
-            verbose,
+            verbosity,
         )?;
 
         drop(vectors_padded);
@@ -2097,10 +2098,6 @@ where
             );
         }
 
-        if verbose {
-            println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
-        }
-
         // ---- Download the CAGRA graph ----
         // Node IDs only, stored verbatim. `cagra_rank_prune_shared` already
         // strips the new-edge flag bit and `cagra_merge_graphs` pads with the
@@ -2108,10 +2105,11 @@ where
         // reads from `final_idx_gpu` on the retained-GPU path.
 
         let cagra_graph = final_idx_gpu.clone().read(&client)?;
-
-        if verbose {
-            println!("  Total build time: {:.2?}", start.elapsed());
+        // Timed after the read-back: the launches above are asynchronous.
+        if verbosity.detailed_verbosity() {
+            println!(" CAGRA prune in {:.2?}", cagra_start.elapsed());
         }
+        log.finish();
 
         let (nav_graph_gpu, vectors_gpu) = if retain_gpu {
             (Some(final_idx_gpu), Some(vectors_gpu))
@@ -2694,7 +2692,8 @@ where
 /// * `refine_knn` - Number of 2-hop refinement sweeps after the main
 ///   NNDescent loop. Defaults to `0`
 /// * `seed` - RNG seed for reproducibility
-/// * `verbose` - Print per-phase progress
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the forest
+///   and the iterations
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -2712,7 +2711,7 @@ pub fn build_knn_graph_gpu<T>(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
@@ -2721,6 +2720,7 @@ where
     if metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(metric));
     }
+    let log = BuildLog::new("NNDescent-GPU kNN graph", verbosity);
 
     let (vectors_flat, n, dim) = data.into_row_major();
     let k = k.unwrap_or(30);
@@ -2744,9 +2744,9 @@ where
         Vec::new()
     };
 
-    if verbose {
+    if verbosity.detailed_verbosity() {
         println!(
-            "kNN-Graph-GPU: {} vectors, dim={} (padded to {}), k={}, build_k={}",
+            " {} vectors, dim {} (padded to {}), k = {}, build_k = {}",
             n.separate_with_underscores(),
             dim,
             dim_padded,
@@ -2754,8 +2754,6 @@ where
             build_k,
         );
     }
-
-    let start = Instant::now();
 
     let client = device.client();
     let limits = GpuLimits::from_client(&client);
@@ -2784,15 +2782,12 @@ where
         &cfg,
         &client,
         &limits,
-        verbose,
+        verbosity,
     )?;
 
     drop(vectors_padded);
     let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
-
-    if verbose {
-        println!("  Total build time: {:.2?}", start.elapsed());
-    }
+    log.finish();
 
     Ok(KnnGraphGpu {
         vectors_flat,
@@ -2876,7 +2871,8 @@ pub struct NnDescentOutput<T: AnnSearchFloat + CubeclFloat> {
 /// * `cfg` - Resolved knobs, see [`NnDescentCfg`]
 /// * `client` - CubeCL compute client, borrowed for the call
 /// * `limits` - Device limits read once by the caller
-/// * `verbose` - Print per-phase progress
+/// * `verbosity` - Prints the forest, the iterations and the refinement at
+///   `Detailed`; the caller prints start and end
 ///
 /// ### Returns
 ///
@@ -2891,7 +2887,7 @@ pub fn nndescent_core<T>(
     cfg: &NnDescentCfg,
     client: &Client,
     limits: &GpuLimits,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NnDescentOutput<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat + CubeclFloat,
@@ -2938,9 +2934,7 @@ where
 
     // ---- Random graph initialisation ----
 
-    if verbose {
-        println!("  Random graph initialisation...");
-    }
+    let detailed = verbosity.detailed_verbosity();
     unsafe {
         init_random_graph::launch_unchecked::<T>(
             client,
@@ -2974,7 +2968,7 @@ where
         n_trees_forest,
         seed,
         use_cosine,
-        verbose,
+        verbosity,
         client,
     )?;
 
@@ -3087,9 +3081,9 @@ where
         let updates = counter_data[0] as f64;
         let rate = updates / (n * build_k) as f64;
 
-        if verbose {
+        if detailed {
             println!(
-                "   Iter {}: {} updates (rate={:.6})",
+                "  Iteration {}: {} edge updates (rate {:.4})",
                 iter + 1,
                 (updates as usize).separate_with_underscores(),
                 rate
@@ -3097,7 +3091,7 @@ where
         }
 
         if rate < delta as f64 {
-            if verbose {
+            if detailed {
                 println!("  Converged after {} iterations", iter + 1);
             }
             converged = true;
@@ -3105,15 +3099,11 @@ where
         }
     }
 
-    if verbose {
-        println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
+    if detailed {
+        println!(" NN-Descent iterations in {:.2?}", iter_start.elapsed());
     }
 
     // ---- Optional 2-hop refinement ----
-
-    if verbose && refine_knn > 0 {
-        println!("  Running 2-Hop Refinement Sweep...");
-    }
 
     let refinement_start = Instant::now();
 
@@ -3170,18 +3160,18 @@ where
             build_k,
         )?;
 
-        if verbose {
+        if detailed {
             let counter_data = update_counter_gpu.clone().read(client)?;
             println!(
-                "    2-Hop sweep {}: {} updates",
+                "  2-hop sweep {}: {} updates",
                 sweep + 1,
                 counter_data[0].separate_with_underscores()
             );
         }
     }
 
-    if verbose && refine_knn > 0 {
-        println!("  Refinement done in: {:.2?}", refinement_start.elapsed());
+    if detailed && refine_knn > 0 {
+        println!(" 2-hop refinement in {:.2?}", refinement_start.elapsed());
     }
 
     // ---- Download the raw graph ----
@@ -3453,7 +3443,7 @@ mod tests {
                 None,
                 None,
                 seed,
-                false,
+                Verbosity::Quiet,
                 device.clone().into(),
             )
             .unwrap();
@@ -3486,7 +3476,7 @@ mod tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             device.clone().into(),
         )
@@ -3518,7 +3508,7 @@ mod tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             device.clone().into(),
         )
@@ -3548,7 +3538,7 @@ mod tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             device.clone().into(),
         )
@@ -3586,7 +3576,7 @@ mod tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             device.clone().into(),
         )
@@ -3629,7 +3619,7 @@ mod tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             device.clone().into(),
         )
@@ -4434,7 +4424,7 @@ mod kernel_tests {
             Some(0.5),
             None,
             42,
-            true,
+            Verbosity::Normal,
             false,
             device.clone().into(),
         )
@@ -4749,7 +4739,7 @@ mod kernel_tests {
             Some(0.5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();

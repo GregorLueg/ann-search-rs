@@ -2240,10 +2240,13 @@ mod gpu_smoke {
             data.as_ref(),
             Dist::SquaredEuclidean,
             WgpuDevice::default().clone().into(),
+            crate::utils::verbosity::Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, dists) = index.query_batch(data.as_ref(), k, false).unwrap();
+        let (indices, dists) = index
+            .query_batch(data.as_ref(), k, crate::utils::verbosity::Verbosity::Quiet)
+            .unwrap();
 
         for q in 0..n {
             // Every query is its own nearest neighbour at distance zero.

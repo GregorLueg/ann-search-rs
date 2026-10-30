@@ -58,9 +58,10 @@ fn main() {
     let (q_flat, n_q, dim) = queries.as_ref().into_row_major();
 
     let start = Instant::now();
-    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let (truth_q, _) = query_exhaustive_index(queries.as_ref(), &cpu, cli.k, false, false).unwrap();
-    let (truth_self, _) = query_exhaustive_self(&cpu, cli.k, false, false).unwrap();
+    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
+    let (truth_q, _) =
+        query_exhaustive_index(queries.as_ref(), &cpu, cli.k, false, Verbosity::Quiet).unwrap();
+    let (truth_self, _) = query_exhaustive_self(&cpu, cli.k, false, Verbosity::Quiet).unwrap();
     println!(
         "CPU exhaustive (ground truth): {:.1} ms",
         start.elapsed().as_secs_f64() * 1e3
@@ -78,7 +79,7 @@ fn main() {
         None,
         Some(1),
         cli.seed as usize,
-        false,
+        Verbosity::Quiet,
         true,
         WgpuDevice::default().clone().into(),
     )
@@ -102,25 +103,40 @@ fn main() {
     let n_entry = CagraMlxSearchParams::from_k(cli.k).get_n_entry();
 
     let (wq_cold, wq_warm, wq_nn) = time_cold_warm(|| {
-        query_nndescent_index_gpu(queries.as_ref(), &mut wgpu, cli.k, None, false, false)
-            .unwrap()
-            .0
+        query_nndescent_index_gpu(
+            queries.as_ref(),
+            &mut wgpu,
+            cli.k,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     let (ws_cold, ws_warm, ws_nn) = time_cold_warm(|| {
-        query_nndescent_index_gpu_self(&mut wgpu, cli.k, None, false)
+        query_nndescent_index_gpu_self(&mut wgpu, cli.k, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
     // Entry selection is host work on both paths, so it sits inside the timing.
     let (mq_cold, mq_warm, mq_nn) = time_cold_warm(|| {
         let entries = wgpu.query_entry_points(&q_flat, n_q, n_entry);
-        query_cagra_index_mlx(queries.as_ref(), &mlx, cli.k, None, Some(&entries), false)
-            .unwrap()
-            .0
+        query_cagra_index_mlx(
+            queries.as_ref(),
+            &mlx,
+            cli.k,
+            None,
+            Some(&entries),
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     let (ms_cold, ms_warm, ms_nn) = time_cold_warm(|| {
         let entries = self_entry_points(&knn_rows, wgpu.k, n, n_entry, 42);
-        query_cagra_index_mlx_self(&mlx, cli.k, None, Some(&entries), false)
+        query_cagra_index_mlx_self(&mlx, cli.k, None, Some(&entries), false, Verbosity::Quiet)
             .unwrap()
             .0
     });

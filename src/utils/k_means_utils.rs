@@ -13,10 +13,13 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use std::iter::Sum;
 use std::num::NonZero;
+use std::time::Instant;
+use thousands::*;
 
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
+use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
 
 ////////////
@@ -1792,7 +1795,7 @@ where
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd<T>(
     data: &[T],
@@ -1805,7 +1808,7 @@ fn hamerly_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField + FromPrimitive,
 {
@@ -1856,8 +1859,8 @@ fn hamerly_lloyd<T>(
         let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
 
         if max_delta <= T::from_f64(1e-5).unwrap() {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -1906,8 +1909,8 @@ fn hamerly_lloyd<T>(
         }
 
         if dirty.is_empty() {
-            if verbose {
-                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {} (bounds tight)", iter + 1);
             }
             break;
         }
@@ -1931,12 +1934,12 @@ fn hamerly_lloyd<T>(
             &mut ws_tmp_lower,
         );
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                "  Iteration {}: {} / {} points reassessed, {:.1}% pruned",
                 iter + 1,
-                dirty.len(),
-                n,
+                dirty.len().separate_with_underscores(),
+                n.separate_with_underscores(),
                 (1.0 - dirty.len() as f64 / n as f64) * 100.0,
             );
         }
@@ -1966,7 +1969,7 @@ fn hamerly_lloyd<T>(
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn gemm_lloyd<T>(
     data: &[T],
@@ -1980,7 +1983,7 @@ fn gemm_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
 {
@@ -2013,8 +2016,8 @@ fn gemm_lloyd<T>(
         let change_floor: usize = (n / 10_000).max(1);
 
         if changed <= change_floor {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2034,11 +2037,11 @@ fn gemm_lloyd<T>(
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} complete ({} assignments changed)",
+                "  Iteration {}: {} assignments changed",
                 iter + 1,
-                changed
+                changed.separate_with_underscores()
             );
         }
     }
@@ -2074,7 +2077,7 @@ fn gemm_lloyd<T>(
 /// * `max_iters` - Maximum iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print iteration progress
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn parallel_lloyd<T>(
     data: &[T],
@@ -2088,7 +2091,7 @@ fn parallel_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
@@ -2124,8 +2127,8 @@ fn parallel_lloyd<T>(
         let change_floor: usize = (n / 10_000).max(1);
 
         if changed <= change_floor && last_adjusted == 0 {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2197,11 +2200,11 @@ fn parallel_lloyd<T>(
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} complete ({} assignments changed)",
+                "  Iteration {}: {} assignments changed",
                 iter + 1,
-                changed
+                changed.separate_with_underscores()
             );
         }
     }
@@ -2398,7 +2401,7 @@ where
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd_simd<T>(
     data: &[T],
@@ -2410,7 +2413,7 @@ fn hamerly_lloyd_simd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + FromPrimitive,
 {
@@ -2450,8 +2453,8 @@ fn hamerly_lloyd_simd<T>(
         let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
 
         if max_delta <= T::from_f64(1e-5).unwrap() {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2501,8 +2504,8 @@ fn hamerly_lloyd_simd<T>(
             .collect();
 
         if dirty.is_empty() {
-            if verbose {
-                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {} (bounds tight)", iter + 1);
             }
             break;
         }
@@ -2518,12 +2521,12 @@ fn hamerly_lloyd_simd<T>(
             &mut lower,
         );
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                "  Iteration {}: {} / {} points reassessed, {:.1}% pruned",
                 iter + 1,
-                dirty.len(),
-                n,
+                dirty.len().separate_with_underscores(),
+                n.separate_with_underscores(),
                 (1.0 - dirty.len() as f64 / n as f64) * 100.0,
             );
         }
@@ -3265,7 +3268,8 @@ where
 ///   control over the maximum iterations, initialisation, path and size
 ///   balancing. If not provided, will default to sensible heuristics.
 /// * `seed` - Seed for reproducibility
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+///   initialisation, the Lloyd path and per-iteration lines
 ///
 /// ### Returns
 ///
@@ -3286,7 +3290,7 @@ pub fn train_centroids<T>(
     metric: &Dist,
     params_k_means: Option<KMeansTrainingParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<Vec<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -3321,19 +3325,19 @@ where
         }
     };
 
+    let start = Instant::now();
+    if verbosity.normal_verbosity() {
+        println!(
+            "Training k-means ({} centroids) ...",
+            n_centroids.separate_with_underscores()
+        );
+    }
+
     let init_method = resolve_init(params.init, n_centroids);
 
     let mut centroids = match init_method {
-        KMeansInit::Random => {
-            if verbose {
-                println!("  Initialising centroids via fast random selection");
-            }
-            fast_random_init(data, dim, n, n_centroids, seed)
-        }
+        KMeansInit::Random => fast_random_init(data, dim, n, n_centroids, seed),
         KMeansInit::KMeansParallel => {
-            if verbose {
-                println!("  Initialising centroids via k-means||");
-            }
             let init_norms: Vec<T> = match metric {
                 Dist::SquaredEuclidean => (0..n)
                     .into_par_iter()
@@ -3347,6 +3351,17 @@ where
             kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
         }
     };
+
+    if verbosity.detailed_verbosity() {
+        let how = match init_method {
+            KMeansInit::Random => "random selection",
+            KMeansInit::KMeansParallel => "k-means||",
+        };
+        println!(
+            " Initialised centroids via {how} in {:.2?}",
+            start.elapsed()
+        );
+    }
 
     let mut centroid_norms: Vec<T> = match metric {
         Dist::SquaredEuclidean => (0..n_centroids)
@@ -3363,17 +3378,20 @@ where
         }
     };
 
-    if verbose {
-        println!("  Running Lloyd's iterations");
-    }
-
     let lloyd_path = resolve_path(params.path, dim, metric);
+
+    if verbosity.detailed_verbosity() {
+        let how = match lloyd_path {
+            LloydPath::HamerlyGemm => "Hamerly's bounds + GEMM assignment",
+            LloydPath::HamerlySimd => "Hamerly's bounds + SIMD assignment",
+            LloydPath::GemmLloyd => "GEMM assignment",
+            LloydPath::ParallelLloyd => "direct SIMD assignment",
+        };
+        println!(" Running Lloyd's iterations ({how})");
+    }
 
     match lloyd_path {
         LloydPath::HamerlyGemm => {
-            if verbose {
-                println!("    (Hamerly's bounds + GEMM assignment)");
-            }
             hamerly_lloyd(
                 data,
                 &data_norms,
@@ -3385,13 +3403,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::HamerlySimd => {
-            if verbose {
-                println!("    (Hamerly's bounds + SIMD assignment)");
-            }
             hamerly_lloyd_simd(
                 data,
                 dim,
@@ -3402,13 +3417,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::GemmLloyd => {
-            if verbose {
-                println!("    (GEMM assignment, no Hamerly)");
-            }
             gemm_lloyd(
                 data,
                 &data_norms,
@@ -3421,13 +3433,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::ParallelLloyd => {
-            if verbose {
-                println!("    (direct SIMD assignment)");
-            }
             parallel_lloyd(
                 data,
                 &data_norms,
@@ -3440,9 +3449,13 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
+    }
+
+    if verbosity.normal_verbosity() {
+        println!("... trained k-means in {:.2?}", start.elapsed());
     }
 
     Ok(centroids)
@@ -3750,7 +3763,7 @@ mod tests {
                 &Dist::SquaredEuclidean,
                 Some(params),
                 7,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let norms: Vec<f32> = (0..k)
@@ -4064,8 +4077,17 @@ mod tests {
     fn test_train_centroids_small() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
 
-        let centroids =
-            train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false).unwrap();
+        let centroids = train_centroids(
+            &data,
+            2,
+            4,
+            2,
+            &Dist::SquaredEuclidean,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(centroids.len(), 4);
 
@@ -4256,7 +4278,7 @@ mod tests {
             20,
             false,
             0,
-            false,
+            Verbosity::Quiet,
         );
 
         let cent0 = (centroids[0], centroids[1]);
@@ -4300,7 +4322,7 @@ mod tests {
                 Some(LloydPath::HamerlySimd),
             )),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -4474,7 +4496,7 @@ mod tests {
                     Some(path),
                 )),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap()
         };

@@ -60,8 +60,8 @@ fn main() {
     let seed = cli.seed as usize;
 
     let start = Instant::now();
-    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let (truth, _) = query_exhaustive_self(&cpu, cli.k, false, false).unwrap();
+    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
+    let (truth, _) = query_exhaustive_self(&cpu, cli.k, false, Verbosity::Quiet).unwrap();
     println!(
         "CPU exhaustive (ground truth): {:.1} ms",
         start.elapsed().as_secs_f64() * 1e3
@@ -75,13 +75,13 @@ fn main() {
         Some(KMeansGpuParams::new(KMEANS_ITERS, None, true, false)),
         &cli.distance,
         seed,
-        false,
+        Verbosity::Quiet,
         device.clone().into(),
     )
     .unwrap();
     let wgpu_build = start.elapsed().as_secs_f64() * 1e3;
     let (wgpu_cold, wgpu_warm, wgpu_nn) = time_cold_warm(|| {
-        query_ivf_index_gpu_self(&wgpu, cli.k, None, None, false, false)
+        query_ivf_index_gpu_self(&wgpu, cli.k, None, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
@@ -93,25 +93,25 @@ fn main() {
         Some(KMeansTrainingParams::new(KMEANS_ITERS, None, None)),
         &cli.distance,
         seed,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap()
     .with_scan(IvfScanMlx::QueryMajor);
     let mlx_build = start.elapsed().as_secs_f64() * 1e3;
     let (mlx_cold, mlx_warm, mlx_nn) = time_cold_warm(|| {
-        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, true)
+        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, Verbosity::Normal)
             .unwrap()
             .0
     });
     let mlx = mlx.with_scan(IvfScanMlx::ClusterMajor);
     let (cm_cold, cm_warm, cm_nn) = time_cold_warm(|| {
-        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, true)
+        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, Verbosity::Normal)
             .unwrap()
             .0
     });
     let mlx = mlx.with_scan(IvfScanMlx::ClusterMatrix);
     let (mm_cold, mm_warm, mm_nn) = time_cold_warm(|| {
-        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, true)
+        query_ivf_index_mlx_self(&mlx, cli.k, None, None, false, Verbosity::Normal)
             .unwrap()
             .0
     });

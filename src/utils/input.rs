@@ -174,6 +174,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::verbosity::Verbosity;
 
     /// Row-major reference data: element (i, j) is i * 10 + j.
     fn reference(n: usize, dim: usize) -> Vec<f32> {
@@ -324,16 +325,31 @@ mod tests {
             .collect();
         let mat = Mat::from_fn(n, dim, |i, j| flat[i * dim + j]);
 
-        let faer_index = build_hnsw_index(mat.as_ref(), 16, 100, "euclidean", 42, false).unwrap();
+        let faer_index =
+            build_hnsw_index(mat.as_ref(), 16, 100, "euclidean", 42, Verbosity::Quiet).unwrap();
         let (faer_idx, faer_dist) =
-            query_hnsw_index(mat.as_ref(), &faer_index, 5, 50, true, false).unwrap();
+            query_hnsw_index(mat.as_ref(), &faer_index, 5, 50, true, Verbosity::Quiet).unwrap();
         let faer_dist = faer_dist.unwrap();
 
         // Same data as a flat row-major buffer: same index, same neighbours.
-        let flat_index =
-            build_hnsw_index((flat.as_slice(), n, dim), 16, 100, "euclidean", 42, false).unwrap();
-        let (flat_idx, flat_dist) =
-            query_hnsw_index((flat.as_slice(), n, dim), &flat_index, 5, 50, true, false).unwrap();
+        let flat_index = build_hnsw_index(
+            (flat.as_slice(), n, dim),
+            16,
+            100,
+            "euclidean",
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let (flat_idx, flat_dist) = query_hnsw_index(
+            (flat.as_slice(), n, dim),
+            &flat_index,
+            5,
+            50,
+            true,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(faer_idx, flat_idx);
         assert_eq!(faer_dist, flat_dist.unwrap());
@@ -342,16 +358,18 @@ mod tests {
         {
             let arr = Array2::from_shape_fn((n, dim), |(i, j)| flat[i * dim + j]);
 
-            let nd_index = build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, false).unwrap();
+            let nd_index =
+                build_hnsw_index(arr.view(), 16, 100, "euclidean", 42, Verbosity::Quiet).unwrap();
             let (nd_idx, nd_dist) =
-                query_hnsw_index(arr.view(), &nd_index, 5, 50, true, false).unwrap();
+                query_hnsw_index(arr.view(), &nd_index, 5, 50, true, Verbosity::Quiet).unwrap();
             assert_eq!(faer_idx, nd_idx);
             assert_eq!(faer_dist, nd_dist.unwrap());
 
             // A transposed view describes the same matrix but reaches the
             // strided fallback, so it must land in the same place.
             let arr_t = Array2::from_shape_fn((dim, n), |(j, i)| flat[i * dim + j]);
-            let (t_idx, _) = query_hnsw_index(arr_t.t(), &nd_index, 5, 50, true, false).unwrap();
+            let (t_idx, _) =
+                query_hnsw_index(arr_t.t(), &nd_index, 5, 50, true, Verbosity::Quiet).unwrap();
             assert_eq!(faer_idx, t_idx);
         }
     }

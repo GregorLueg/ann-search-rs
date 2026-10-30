@@ -8,10 +8,6 @@ use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use thousands::*;
 
 use crate::binary::dist_binary::*;
 use crate::binary::rabitq::rotator::RotatorKind;
@@ -20,6 +16,7 @@ use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::CentroidDistance;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 /// Exhaustive RaBitQ index with multi-centroid support
 ///
@@ -87,6 +84,7 @@ where
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
     /// * `seed` - Random seed
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -96,8 +94,12 @@ where
         metric: &Dist,
         n_clusters: Option<usize>,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
-        Self::with_rotator_kind(data, metric, n_clusters, None, seed)
+        let log = BuildLog::new("Exhaustive-RaBitQ index", verbosity);
+        let index = Self::with_rotator_kind(data, metric, n_clusters, None, seed);
+        log.finish();
+        index
     }
 
     /// Create a new exhaustive RaBitQ index with an explicitly chosen rotation
@@ -149,6 +151,7 @@ where
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
     /// * `seed` - Random seed
+    /// * `verbosity` - Prints start and end at `Normal`
     /// * `save_path` - Where to save the vector storage
     ///
     /// ### Returns
@@ -159,8 +162,10 @@ where
         metric: &Dist,
         n_clusters: Option<usize>,
         seed: usize,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-RaBitQ index", verbosity);
         if *metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(*metric));
         }
@@ -183,6 +188,8 @@ where
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
+
+        log.finish();
 
         Ok(Self {
             quantiser,
@@ -407,7 +414,7 @@ where
     /// * `n_probe` - Number of clusters to search per query
     /// * `rerank_factor` - Reranking factor for exact distances
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -418,34 +425,26 @@ where
         n_probe: Option<usize>,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()
             .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Exhaustive-RaBitQ index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let vec = vector_store.load_vector(i);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query_reranking(vec, k, n_probe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -575,9 +574,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_construction() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42)
-                .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.n, 100);
         assert_eq!(index.quantiser.n_clusters(), 10);
@@ -587,9 +591,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_query_returns_k_results() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42)
-                .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10, Some(5)).unwrap();
@@ -601,9 +610,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_query_sorted() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42)
-                .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (_, distances) = index.query(&query, 10, Some(5)).unwrap();
@@ -616,8 +630,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_query_k_exceeds_n() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42)
-            .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(5),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 100, Some(5)).unwrap();
@@ -628,9 +648,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_query_row() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42)
-                .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let (indices, distances) = index.query_row(data.as_ref().row(0), 10, Some(5)).unwrap();
 
@@ -641,7 +666,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_cosine() {
         let data = create_test_data::<f32>(100, 32);
-        let index = ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::Cosine, Some(10), 42).unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::Cosine,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, distances) = index.query(&query, 10, Some(10)).unwrap();
@@ -653,9 +685,14 @@ mod tests {
     #[test]
     fn test_exhaustive_rabitq_default_nprobe() {
         let data = create_test_data::<f32>(100, 32);
-        let index =
-            ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(10), 42)
-                .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(10),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let (indices, _) = index.query(&query, 10, None).unwrap();
@@ -673,6 +710,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             Some(5),
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -691,6 +729,7 @@ mod tests {
             &Dist::Cosine,
             Some(10),
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -718,6 +757,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             Some(10),
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -740,12 +780,13 @@ mod tests {
             &Dist::Cosine,
             Some(5),
             42,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
 
         let (knn_indices, knn_distances) = index
-            .generate_knn(5, Some(5), Some(10), true, false)
+            .generate_knn(5, Some(5), Some(10), true, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(knn_indices.len(), 50);
@@ -760,11 +801,15 @@ mod tests {
     #[test]
     fn test_knn_without_vector_store_panics() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42)
-            .unwrap();
-        let result = index.generate_knn(5, Some(5), Some(10), false, false);
-
-        println!("What is this {:?}", result);
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(5),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let result = index.generate_knn(5, Some(5), Some(10), false, Verbosity::Quiet);
 
         assert!(matches!(
             result,
@@ -775,8 +820,14 @@ mod tests {
     #[test]
     fn test_query_reranking_without_vector_store_panics() {
         let data = create_test_data::<f32>(50, 32);
-        let index = ExhaustiveIndexRaBitQ::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42)
-            .unwrap();
+        let index = ExhaustiveIndexRaBitQ::new(
+            data.as_ref(),
+            &Dist::SquaredEuclidean,
+            Some(5),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
         let result = index.query_reranking(&query, 10, Some(5), Some(5));
         assert!(matches!(

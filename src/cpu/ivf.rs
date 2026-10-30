@@ -3,13 +3,13 @@
 
 use faer::RowRef;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+use std::time::Instant;
 
 /////////////
 // IvfIndex//
@@ -137,7 +137,8 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds timed
+    ///   stages
     ///
     /// ### Returns
     ///
@@ -148,8 +149,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -173,11 +175,8 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("Generating IVF index with {} Voronoi cells.", nlist);
-        }
-
         // 2. train the centroids
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -186,8 +185,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -212,6 +219,7 @@ where
             vec![T::one(); n]
         };
 
+        let start = Instant::now();
         let assignments = assign_all_parallel(
             &vectors_flat,
             &data_norms_for_assignment,
@@ -222,6 +230,13 @@ where
             nlist,
             &metric,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
@@ -242,6 +257,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -457,7 +474,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -468,9 +485,9 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -480,21 +497,13 @@ where
                 let vec = &self.vectors_flat[start..end];
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(vec, k, nprobe)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -593,7 +602,7 @@ mod tests {
             Some(2), // nlist
             None,
             42,
-            false,
+            Verbosity::Quiet,
         );
     }
 
@@ -606,7 +615,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -627,7 +636,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -646,7 +655,15 @@ mod tests {
     fn test_ivf_query_cosine() {
         let data = create_simple_matrix();
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false).unwrap();
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(2),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -664,7 +681,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -683,7 +700,7 @@ mod tests {
             Some(3),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -705,7 +722,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index2 = IvfIndex::build(
@@ -714,7 +731,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -735,7 +752,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index2 = IvfIndex::build(
@@ -744,7 +761,7 @@ mod tests {
             Some(2),
             None,
             123,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -768,7 +785,7 @@ mod tests {
             Some(10), // sqrt(100)
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -783,7 +800,15 @@ mod tests {
     fn test_ivf_orthogonal_vectors() {
         let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false).unwrap();
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(3),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -811,7 +836,7 @@ mod tests {
             Some(5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -838,7 +863,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index_many = IvfIndex::build(
@@ -847,7 +872,7 @@ mod tests {
             Some(4),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

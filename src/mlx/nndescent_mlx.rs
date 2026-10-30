@@ -32,6 +32,7 @@ use crate::mlx::forest_mlx::forest_init_mlx;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::unpack_knn_graph;
 use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees, ForestRouter};
+use crate::utils::verbosity::BuildLog;
 
 ////////////
 // Consts //
@@ -1233,7 +1234,8 @@ pub struct NndOutputMlx {
 /// * `n` - Rows
 /// * `dim` - Row length
 /// * `cfg` - Resolved knobs
-/// * `verbose` - Print per-phase progress
+/// * `verbosity` - Prints the forest, the iterations and the refinement at
+///   `Detailed`; the caller prints start and end
 ///
 /// ### Returns
 ///
@@ -1244,8 +1246,9 @@ pub fn nndescent_core_mlx(
     n: usize,
     dim: usize,
     cfg: &NnDescentCfgMlx,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<NndOutputMlx, AnnSearchErrors> {
+    let detailed = verbosity.detailed_verbosity();
     install_error_handler();
     let build_k = cfg.build_k;
     let (vectors_padded, dim_padded) = pad_rows(vectors_flat, n, dim);
@@ -1266,12 +1269,9 @@ pub fn nndescent_core_mlx(
     );
     drop(vectors_padded);
 
-    if verbose {
-        println!("  Random graph initialisation...");
-    }
     let mut g = ctx.init_random(cfg.seed as u32)?;
 
-    let (forest_g, router) = forest_init_mlx(&ctx, g, dim, cfg.n_trees, cfg.seed, verbose)?;
+    let (forest_g, router) = forest_init_mlx(&ctx, g, dim, cfg.n_trees, cfg.seed, verbosity)?;
     g = forest_g;
     // The forest's projections and proposal buffers are dead; hand them back
     // rather than letting MLX's cache hold them through the descent.
@@ -1293,24 +1293,24 @@ pub fn nndescent_core_mlx(
 
         let updates = total.as_u32()?[0] as f64;
         let rate = updates / (n * build_k) as f64;
-        if verbose {
+        if detailed {
             println!(
-                "   Iter {}: {} updates (rate={:.6})",
+                "  Iteration {}: {} edge updates (rate {:.4})",
                 iter + 1,
                 (updates as usize).separate_with_underscores(),
                 rate
             );
         }
         if rate < cfg.delta as f64 {
-            if verbose {
+            if detailed {
                 println!("  Converged after {} iterations", iter + 1);
             }
             converged = true;
             break;
         }
     }
-    if verbose {
-        println!("  NNDescent iterations: {:.2?}", iter_start.elapsed());
+    if detailed {
+        println!(" NN-Descent iterations in {:.2?}", iter_start.elapsed());
     }
     crate::mlx::clear_cache()?;
 
@@ -1320,11 +1320,11 @@ pub fn nndescent_core_mlx(
         let (next, changed) = ctx.merge(&g, &props, &params)?;
         g = next;
         eval_all(&[&g.0, &g.1], false)?;
-        if verbose {
+        if detailed {
             let total = changed.sum_axis(0, false, &ctx.stream)?;
             eval_all(&[&total], false)?;
             println!(
-                "    2-Hop sweep {}: {} updates",
+                "  2-hop sweep {}: {} updates",
                 sweep + 1,
                 total.as_u32()?[0].separate_with_underscores()
             );
@@ -1423,7 +1423,8 @@ impl KnnGraphMlx {
 /// * `rho` - Local-join sampling rate. Defaults to 1.0
 /// * `refine_knn` - Two-hop sweeps after the loop. Defaults to 0
 /// * `seed` - RNG seed
-/// * `verbose` - Print per-phase progress
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the forest
+///   and the iterations
 ///
 /// ### Returns
 ///
@@ -1440,11 +1441,12 @@ pub fn build_knn_graph_mlx(
     rho: Option<f32>,
     refine_knn: Option<usize>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<KnnGraphMlx, AnnSearchErrors> {
     if metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(metric));
     }
+    let log = BuildLog::new("NNDescent-MLX kNN graph", verbosity);
     let (vectors_flat, n, dim) = data.into_row_major();
     let k = k.unwrap_or(30);
     let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
@@ -1459,16 +1461,15 @@ pub fn build_knn_graph_mlx(
         Vec::new()
     };
 
-    if verbose {
+    if verbosity.detailed_verbosity() {
         println!(
-            "kNN-Graph-MLX: {} vectors, dim={}, k={}, build_k={}",
+            " {} vectors, dim {}, k = {}, build_k = {}",
             n.separate_with_underscores(),
             dim,
             k,
             build_k,
         );
     }
-    let start = Instant::now();
 
     let cfg = NnDescentCfgMlx {
         build_k,
@@ -1481,13 +1482,10 @@ pub fn build_knn_graph_mlx(
         use_cosine,
     };
 
-    let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbose)?;
+    let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbosity)?;
     let knn_graph = compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k);
     let converged = out.converged;
-
-    if verbose {
-        println!("  Total build time: {:.2?}", start.elapsed());
-    }
+    log.finish();
 
     Ok(KnnGraphMlx {
         vectors_flat,
@@ -1657,8 +1655,8 @@ mod tests {
     ///
     /// Recall in `[0, 1]`
     fn recall(data: &Mat<f32>, metric: Dist, approx: &[Vec<usize>], k: usize) -> f64 {
-        let cpu = ExhaustiveIndex::new(data.as_ref(), metric);
-        let (truth, _) = cpu.generate_knn(k + 1, false, false).unwrap();
+        let cpu = ExhaustiveIndex::new(data.as_ref(), metric, Verbosity::Quiet);
+        let (truth, _) = cpu.generate_knn(k + 1, false, Verbosity::Quiet).unwrap();
         let mut hits = 0;
         for (i, (t, a)) in truth.iter().zip(approx).enumerate() {
             let t: Vec<usize> = t.iter().copied().filter(|&j| j != i).take(k).collect();
@@ -1706,7 +1704,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         );
         assert!(res.is_err());
     }
@@ -1736,7 +1734,7 @@ mod tests {
             None,
             Some(refine),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (idx, _) = g.extract_knn(None, false, false);
@@ -1833,7 +1831,7 @@ mod tests {
             seed: 42,
             use_cosine: false,
         };
-        let g_idx = nndescent_core_mlx(&flat, &[], n, dim, &cfg, false)
+        let g_idx = nndescent_core_mlx(&flat, &[], n, dim, &cfg, Verbosity::Quiet)
             .unwrap()
             .graph_idx;
         let (nav, medoid) =
@@ -1878,7 +1876,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
             WgpuDevice::default().clone().into(),
         )
         .unwrap();
@@ -1907,7 +1905,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
             false,
             WgpuDevice::default().clone().into(),
         )

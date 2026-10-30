@@ -26,13 +26,13 @@ use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+use std::time::Instant;
 
 //////////////////////////
 // Thread-local buffers //
@@ -213,7 +213,8 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds timed
+    ///   stages
     ///
     /// ### Returns
     ///
@@ -230,8 +231,9 @@ where
         rule: Option<SoarRule>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("SOAR index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -255,13 +257,11 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!(
-                "  Generating SOAR index with {} Voronoi cells, rule {:?}.",
-                nlist, rule
-            );
+        if verbosity.detailed_verbosity() {
+            println!(" Spilling rule {:?}", rule);
         }
 
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -270,8 +270,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -290,6 +298,7 @@ where
             vec![T::one(); n]
         };
 
+        let start = Instant::now();
         let assignments = assign_all_parallel(
             &vectors_flat,
             &data_norms_for_assignment,
@@ -300,6 +309,13 @@ where
             nlist,
             &metric,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // Secondary assignment reads the primary one, so it has to run before
         // `assignments` is consumed by the CSR build.
@@ -362,6 +378,8 @@ where
             .iter()
             .map(|&row| row_primary[row as usize])
             .collect();
+
+        log.finish();
 
         Ok(Self {
             vectors_flat: reordered,
@@ -554,7 +572,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -565,9 +583,9 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("SOAR index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -576,21 +594,13 @@ where
                 let vec = &self.vectors_flat[start..start + self.dim];
                 let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(vec, k, nprobe)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -853,7 +863,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -879,7 +889,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -908,7 +918,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -930,7 +940,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -955,7 +965,7 @@ mod tests {
             None,
             None,
             4,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let b = SoarIndex::build(
@@ -965,7 +975,7 @@ mod tests {
             None,
             None,
             4,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -986,7 +996,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1012,7 +1022,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1029,9 +1039,16 @@ mod tests {
         let (n, dim) = (50, 4);
         let data = clustered_data(n, dim, 2, 1);
         let mat = as_mat(&data, n, dim);
-        assert!(
-            SoarIndex::build(mat.as_ref(), Dist::Manhattan, None, None, None, 1, false).is_err()
-        );
+        assert!(SoarIndex::build(
+            mat.as_ref(),
+            Dist::Manhattan,
+            None,
+            None,
+            None,
+            1,
+            Verbosity::Quiet
+        )
+        .is_err());
     }
 
     #[test]
@@ -1046,7 +1063,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1066,11 +1083,13 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, dists) = index.generate_knn(7, Some(nlist), true, false).unwrap();
+        let (indices, dists) = index
+            .generate_knn(7, Some(nlist), true, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(indices.len(), n);
         assert!(indices.iter().all(|row| row.len() == 7));
         assert!(dists.unwrap().iter().all(|row| row.len() == 7));

@@ -46,8 +46,8 @@ pub struct GraphBuildParams {
     pub ef_construction: usize,
     /// Seed for the layer draw and the within-bucket permutation.
     pub seed: usize,
-    /// Print progress per layer.
-    pub verbose: bool,
+    /// Prints one line per layer at `Detailed`.
+    pub verbosity: Verbosity,
 }
 
 impl GraphBuildParams {
@@ -58,17 +58,17 @@ impl GraphBuildParams {
     /// * `m` - Base connectivity parameter
     /// * `ef_construction` - Construction beam width
     /// * `seed` - Random seed
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - Prints one line per layer at `Detailed`
     ///
     /// ### Returns
     ///
     /// The parameter struct
-    pub fn new(m: usize, ef_construction: usize, seed: usize, verbose: bool) -> Self {
+    pub fn new(m: usize, ef_construction: usize, seed: usize, verbosity: Verbosity) -> Self {
         Self {
             m,
             ef_construction,
             seed,
-            verbose,
+            verbosity,
         }
     }
 }
@@ -79,7 +79,7 @@ impl Default for GraphBuildParams {
             m: 16,
             ef_construction: 200,
             seed: 42,
-            verbose: false,
+            verbosity: Verbosity::Quiet,
         }
     }
 }
@@ -132,9 +132,9 @@ where
     let max_layer = levels.iter().copied().fold(0u8, u8::max);
     let entry_point = levels.iter().position(|&l| l == max_layer).unwrap_or(0) as u32;
 
-    if params.verbose {
+    if params.verbosity.detailed_verbosity() {
         println!(
-            "Building quantised HNSW over {} nodes, M = {}, max layer {}",
+            " {} nodes, M = {}, max layer {}",
             n.separate_with_underscores(),
             m,
             max_layer
@@ -161,7 +161,6 @@ where
         buckets[levels[node] as usize].push(node);
     }
 
-    let start = Instant::now();
     let mut rng = SmallRng::seed_from_u64(params.seed as u64);
 
     for layer in (0..=max_layer as usize).rev() {
@@ -183,19 +182,15 @@ where
             }
         }
 
-        if params.verbose {
+        if params.verbosity.detailed_verbosity() {
             println!(
-                "  Layer {}: {} nodes ({}) in {:.2?}",
+                " Layer {}: {} nodes ({}) in {:.2?}",
                 layer,
                 bucket.len().separate_with_underscores(),
                 if parallel { "parallel" } else { "sequential" },
                 bucket_start.elapsed()
             );
         }
-    }
-
-    if params.verbose {
-        println!("  Total build in {:.2?}", start.elapsed());
     }
 
     let (nodes, block_offsets, levels) = graph.into_flat();
@@ -459,7 +454,7 @@ mod tests {
     fn test_build_produces_a_graph_of_the_right_shape() {
         let n = 500;
         let data = line(n);
-        let params = GraphBuildParams::new(8, 100, 42, false);
+        let params = GraphBuildParams::new(8, 100, 42, Verbosity::Quiet);
         let (graph, hierarchy) = build_hierarchical_graph(n, &params, line_dist(&data));
 
         assert_eq!(graph.n(), n);
@@ -475,7 +470,7 @@ mod tests {
     fn test_every_node_gets_at_least_one_base_edge() {
         let n = 400;
         let data = line(n);
-        let params = GraphBuildParams::new(8, 100, 7, false);
+        let params = GraphBuildParams::new(8, 100, 7, Verbosity::Quiet);
         let (graph, _) = build_hierarchical_graph(n, &params, line_dist(&data));
 
         for node in 0..n {
@@ -494,7 +489,7 @@ mod tests {
         // average; a saturated mean means rejects are being used as filler.
         let (n, m) = (400, 4);
         let data = line(n);
-        let params = GraphBuildParams::new(m, 100, 42, false);
+        let params = GraphBuildParams::new(m, 100, 42, Verbosity::Quiet);
         let (graph, _) = build_hierarchical_graph(n, &params, line_dist(&data));
 
         let degrees: Vec<usize> = (0..n)
@@ -519,7 +514,7 @@ mod tests {
         // construction rather than being ignored.
         let n = 300;
         let data = line(n);
-        let params = GraphBuildParams::new(8, 200, 42, false);
+        let params = GraphBuildParams::new(8, 200, 42, Verbosity::Quiet);
         let (graph, _) = build_hierarchical_graph(n, &params, line_dist(&data));
 
         let mut total = 0usize;
@@ -541,7 +536,7 @@ mod tests {
     fn test_hierarchy_lists_only_hold_nodes_above_the_base() {
         let n = 600;
         let data = line(n);
-        let params = GraphBuildParams::new(8, 100, 3, false);
+        let params = GraphBuildParams::new(8, 100, 3, Verbosity::Quiet);
         let (_, hierarchy) = build_hierarchical_graph(n, &params, line_dist(&data));
 
         for node in 0..n {
@@ -568,7 +563,7 @@ mod tests {
     fn test_small_input_builds() {
         for n in [1usize, 2, 5, 101] {
             let data = line(n);
-            let params = GraphBuildParams::new(4, 20, 1, false);
+            let params = GraphBuildParams::new(4, 20, 1, Verbosity::Quiet);
             let (graph, _) = build_hierarchical_graph(n, &params, line_dist(&data));
             assert_eq!(graph.n(), n);
         }

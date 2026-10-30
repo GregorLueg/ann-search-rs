@@ -811,7 +811,7 @@ where
             metric,
             Some(k_means_params),
             seed,
-            false,
+            Verbosity::Quiet,
         )?;
 
         let centroid_norms: Vec<T> = (0..k)

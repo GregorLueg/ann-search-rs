@@ -15,6 +15,7 @@ pub mod parallelism;
 pub mod rp_forest;
 pub mod traits;
 pub mod tree_utils;
+pub mod verbosity;
 
 #[cfg(any(feature = "binary", feature = "serialise"))]
 pub mod staging;

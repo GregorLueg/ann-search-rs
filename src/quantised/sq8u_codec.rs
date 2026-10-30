@@ -215,6 +215,8 @@ where
 {
     type Query = Sq8uQuery<T>;
 
+    const INDEX_NAME: &'static str = "HNSW-SQ8U index";
+
     fn n(&self) -> usize {
         self.n
     }

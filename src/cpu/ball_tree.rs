@@ -6,11 +6,10 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 
-use thousands::*;
-
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::tree_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 /// Sequential Lloyd passes on a small node's two-way split (an in-place
@@ -379,6 +378,7 @@ where
     /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `seed` - Random seed for reproducibility
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -387,7 +387,9 @@ where
         data: impl AnnMatrix<T>,
         metric: Dist,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("BallTree index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -459,6 +461,8 @@ where
         } else {
             Vec::new()
         };
+
+        log.finish();
 
         Ok(BallTreeIndex {
             nodes,
@@ -1050,7 +1054,7 @@ where
     /// * `search_k` - The budget. How many nodes to maximally visit per given
     ///   query.
     /// * `return_dist` - Return the distances.
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -1060,14 +1064,9 @@ where
         k: usize,
         search_k: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("BallTree index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -1076,20 +1075,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, search_k)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         // Rows come out in storage order; put them back in original order.
         let mut ordered = vec![(Vec::new(), Vec::new()); self.n];
@@ -1174,13 +1165,14 @@ mod tests {
     #[test]
     fn test_ball_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42);
+        let _ = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet);
     }
 
     #[test]
     fn test_ball_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -1194,7 +1186,8 @@ mod tests {
     #[test]
     fn test_ball_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
@@ -1214,7 +1207,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
@@ -1229,7 +1222,8 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -1244,7 +1238,8 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -1258,7 +1253,8 @@ mod tests {
     #[test]
     fn test_ball_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
@@ -1271,8 +1267,10 @@ mod tests {
     fn test_ball_tree_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index1 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
+        let index2 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
@@ -1285,8 +1283,11 @@ mod tests {
     fn test_ball_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 123).unwrap();
+        let index1 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
+        let index2 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 123, Verbosity::Quiet)
+                .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1310,7 +1311,8 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, None).unwrap();
@@ -1324,7 +1326,7 @@ mod tests {
         use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
@@ -1342,7 +1344,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None).unwrap(); // 5% of 50 is 2.5 -> 2. Safe-ish.

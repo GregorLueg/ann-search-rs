@@ -36,6 +36,9 @@ use crate::quantised::hnsw_quantised::codec::GraphCodec;
 use crate::quantised::hnsw_quantised::index::HnswQuantisedIndex;
 use crate::utils::graph_utils::ThreadLocalSearchState;
 use crate::utils::k_means_utils::{assign_all_parallel, sample_vectors, train_centroids};
+use crate::utils::verbosity::BuildLog;
+use std::time::Instant;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -166,7 +169,7 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed, for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints the k-means stage at `Detailed`
     ///
     /// ### Returns
     ///
@@ -182,7 +185,7 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
@@ -196,9 +199,9 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1).min(n);
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "  Encoding {n} vectors at {} total bits over {nlist} centroids.",
+                " Encoding {n} vectors at {} total bits over {nlist} centroids.",
                 ex_bits + 1
             );
         }
@@ -208,6 +211,7 @@ where
         // Euclidean.
         let n_train = (TRAIN_PER_CENTROID * nlist).min(MAX_TRAIN).min(n).max(1);
         let (training_data, _) = sample_vectors(vectors_flat, dim, n, n_train, seed);
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -216,8 +220,16 @@ where
             &Dist::SquaredEuclidean,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let vector_norms: Vec<T> = vectors_flat
             .par_chunks(dim)
@@ -562,6 +574,8 @@ where
 {
     type Query = RaBitQCodecQuery<T>;
 
+    const INDEX_NAME: &'static str = "HNSW-RaBitQ index";
+
     fn n(&self) -> usize {
         self.n
     }
@@ -678,7 +692,8 @@ where
     /// * `nlist` - Centroid count, `None` picks `sqrt(n)`
     /// * `k_means_params` - Optional k-means settings
     /// * `seed` - Random seed, for reproducibility
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   encoding and the per-layer insertion
     ///
     /// ### Returns
     ///
@@ -693,8 +708,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("HNSW-RaBitQ index", verbosity);
         let (mut flat, n, dim) = data.into_row_major();
 
         // Cosine runs as squared Euclidean on unit vectors, which is the frame
@@ -718,17 +734,19 @@ where
             k_means_params,
             None,
             seed,
-            verbose,
+            verbosity,
         )?;
 
-        let params = GraphBuildParams::new(m, ef_construction, seed, verbose);
+        let params = GraphBuildParams::new(m, ef_construction, seed, verbosity);
         let (graph, hierarchy) = Self::build_topology(&codec, &params, |a, b| {
             T::euclidean_simd(&flat[a * dim..(a + 1) * dim], &flat[b * dim..(b + 1) * dim])
         });
 
         drop(flat);
 
-        Ok(Self::from_parts(codec, graph, hierarchy, &params))
+        let index = Self::from_parts(codec, graph, hierarchy, &params);
+        log.finish();
+        Ok(index)
     }
 
     /// Bytes held by the index.
@@ -798,7 +816,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap()
     }
@@ -958,7 +976,7 @@ mod tests {
                 None,
                 None,
                 42,
-                false
+                Verbosity::Quiet
             ),
             Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
         ));
@@ -977,7 +995,7 @@ mod tests {
                 None,
                 None,
                 42,
-                false
+                Verbosity::Quiet
             ),
             Err(AnnSearchErrors::RaBitQInvalidExBits { .. })
         ));
@@ -995,7 +1013,7 @@ mod tests {
             Some(1),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1025,7 +1043,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1062,7 +1080,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

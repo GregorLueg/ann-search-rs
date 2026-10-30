@@ -9,9 +9,6 @@ use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::iter::Sum;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::dist_binary::*;
@@ -21,6 +18,8 @@ use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 /// IVF index with RaBitQ quantisation
 ///
@@ -113,7 +112,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -124,9 +123,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
-        Self::build_with_rotator_kind(data, metric, nlist, k_means_params, None, seed, verbose)
+        Self::build_with_rotator_kind(data, metric, nlist, k_means_params, None, seed, verbosity)
     }
 
     /// Build IVF-RaBitQ index with an explicitly chosen rotation
@@ -142,7 +141,7 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -155,8 +154,9 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-RaBitQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -197,10 +197,6 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!("  Building IVF-RaBitQ index with {} cells.", nlist);
-        }
-
         let cluster_norms = if matches!(metric, Dist::Cosine) {
             vec![T::one(); n]
         } else {
@@ -212,6 +208,7 @@ where
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // train centroids
+        let start = Instant::now();
         let mut centroids_flat = train_centroids(
             &training_data,
             dim,
@@ -220,8 +217,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -274,6 +279,8 @@ where
             &encoder,
         )?;
 
+        log.finish();
+
         Ok(Self {
             encoder,
             storage,
@@ -296,7 +303,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
     ///
     /// ### Returns
@@ -309,7 +316,7 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
         Self::build_with_vector_store_and_rotator_kind(
@@ -319,7 +326,7 @@ where
             k_means_params,
             None,
             seed,
-            verbose,
+            verbosity,
             save_path,
         )
     }
@@ -337,7 +344,7 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
     ///
     /// ### Returns
@@ -351,9 +358,10 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-RaBitQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -390,10 +398,6 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!("  Building IVF-RaBitQ index with {} cells.", nlist);
-        }
-
         let cluster_norms = if matches!(metric, Dist::Cosine) {
             vec![T::one(); n]
         } else {
@@ -401,15 +405,13 @@ where
         };
 
         let (training_data, n_train) = if n > 500_000 {
-            if verbose {
-                println!("  Sampling 250k vectors for centroid training.");
-            }
             let (sampled, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
             (sampled, 250_000)
         } else {
             (vectors_flat.clone(), n)
         };
 
+        let start = Instant::now();
         let mut centroids_flat = train_centroids(
             &training_data,
             dim,
@@ -418,8 +420,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // Normalise centroids for Cosine
         if metric == Dist::Cosine {
@@ -476,6 +486,8 @@ where
 
         MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
         let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
+
+        log.finish();
 
         Ok(Self {
             encoder,
@@ -708,7 +720,7 @@ where
     /// * `nprobe` - Number of IVF cells to probe per query
     /// * `rerank_factor` - Reranking factor for exact distances
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -719,34 +731,26 @@ where
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()
             .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-RaBitQ index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let vec = vector_store.load_vector(i);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query_reranking(vec, k, nprobe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -830,7 +834,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -850,7 +854,7 @@ mod tests {
             Some(25),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -870,7 +874,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -890,7 +894,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -911,7 +915,7 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -930,7 +934,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -949,7 +953,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -969,7 +973,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -990,7 +994,7 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1010,7 +1014,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1039,7 +1043,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
@@ -1063,13 +1067,13 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
         )
         .unwrap();
 
         let (knn_indices, knn_distances) = index
-            .generate_knn(5, Some(5), Some(10), true, false)
+            .generate_knn(5, Some(5), Some(10), true, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(knn_indices.len(), 50);
@@ -1090,10 +1094,10 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
-        let result = index.generate_knn(5, Some(5), Some(10), false, false);
+        let result = index.generate_knn(5, Some(5), Some(10), false, Verbosity::Quiet);
         assert!(matches!(
             result,
             Err(AnnSearchErrors::VectorStoreNotAvailable)
@@ -1109,7 +1113,7 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
@@ -1129,7 +1133,7 @@ mod tests {
             None,
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

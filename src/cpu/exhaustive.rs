@@ -5,11 +5,10 @@ use crate::utils::gemm::gemm;
 use faer::{Accum, Mat, MatRef, Par, RowRef};
 
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 ////////////////////////
 // Constants & tuning //
@@ -63,28 +62,6 @@ pub(crate) const GEMM_RERANK_DEN: usize = 2;
 /////////////
 // Helpers //
 /////////////
-
-/// Report scan progress every 100,000 queries.
-///
-/// Takes the batch size so the block-at-a-time GEMM path reports on the same
-/// cadence as the one-at-a-time scan.
-///
-/// ### Params
-///
-/// * `counter` - Shared count of queries completed so far
-/// * `delta` - Number of queries this call completed
-/// * `total` - Total number of queries in the batch
-fn report_progress(counter: &AtomicUsize, delta: usize, total: usize) {
-    let before = counter.fetch_add(delta, Ordering::Relaxed);
-    let after = before + delta;
-    if before / 100_000 != after / 100_000 {
-        println!(
-            "  Processed {} / {} samples.",
-            after.separate_with_underscores(),
-            total.separate_with_underscores()
-        );
-    }
-}
 
 /// Scan every candidate once, retaining the `k` nearest in a bounded heap.
 ///
@@ -179,11 +156,13 @@ where
     ///
     /// * `data` - The data for which to generate the index. Samples x features
     /// * `metric` - Which distance metric the index shall be generated for.
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive index
-    pub fn new(data: impl AnnMatrix<T>, metric: Dist) -> Self {
+    pub fn new(data: impl AnnMatrix<T>, metric: Dist, verbosity: Verbosity) -> Self {
+        let log = BuildLog::new("Exhaustive index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
 
         let norms = if metric == Dist::Cosine {
@@ -197,6 +176,8 @@ where
         } else {
             Vec::new()
         };
+
+        log.finish();
 
         Self {
             vectors_flat,
@@ -310,14 +291,21 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
-        let results = self.query_batch(&self.vectors_flat, self.n, k, None, verbose)?;
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        let progress = QueryProgress::new("Exhaustive index", self.n, true, verbosity);
+        let results = self.query_batch_with(&self.vectors_flat, self.n, k, None, &progress)?;
+        progress.finish();
         Ok(pack_knn_results(results, return_dist))
     }
 
@@ -338,7 +326,7 @@ where
     ///   size relative to the thread count, see
     ///   [`GEMM_MIN_QUERIES_PER_THREAD`]. Both paths return exact distances,
     ///   so this is a performance knob only.
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -349,7 +337,34 @@ where
         nq: usize,
         k: usize,
         use_gemm: Option<bool>,
-        verbose: bool,
+        verbosity: Verbosity,
+    ) -> KnnBatchResult<T> {
+        let progress = QueryProgress::new("Exhaustive index", nq, false, verbosity);
+        let results = self.query_batch_with(queries, nq, k, use_gemm, &progress)?;
+        progress.finish();
+        Ok(results)
+    }
+
+    /// [`query_batch`](Self::query_batch) against a caller-owned progress
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Query vectors, flattened row-major (`nq * dim` elements)
+    /// * `nq` - Number of queries
+    /// * `k` - Number of neighbours to return
+    /// * `use_gemm` - Force the GEMM path on or off, `None` for the heuristic
+    /// * `progress` - Progress the queries are counted against
+    ///
+    /// ### Returns
+    ///
+    /// Per-query tuples of `(indices, distances)`
+    fn query_batch_with(
+        &self,
+        queries: &[T],
+        nq: usize,
+        k: usize,
+        use_gemm: Option<bool>,
+        progress: &QueryProgress,
     ) -> KnnBatchResult<T> {
         if nq == 0 {
             return Ok(Vec::new());
@@ -357,16 +372,13 @@ where
         self.check_dim(queries.len() / nq)?;
 
         if self.gemm_applies(nq, use_gemm) {
-            return self.query_batch_gemm(queries, nq, k.min(self.n), verbose);
+            return self.query_batch_gemm(queries, nq, k.min(self.n), progress);
         }
 
-        let counter = AtomicUsize::new(0);
         (0..nq)
             .into_par_iter()
             .map(|i| {
-                if verbose {
-                    report_progress(&counter, 1, nq);
-                }
+                progress.tick();
                 self.query(&queries[i * self.dim..(i + 1) * self.dim], k)
             })
             .collect()
@@ -412,7 +424,7 @@ where
     /// * `queries` - Query vectors, flattened row-major (`nq * dim` elements)
     /// * `nq` - Number of queries
     /// * `k` - Number of neighbours to return, already clamped to `n`
-    /// * `verbose` - Controls verbosity
+    /// * `progress` - Progress the queries are counted against
     ///
     /// ### Returns
     ///
@@ -422,7 +434,7 @@ where
         queries: &[T],
         nq: usize,
         k: usize,
-        verbose: bool,
+        progress: &QueryProgress,
     ) -> KnnBatchResult<T> {
         let dim = self.dim;
         let n = self.n;
@@ -460,8 +472,6 @@ where
                 }
             })
             .collect();
-
-        let counter = AtomicUsize::new(0);
 
         // The block loop carries all the parallelism, so a batch that would
         // fit in one block has to be split anyway or the whole search runs on
@@ -537,9 +547,7 @@ where
                     }
                 }
 
-                if verbose {
-                    report_progress(&counter, bq, nq);
-                }
+                progress.tick_n(bq);
 
                 heaps
                     .into_iter()
@@ -614,7 +622,7 @@ mod tests {
     #[test]
     fn test_exhaustive_index_creation_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -625,7 +633,7 @@ mod tests {
     #[test]
     fn test_exhaustive_index_creation_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -636,7 +644,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_finds_self_euclidean() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -650,7 +658,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_finds_self_cosine() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -663,7 +671,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_euclidean_multiple() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -681,7 +689,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_cosine_orthogonal() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 5).unwrap(); // Get all 5
@@ -702,7 +710,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_k_larger_than_dataset() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         // Ask for 10 neighbours but only 5 points exist
@@ -715,7 +723,7 @@ mod tests {
     #[test]
     fn test_exhaustive_query_row() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1).unwrap();
@@ -727,7 +735,7 @@ mod tests {
     #[test]
     fn test_exhaustive_euclidean_distances() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 5).unwrap();
@@ -751,7 +759,7 @@ mod tests {
     #[test]
     fn test_exhaustive_all_points_found() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query = vec![0.5, 0.5, 0.5];
         let (indices, _) = index.query(&query, 5).unwrap();
@@ -779,7 +787,7 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -797,7 +805,7 @@ mod tests {
             -2.0, 1.0, 0.0, // Vector 2 (actually orthogonal to 0)
         ];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         let query = vec![1.0, 2.0, 3.0];
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -818,7 +826,7 @@ mod tests {
     #[test]
     fn test_exhaustive_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         // Test that we can call VectorDistance methods
         let dist = index.euclidean_distance(0, 1);
@@ -831,7 +839,7 @@ mod tests {
     #[test]
     fn test_exhaustive_cosine_implements_vector_distance() {
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
 
         // Test that we can call VectorDistance methods
         let dist = index.cosine_distance(0, 1);
@@ -870,10 +878,10 @@ mod tests {
     /// are the exact ones, sorted, and no worse than the scan's.
     fn assert_paths_agree(index: &ExhaustiveIndex<f32>, queries: &[f32], nq: usize, k: usize) {
         let scan = index
-            .query_batch(queries, nq, k, Some(false), false)
+            .query_batch(queries, nq, k, Some(false), Verbosity::Quiet)
             .unwrap();
         let gemm = index
-            .query_batch(queries, nq, k, Some(true), false)
+            .query_batch(queries, nq, k, Some(true), Verbosity::Quiet)
             .unwrap();
 
         let mut matched = 0usize;
@@ -899,7 +907,7 @@ mod tests {
     #[test]
     fn test_gemm_and_scan_agree_euclidean() {
         let mat = clustered_matrix(400, 24);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         assert_paths_agree(&index, &queries, nq, 10);
@@ -908,7 +916,7 @@ mod tests {
     #[test]
     fn test_gemm_and_scan_agree_cosine() {
         let mat = clustered_matrix(400, 24);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Cosine, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         assert_paths_agree(&index, &queries, nq, 10);
@@ -919,11 +927,11 @@ mod tests {
         // The expansion cancels hardest on coincident vectors; the re-rank is
         // what keeps the reported distance exact rather than merely clamped.
         let mat = clustered_matrix(300, 16);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         let gemm = index
-            .query_batch(&queries, nq, 3, Some(true), false)
+            .query_batch(&queries, nq, 3, Some(true), Verbosity::Quiet)
             .unwrap();
         for (i, (ids, dists)) in gemm.iter().enumerate() {
             assert_eq!(ids[0], i);
@@ -938,11 +946,11 @@ mod tests {
         // The re-rank is what guarantees that whatever comes back carries its
         // exact distance, in the right order. That is the contract.
         let mat = cancellation_matrix(300, 16);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, dim) = mat.as_ref().into_row_major();
 
         let gemm = index
-            .query_batch(&queries, nq, 8, Some(true), false)
+            .query_batch(&queries, nq, 8, Some(true), Verbosity::Quiet)
             .unwrap();
 
         for (i, (ids, dists)) in gemm.iter().enumerate() {
@@ -962,14 +970,14 @@ mod tests {
         let mat = Mat::from_fn(300, 12, |i, j| {
             ((i / 3) as f32 + 1.0) * (j as f32 + 1.0) * 0.5
         });
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         let scan = index
-            .query_batch(&queries, nq, 3, Some(false), false)
+            .query_batch(&queries, nq, 3, Some(false), Verbosity::Quiet)
             .unwrap();
         let gemm = index
-            .query_batch(&queries, nq, 3, Some(true), false)
+            .query_batch(&queries, nq, 3, Some(true), Verbosity::Quiet)
             .unwrap();
 
         for (i, (ids, dists)) in gemm.iter().enumerate() {
@@ -983,7 +991,7 @@ mod tests {
     #[test]
     fn test_gemm_path_refused_for_manhattan() {
         let mat = clustered_matrix(300, 16);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Manhattan);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::Manhattan, Verbosity::Quiet);
 
         // Even when explicitly asked for, since the expansion has no analogue.
         assert!(!index.gemm_applies(1_000, Some(true)));
@@ -998,7 +1006,7 @@ mod tests {
     #[test]
     fn test_gemm_dispatch_follows_batch_size() {
         let mat = clustered_matrix(300, 16);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         assert!(!index.gemm_applies(gemm_floor() - 1, None));
         assert!(index.gemm_applies(gemm_floor(), None));
@@ -1009,11 +1017,11 @@ mod tests {
     #[test]
     fn test_gemm_handles_k_larger_than_dataset() {
         let mat = clustered_matrix(200, 8);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         let gemm = index
-            .query_batch(&queries, nq, 500, Some(true), false)
+            .query_batch(&queries, nq, 500, Some(true), Verbosity::Quiet)
             .unwrap();
         assert!(gemm.iter().all(|(ids, _)| ids.len() == 200));
     }
@@ -1023,11 +1031,11 @@ mod tests {
         // A batch that is not a multiple of the query tile still returns one
         // result per query, in order.
         let mat = clustered_matrix(257, 12);
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (queries, nq, _) = mat.as_ref().into_row_major();
 
         let gemm = index
-            .query_batch(&queries, nq, 5, Some(true), false)
+            .query_batch(&queries, nq, 5, Some(true), Verbosity::Quiet)
             .unwrap();
         assert_eq!(gemm.len(), 257);
         for (i, (ids, _)) in gemm.iter().enumerate() {
@@ -1039,7 +1047,7 @@ mod tests {
     fn test_exhaustive_query_consistency() {
         // Test that query and query_row give same results
         let mat = create_simple_matrix();
-        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean);
+        let index = ExhaustiveIndex::new(mat.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
 
         let query_vec = vec![1.0, 0.0, 0.0];
         let (indices1, distances1) = index.query(&query_vec, 3).unwrap();

@@ -15,6 +15,7 @@ use crate::mlx::nndescent_mlx::*;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::unpack_knn_graph;
 use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
+use crate::utils::verbosity::BuildLog;
 use crate::utils::DimensionValidation;
 
 /// Default final degree, as on the wgpu path.
@@ -86,7 +87,8 @@ impl NNDescentIndexMlx {
     /// * `rho` - Sampling rate for the local join (default 1.0, no sampling)
     /// * `refine_knn` - Two-hop sweeps after the main loop (default 0)
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   forest, the iterations and the CAGRA prune
     ///
     /// ### Returns
     ///
@@ -103,11 +105,12 @@ impl NNDescentIndexMlx {
         rho: Option<f32>,
         refine_knn: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
+        let log = BuildLog::new("NNDescent-MLX index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
         let k = k.unwrap_or(DEFAULT_K);
         let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
@@ -122,16 +125,15 @@ impl NNDescentIndexMlx {
             Vec::new()
         };
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "NNDescent-MLX: {} vectors, dim={}, k={}, build_k={}",
+                " {} vectors, dim {}, k = {}, build_k = {}",
                 n.separate_with_underscores(),
                 dim,
                 k,
                 build_k,
             );
         }
-        let start = Instant::now();
 
         let cfg = NnDescentCfgMlx {
             build_k,
@@ -143,7 +145,7 @@ impl NNDescentIndexMlx {
             seed,
             use_cosine,
         };
-        let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbose)?;
+        let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbosity)?;
         let knn_graph = compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k);
         let NndOutputMlx {
             graph_idx,
@@ -157,8 +159,8 @@ impl NNDescentIndexMlx {
         let (nav_graph, medoid) =
             cagra_optimise_mlx(&graph_idx, &vectors_flat, n, dim, build_k, k, metric)?;
         drop(graph_idx);
-        if verbose {
-            println!("  CAGRA optimisation: {:.2?}", cagra_start.elapsed());
+        if verbosity.detailed_verbosity() {
+            println!(" CAGRA prune in {:.2?}", cagra_start.elapsed());
         }
 
         let mut searcher = CagraSearchMlx::with_vectors(
@@ -172,9 +174,7 @@ impl NNDescentIndexMlx {
             medoid,
         )?;
         searcher.attach_router(&router)?;
-        if verbose {
-            println!("  Total build time: {:.2?}", start.elapsed());
-        }
+        log.finish();
 
         Ok(Self {
             vectors_flat,
@@ -398,14 +398,14 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
-        let cpu = ExhaustiveIndex::new(data.as_ref(), metric);
+        let cpu = ExhaustiveIndex::new(data.as_ref(), metric, Verbosity::Quiet);
         let (q_flat, nq, _) = queries.as_ref().into_row_major();
 
         let truth: Vec<Vec<usize>> = cpu
-            .query_batch(&q_flat, nq, k, None, false)
+            .query_batch(&q_flat, nq, k, None, Verbosity::Quiet)
             .unwrap()
             .into_iter()
             .map(|(i, _)| i)
@@ -416,7 +416,7 @@ mod tests {
         }
         let r_ext = recall(&truth, &idx);
 
-        let (self_truth, _) = cpu.generate_knn(k, false, false).unwrap();
+        let (self_truth, _) = cpu.generate_knn(k, false, Verbosity::Quiet).unwrap();
         let (self_idx, _) = index.self_query(k, None, 42).unwrap();
         let r_self = recall(&self_truth, &self_idx);
         println!("MLX {metric:?}: query recall {r_ext:.4}, self recall {r_self:.4}");
@@ -452,7 +452,7 @@ mod tests {
                 None,
                 None,
                 42,
-                false,
+                Verbosity::Quiet,
             )
         };
         assert!(build(Dist::Manhattan).is_err());
@@ -480,21 +480,21 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
             true,
             WgpuDevice::default().clone().into(),
         )
         .unwrap();
-        let cpu = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean);
+        let cpu = ExhaustiveIndex::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet);
         let (q_flat, nq, _) = queries.as_ref().into_row_major();
         let truth: Vec<Vec<usize>> = cpu
-            .query_batch(&q_flat, nq, k, None, false)
+            .query_batch(&q_flat, nq, k, None, Verbosity::Quiet)
             .unwrap()
             .into_iter()
             .map(|(i, _)| i)
             .collect();
         let (g_idx, _) = gpu.query_batch_gpu(&q_flat, nq, None, k, 42).unwrap();
-        let (self_truth, _) = cpu.generate_knn(k, false, false).unwrap();
+        let (self_truth, _) = cpu.generate_knn(k, false, Verbosity::Quiet).unwrap();
         let (g_self, _) = gpu.self_query_gpu(k, None, 42).unwrap();
         let (g_ext, g_slf) = (recall(&truth, &g_idx), recall(&self_truth, &g_self));
         println!("wgpu: query recall {g_ext:.4}, self recall {g_slf:.4}");

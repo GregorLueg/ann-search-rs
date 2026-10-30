@@ -27,6 +27,17 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 - Manhattan NN-Descent seeds by Kd-tree leaf join as well, instead of one
   forest query per point. Recall@15 at 200k x 32 goes from 0.960 to 0.970.
 
+- One verbosity grammar across every index, k-means and kNN-graph builder:
+  `Verbosity { Quiet, Normal, Detailed }`. `Normal` prints `Building <name>
+  ...` / `... built <name> in 1.23s`, `Querying <name> ...`, a progress line
+  every 100_000 samples and `... queried <name> in`. `Detailed` adds timed
+  build stages (forest, k-means, assignment, quantiser training, NSG steps,
+  CAGRA prune) and per-iteration lines. A sub-component run by a parent (the
+  k-means inside IVF, the NN-Descent inside NSG) stays quiet and the parent
+  prints one timed line for it. Warnings still print at `Quiet`.
+- `parse_annsearch_verbosity(usize)` maps `0`/`1`/`2` to the enum for callers
+  that carry verbosity as an integer.
+
 **Memory**
 
 - Annoy and Kd forests build in place: one `u32` permutation per tree,
@@ -50,6 +61,18 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Breaking changes**
 
+- Every `verbose: bool` parameter is now `verbosity: Verbosity`, including
+  `train_centroids`, `k_means_clusters_gpu`, `k_means_clusters_mlx` and
+  `GraphBuildParams::verbosity` (was `verbose`). Builders and self-queries that
+  took no flag before take one now: `build_annoy_index`, `build_balltree_index`,
+  `build_exhaustive_index` and its BF16, SQ8, binary, RaBitQ, TurboQuant, GPU
+  and MLX variants, `build_kd_tree_index`, `build_lsh_index`,
+  `build_vamana_index`, `build_qg_index`, `build_qg_index_with_rotator`,
+  `query_nndescent_index_gpu_self`, `query_nndescent_index_mlx_self`,
+  `query_cagra_index_mlx` and `query_cagra_index_mlx_self`. The matching
+  struct constructors follow.
+- The LSH "more than 1% of samples not in the buckets" warning prints at every
+  verbosity, as the cross-query path already did.
 - Datasets with more than `u32::MAX - 1` samples (`2^31 - 2` for NN-Descent and
   RNN-Descent) are refused with the new `AnnSearchErrors::TooManySamples`.
 - `build_hnsw_index`, `build_kd_tree_index` and `build_vamana_index` return a

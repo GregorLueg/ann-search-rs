@@ -83,36 +83,53 @@ fn assert_non_negative(label: &str, distances: &Option<Vec<Vec<f32>>>) {
 #[test]
 fn hnsw_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_hnsw_index((&data[..], n, dim), 16, 100, "cosine", 42, false).unwrap();
+    let index =
+        build_hnsw_index((&data[..], n, dim), 16, 100, "cosine", 42, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_hnsw_self(&index, K, 50, true, false).unwrap();
+    let (_, self_d) = query_hnsw_self(&index, K, 50, true, Verbosity::Quiet).unwrap();
     assert_non_negative("hnsw self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) = query_hnsw_index((queries, 50, dim), &index, K, 50, true, false).unwrap();
+    let (_, cross_d) =
+        query_hnsw_index((queries, 50, dim), &index, K, 50, true, Verbosity::Quiet).unwrap();
     assert_non_negative("hnsw cross", &cross_d);
 }
 
 #[test]
 fn ivf_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_ivf_index((&data[..], n, dim), Some(16), None, "cosine", 42, false).unwrap();
+    let index = build_ivf_index(
+        (&data[..], n, dim),
+        Some(16),
+        None,
+        "cosine",
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_ivf_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_ivf_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_ivf_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf cross", &cross_d);
 }
 
 #[test]
 fn exhaustive_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_exhaustive_index((&data[..], n, dim), "cosine");
+    let index = build_exhaustive_index((&data[..], n, dim), "cosine", Verbosity::Quiet);
 
-    let (_, self_d) = query_exhaustive_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive self", &self_d);
 }
 
@@ -121,8 +138,8 @@ fn exhaustive_cosine_is_non_negative() {
 #[test]
 fn euclidean_distances_are_unchanged() {
     let (data, n, dim) = blobs();
-    let index = build_exhaustive_index((&data[..], n, dim), "euclidean");
-    let (idx, dist) = query_exhaustive_self(&index, K, true, false).unwrap();
+    let index = build_exhaustive_index((&data[..], n, dim), "euclidean", Verbosity::Quiet);
+    let (idx, dist) = query_exhaustive_self(&index, K, true, Verbosity::Quiet).unwrap();
     let dist = dist.expect("distances requested");
 
     // Row i starts with i at distance zero, and the rest ascend.
@@ -145,69 +162,96 @@ fn kmknn_cosine_is_non_negative() {
     // Never actually negative (kmknn L2-normalises at build time in Cosine
     // mode), kept here as a regression guard alongside the other 12.
     let (data, n, dim) = blobs();
-    let index =
-        build_kmknn_index((&data[..], n, dim), "cosine", Some(16), None, 42, false).unwrap();
+    let index = build_kmknn_index(
+        (&data[..], n, dim),
+        "cosine",
+        Some(16),
+        None,
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_kmknn_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_kmknn_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("kmknn self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) = query_kmknn_index((queries, 50, dim), &index, K, true, false).unwrap();
+    let (_, cross_d) =
+        query_kmknn_index((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("kmknn cross", &cross_d);
 }
 
 #[test]
 fn annoy_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_annoy_index((&data[..], n, dim), "cosine", 8, 42).unwrap();
+    let index = build_annoy_index((&data[..], n, dim), "cosine", 8, 42, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_annoy_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_annoy_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("annoy self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) = query_annoy_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+    let (_, cross_d) =
+        query_annoy_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("annoy cross", &cross_d);
 }
 
 #[test]
 fn balltree_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_balltree_index((&data[..], n, dim), "cosine", 42).unwrap();
+    let index = build_balltree_index((&data[..], n, dim), "cosine", 42, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_balltree_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_balltree_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("balltree self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_balltree_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+        query_balltree_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("balltree cross", &cross_d);
 }
 
 #[test]
 fn kd_tree_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_kd_tree_index((&data[..], n, dim), "cosine", 4, 42).unwrap();
+    let index =
+        build_kd_tree_index((&data[..], n, dim), "cosine", 4, 42, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_kd_tree_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_kd_tree_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("kd_tree self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_kd_tree_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+        query_kd_tree_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("kd_tree cross", &cross_d);
 }
 
 #[test]
 fn lsh_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_lsh_index((&data[..], n, dim), "cosine", 4, 8, None, 42).unwrap();
+    let index = build_lsh_index(
+        (&data[..], n, dim),
+        "cosine",
+        4,
+        8,
+        None,
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_lsh_self(&index, K, None, None, true, false).unwrap();
+    let (_, self_d) = query_lsh_self(&index, K, None, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("lsh self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_lsh_index((queries, 50, dim), &index, K, 4, None, true, false).unwrap();
+    let (_, cross_d) = query_lsh_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        4,
+        None,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("lsh cross", &cross_d);
 }
 
@@ -224,16 +268,16 @@ fn nndescent_cosine_is_non_negative() {
         None,
         None,
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_nndescent_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_nndescent_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("nndescent self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_nndescent_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+        query_nndescent_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("nndescent cross", &cross_d);
 
     // The raw-graph extraction path (`unpack_knn_graph`) is a separate
@@ -245,29 +289,58 @@ fn nndescent_cosine_is_non_negative() {
 #[test]
 fn nsg_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_nsg_index((&data[..], n, dim), 16, 40, 100, 20, "cosine", 42, false).unwrap();
+    let index = build_nsg_index(
+        (&data[..], n, dim),
+        16,
+        40,
+        100,
+        20,
+        "cosine",
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_nsg_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_nsg_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("nsg self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) = query_nsg_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+    let (_, cross_d) =
+        query_nsg_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("nsg cross", &cross_d);
 }
 
 #[test]
 fn rnn_descent_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index =
-        build_rnn_descent_index((&data[..], n, dim), 20, 32, 3, 8, "cosine", None, 42, false)
-            .unwrap();
+    let index = build_rnn_descent_index(
+        (&data[..], n, dim),
+        20,
+        32,
+        3,
+        8,
+        "cosine",
+        None,
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_rnn_descent_self(&index, K, None, None, true, false).unwrap();
+    let (_, self_d) =
+        query_rnn_descent_self(&index, K, None, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("rnn_descent self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_rnn_descent_index((queries, 50, dim), &index, K, None, None, true, false).unwrap();
+    let (_, cross_d) = query_rnn_descent_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        None,
+        None,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("rnn_descent cross", &cross_d);
 }
 
@@ -281,31 +354,48 @@ fn soar_cosine_is_non_negative() {
         None,
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_soar_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_soar_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("soar self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_soar_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_soar_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("soar cross", &cross_d);
 }
 
 #[test]
 fn vamana_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index =
-        build_vamana_index((&data[..], n, dim), 16, 60, None, 1.0, 1.2, "cosine", 42).unwrap();
+    let index = build_vamana_index(
+        (&data[..], n, dim),
+        16,
+        60,
+        None,
+        1.0,
+        1.2,
+        "cosine",
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_vamana_self(&index, K, None, true, false).unwrap();
+    let (_, self_d) = query_vamana_self(&index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("vamana self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_vamana_index((queries, 50, dim), &index, K, None, true, false).unwrap();
+        query_vamana_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("vamana cross", &cross_d);
 }
 
@@ -317,14 +407,15 @@ fn vamana_cosine_is_non_negative() {
 #[test]
 fn exhaustive_bf16_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_exhaustive_bf16_index((&data[..], n, dim), "cosine", false).unwrap();
+    let index =
+        build_exhaustive_bf16_index((&data[..], n, dim), "cosine", Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_exhaustive_bf16_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_bf16_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_bf16 self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_exhaustive_bf16_index((queries, 50, dim), &index, K, true, false).unwrap();
+        query_exhaustive_bf16_index((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_bf16 cross", &cross_d);
 }
 
@@ -332,14 +423,15 @@ fn exhaustive_bf16_cosine_is_non_negative() {
 #[test]
 fn exhaustive_sq8_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index = build_exhaustive_sq8_index((&data[..], n, dim), "cosine", None, false).unwrap();
+    let index =
+        build_exhaustive_sq8_index((&data[..], n, dim), "cosine", None, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_exhaustive_sq8_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_sq8_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_sq8 self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_exhaustive_sq8_index((queries, 50, dim), &index, K, true, false).unwrap();
+        query_exhaustive_sq8_index((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_sq8 cross", &cross_d);
 }
 
@@ -354,16 +446,16 @@ fn exhaustive_pq_cosine_is_non_negative() {
         Some(4),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_exhaustive_pq_index_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_pq_index_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_pq self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_exhaustive_pq_index((queries, 50, dim), &index, K, true, false).unwrap();
+        query_exhaustive_pq_index((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_pq cross", &cross_d);
 }
 
@@ -378,16 +470,16 @@ fn exhaustive_opq_cosine_is_non_negative() {
         Some(4),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_exhaustive_opq_index_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_opq_index_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_opq self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_exhaustive_opq_index((queries, 50, dim), &index, K, true, false).unwrap();
+        query_exhaustive_opq_index((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_opq cross", &cross_d);
 }
 
@@ -395,15 +487,29 @@ fn exhaustive_opq_cosine_is_non_negative() {
 #[test]
 fn ivf_bf16_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index =
-        build_ivf_bf16_index((&data[..], n, dim), Some(16), None, "cosine", 42, false).unwrap();
+    let index = build_ivf_bf16_index(
+        (&data[..], n, dim),
+        Some(16),
+        None,
+        "cosine",
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_ivf_bf16_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_ivf_bf16_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_bf16 self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_bf16_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_ivf_bf16_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf_bf16 cross", &cross_d);
 }
 
@@ -418,16 +524,23 @@ fn ivf_sq8_cosine_is_non_negative() {
         "cosine",
         42,
         None,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_ivf_sq8_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_ivf_sq8_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_sq8 self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_sq8_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_ivf_sq8_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf_sq8 cross", &cross_d);
 }
 
@@ -443,16 +556,23 @@ fn ivf_pq_cosine_is_non_negative() {
         Some(4),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_ivf_pq_index_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_ivf_pq_index_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_pq self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_pq_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_ivf_pq_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf_pq cross", &cross_d);
 }
 
@@ -469,16 +589,23 @@ fn ivf_opq_cosine_is_non_negative() {
         Some(1),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_ivf_opq_index_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_ivf_opq_index_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_opq self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_opq_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_ivf_opq_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf_opq cross", &cross_d);
 }
 
@@ -495,16 +622,23 @@ fn soar_pq_cosine_is_non_negative() {
         Some(4),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_soar_pq_index_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) = query_soar_pq_index_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("soar_pq self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_soar_pq_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_soar_pq_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("soar_pq cross", &cross_d);
 }
 
@@ -522,16 +656,24 @@ fn soar_opq_cosine_is_non_negative() {
         Some(1),
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_soar_opq_index_self(&index, K, Some(8), true, false).unwrap();
+    let (_, self_d) =
+        query_soar_opq_index_self(&index, K, Some(8), true, Verbosity::Quiet).unwrap();
     assert_non_negative("soar_opq self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_soar_opq_index((queries, 50, dim), &index, K, Some(8), true, false).unwrap();
+    let (_, cross_d) = query_soar_opq_index(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("soar_opq cross", &cross_d);
 }
 
@@ -539,15 +681,23 @@ fn soar_opq_cosine_is_non_negative() {
 #[test]
 fn hnsw_quantised_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
-    let index =
-        build_hnsw_sq8u_index((&data[..], n, dim), 16, 100, "cosine", 42, None, false).unwrap();
+    let index = build_hnsw_sq8u_index(
+        (&data[..], n, dim),
+        16,
+        100,
+        "cosine",
+        42,
+        None,
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_hnsw_sq8u_self(&index, K, 64, true, false).unwrap();
+    let (_, self_d) = query_hnsw_sq8u_self(&index, K, 64, true, Verbosity::Quiet).unwrap();
     assert_non_negative("hnsw_quantised self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_hnsw_sq8u_index((queries, 50, dim), &index, K, 64, true, false).unwrap();
+        query_hnsw_sq8u_index((queries, 50, dim), &index, K, 64, true, Verbosity::Quiet).unwrap();
     assert_non_negative("hnsw_quantised cross", &cross_d);
 }
 
@@ -573,16 +723,25 @@ fn exhaustive_binary_cosine_is_non_negative() {
         "cosine",
         true,
         Some(temp_dir.path()),
+        Verbosity::Quiet,
     )
     .unwrap();
 
-    let (_, self_d) = query_exhaustive_index_binary_self(&index, K, Some(10), true, false).unwrap();
+    let (_, self_d) =
+        query_exhaustive_index_binary_self(&index, K, Some(10), true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_binary self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_exhaustive_index_binary((queries, 50, dim), &index, K, true, Some(10), true, false)
-            .unwrap();
+    let (_, cross_d) = query_exhaustive_index_binary(
+        (queries, 50, dim),
+        &index,
+        K,
+        true,
+        Some(10),
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("exhaustive_binary cross", &cross_d);
 }
 
@@ -601,12 +760,12 @@ fn ivf_binary_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
     let (_, self_d) =
-        query_ivf_index_binary_self(&index, K, Some(8), Some(10), true, false).unwrap();
+        query_ivf_index_binary_self(&index, K, Some(8), Some(10), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_binary self", &self_d);
 
     let queries = &data[..50 * dim];
@@ -618,7 +777,7 @@ fn ivf_binary_cosine_is_non_negative() {
         true,
         Some(10),
         true,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     assert_non_negative("ivf_binary cross", &cross_d);
@@ -636,11 +795,13 @@ fn exhaustive_rabitq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        Verbosity::Quiet,
     )
     .unwrap();
 
     let (_, self_d) =
-        query_exhaustive_index_rabitq_self(&index, K, None, Some(10), true, false).unwrap();
+        query_exhaustive_index_rabitq_self(&index, K, None, Some(10), true, Verbosity::Quiet)
+            .unwrap();
     assert_non_negative("exhaustive_rabitq self", &self_d);
 
     let queries = &data[..50 * dim];
@@ -652,7 +813,7 @@ fn exhaustive_rabitq_cosine_is_non_negative() {
         true,
         Some(10),
         true,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     assert_non_negative("exhaustive_rabitq cross", &cross_d);
@@ -671,12 +832,12 @@ fn ivf_rabitq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
     let (_, self_d) =
-        query_ivf_index_rabitq_self(&index, K, Some(8), Some(10), true, false).unwrap();
+        query_ivf_index_rabitq_self(&index, K, Some(8), Some(10), true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_rabitq self", &self_d);
 
     let queries = &data[..50 * dim];
@@ -688,7 +849,7 @@ fn ivf_rabitq_cosine_is_non_negative() {
         true,
         Some(10),
         true,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     assert_non_negative("ivf_rabitq cross", &cross_d);
@@ -706,11 +867,13 @@ fn exhaustive_tq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        Verbosity::Quiet,
     )
     .unwrap();
 
     let (_, self_d) =
-        query_exhaustive_index_turboquant_self(&index, K, Some(10), true, false).unwrap();
+        query_exhaustive_index_turboquant_self(&index, K, Some(10), true, Verbosity::Quiet)
+            .unwrap();
     assert_non_negative("exhaustive_tq self", &self_d);
 
     let queries = &data[..50 * dim];
@@ -721,7 +884,7 @@ fn exhaustive_tq_cosine_is_non_negative() {
         true,
         Some(10),
         true,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     assert_non_negative("exhaustive_tq cross", &cross_d);
@@ -741,12 +904,13 @@ fn ivf_tq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
 
     let (_, self_d) =
-        query_ivf_index_turboquant_self(&index, K, Some(8), Some(10), true, false).unwrap();
+        query_ivf_index_turboquant_self(&index, K, Some(8), Some(10), true, Verbosity::Quiet)
+            .unwrap();
     assert_non_negative("ivf_tq self", &self_d);
 
     let queries = &data[..50 * dim];
@@ -758,7 +922,7 @@ fn ivf_tq_cosine_is_non_negative() {
         true,
         Some(10),
         true,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     assert_non_negative("ivf_tq cross", &cross_d);
@@ -786,16 +950,20 @@ fn exhaustive_gpu_cosine_is_non_negative() {
     }
 
     let (data, n, dim) = blobs();
-    let index =
-        build_exhaustive_index_gpu::<f32>((&data[..], n, dim), "cosine", device.clone().into())
-            .unwrap();
+    let index = build_exhaustive_index_gpu::<f32>(
+        (&data[..], n, dim),
+        "cosine",
+        device.clone().into(),
+        Verbosity::Quiet,
+    )
+    .unwrap();
 
-    let (_, self_d) = query_exhaustive_index_gpu_self(&index, K, true, false).unwrap();
+    let (_, self_d) = query_exhaustive_index_gpu_self(&index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_gpu self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_exhaustive_index_gpu((queries, 50, dim), &index, K, true, false).unwrap();
+        query_exhaustive_index_gpu((queries, 50, dim), &index, K, true, Verbosity::Quiet).unwrap();
     assert_non_negative("exhaustive_gpu cross", &cross_d);
 }
 
@@ -818,16 +986,25 @@ fn ivf_gpu_cosine_is_non_negative() {
         None,
         "cosine",
         42,
-        false,
+        Verbosity::Quiet,
         device.clone().into(),
     )
     .unwrap();
 
-    let (_, self_d) = query_ivf_index_gpu_self(&index, K, Some(8), None, true, false).unwrap();
+    let (_, self_d) =
+        query_ivf_index_gpu_self(&index, K, Some(8), None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("ivf_gpu self", &self_d);
 
     let queries = &data[..50 * dim];
-    let (_, cross_d) =
-        query_ivf_index_gpu((queries, 50, dim), &index, K, Some(8), None, true, false).unwrap();
+    let (_, cross_d) = query_ivf_index_gpu(
+        (queries, 50, dim),
+        &index,
+        K,
+        Some(8),
+        None,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     assert_non_negative("ivf_gpu cross", &cross_d);
 }
