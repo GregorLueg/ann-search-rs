@@ -38,11 +38,14 @@
 //!
 //! ### What is not from the paper
 //!
-//! The graph. SymphonyQG builds its own with random init, repeated
-//! search-prune-reverse rounds and a cosine-threshold refill whose purpose is
-//! to force exact-degree regularity. [`VamanaIndex`] already produces a
-//! fixed-degree graph, so it builds the topology here and the contribution kept
-//! is the storage layout and the estimator.
+//! The graph. SymphonyQG builds its own with random init and repeated
+//! search-prune-reverse rounds. [`VamanaIndex`] builds the topology here, and
+//! the contribution kept is the storage layout and the estimator. What is kept
+//! from its build is the refill: Vamana's prune leaves vertices well short of
+//! the degree bound, and a hop sweeps a whole batch of lanes whatever they
+//! hold, so the empty lanes of a scanned batch are filled with the nearest
+//! 2-hop neighbours (SymphonyQG relaxes an angle threshold instead). Batches
+//! that hold no edge at all stay empty and are skipped by the walk.
 //!
 //! ### References
 //!
@@ -264,6 +267,64 @@ where
     (v_dist, dot_correction_inv)
 }
 
+/// Fill every vertex's empty slots with its nearest unlinked 2-hop neighbours.
+///
+/// Vamana's prune leaves most vertices well short of the degree bound, but a
+/// hop sweeps all [`QG_BATCH`] lanes of a batch whatever they hold, so an
+/// empty lane in a batch that is already scanned is an edge thrown away. Each
+/// vertex keeps its pruned edges and tops up from its neighbours' neighbours,
+/// nearest first. A batch that was entirely empty stays empty, so the walk
+/// still skips it.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vectors, `n * dim`
+/// * `dim` - Dimensionality
+/// * `edges` - Adjacency, `n * degree`, packed at the front
+/// * `degree` - Slots per vertex
+///
+/// ### Returns
+///
+/// The completed adjacency, same layout
+fn complete_degree<T>(vectors: &[T], dim: usize, edges: &[u32], degree: usize) -> Vec<u32>
+where
+    T: AnnSearchFloat,
+{
+    let mut out = edges.to_vec();
+    out.par_chunks_mut(degree)
+        .enumerate()
+        .for_each(|(node, slots)| {
+            let filled = slots.iter().take_while(|&&nb| nb != SENTINEL).count();
+            let target = filled.div_ceil(QG_BATCH) * QG_BATCH;
+            if filled == 0 || filled == target {
+                return;
+            }
+
+            let x = &vectors[node * dim..(node + 1) * dim];
+            let mut pool: Vec<(OrderedFloat<T>, u32)> = slots[..filled]
+                .iter()
+                .flat_map(|&nb| {
+                    let nb = nb as usize;
+                    edges[nb * degree..(nb + 1) * degree]
+                        .iter()
+                        .take_while(|&&c| c != SENTINEL)
+                })
+                .filter(|&&c| c as usize != node && !slots[..filled].contains(&c))
+                .map(|&c| {
+                    let c_vec = &vectors[c as usize * dim..(c as usize + 1) * dim];
+                    (OrderedFloat(T::euclidean_simd(x, c_vec)), c)
+                })
+                .collect();
+            pool.sort_unstable();
+            pool.dedup_by_key(|e| e.1);
+
+            for (slot, (_, c)) in slots[filled..target].iter_mut().zip(pool) {
+                *slot = c;
+            }
+        });
+    out
+}
+
 impl<T> QgIndex<T>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -358,7 +419,7 @@ where
                 start.elapsed()
             );
         }
-        let edges = graph_index.graph;
+        let edges = complete_degree(&vectors_flat, dim, &graph_index.graph, degree);
         let entry_point = graph_index.medoid;
 
         let encoder = match rotator_kind {
@@ -578,6 +639,12 @@ where
                 let factors = &self.factors[node * self.degree * 2..(node + 1) * self.degree * 2];
 
                 for b in 0..self.n_batches {
+                    // Edges are packed at the front, so an empty first slot
+                    // means this batch and every later one hold nothing worth
+                    // a sweep.
+                    if slots[b * QG_BATCH] == SENTINEL {
+                        break;
+                    }
                     score_sign_block(&lut, &self.codes, node * self.n_batches + b, &mut lanes);
 
                     let add = &factors[b * 2 * QG_BATCH..b * 2 * QG_BATCH + QG_BATCH];
@@ -1152,5 +1219,55 @@ mod tests {
 
         assert_eq!(index.blocked_arch, BLOCKED_ARCH);
         assert_eq!(index.query(&query, 10, 128).unwrap(), before);
+    }
+
+    #[test]
+    fn test_complete_degree_fills_scanned_batches_only() {
+        let (n, dim, degree) = (300usize, 16usize, 64usize);
+        let data = clustered(n, dim, 3, 5);
+        let vectors: Vec<f32> = (0..n)
+            .flat_map(|i| (0..dim).map(move |j| (i, j)))
+            .map(|(i, j)| data[(i, j)])
+            .collect();
+
+        // Each vertex links to a handful of others, far short of a batch,
+        // except vertex 0, which already fills its first batch exactly.
+        let mut edges = vec![SENTINEL; n * degree];
+        for i in 0..n {
+            for s in 0..3 + i % 4 {
+                edges[i * degree + s] = ((i + 1 + s * 7) % n) as u32;
+            }
+        }
+        for s in 0..QG_BATCH {
+            edges[s] = (s + 1) as u32;
+        }
+
+        let filled = complete_degree(&vectors, dim, &edges, degree);
+
+        for i in 0..n {
+            let before = &edges[i * degree..(i + 1) * degree];
+            let after = &filled[i * degree..(i + 1) * degree];
+            let kept = before.iter().take_while(|&&e| e != SENTINEL).count();
+
+            // Original edges keep their slots, and nothing spills into a
+            // batch that held no edge.
+            assert_eq!(&after[..kept], &before[..kept]);
+            assert!(
+                after[QG_BATCH..].iter().all(|&e| e == SENTINEL),
+                "vertex {i}"
+            );
+
+            let live: Vec<u32> = after
+                .iter()
+                .copied()
+                .take_while(|&e| e != SENTINEL)
+                .collect();
+            assert!(i == 0 || live.len() > kept, "vertex {i} was not topped up");
+            assert!(!live.contains(&(i as u32)), "vertex {i} links to itself");
+            let mut unique = live.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), live.len(), "vertex {i} has a duplicate edge");
+        }
     }
 }
