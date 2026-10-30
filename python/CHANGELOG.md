@@ -3,6 +3,17 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.6.0
+
+Requires `ann-search-rs` 0.12.0
+
+- Smaller indices: the crate stores point ids as `u32` and the NN-Descent
+  index no longer keeps a second copy of the vectors in its forest. The Python
+  API is unchanged.
+- Manhattan NN-Descent seeds by Kd-tree leaf join, which raises recall.
+- Indices saved with 0.5.x do not load any more (crate save format 6 to 7).
+  Rebuild and save them again.
+
 ## 0.5.1
 
 Requires `ann-search-rs` 0.11.1

@@ -5,7 +5,6 @@
 //! regardless of the index element type, so no cast is needed here.
 
 use ann_search_rs::cpu::vamana::VamanaIndex;
-use ann_search_rs::prelude::AnnSearchErrors;
 use ann_search_rs::{build_vamana_index, query_vamana_index, query_vamana_self};
 use pyo3::prelude::*;
 
@@ -43,7 +42,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
         alpha_pass2: f32,
         seed: usize,
     ) -> PyResult<Self> {
-        build_dispatch!(py, x, VamanaInner, |data, n, dim| Ok::<_, AnnSearchErrors>(
+        build_dispatch!(py, x, VamanaInner, |data, n, dim| {
             build_vamana_index(
                 (data, n, dim),
                 r,
@@ -54,7 +53,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
                 &metric,
                 seed
             )
-        ))
+        })
     }
 
     /// Greedy search from the entry point for external queries.

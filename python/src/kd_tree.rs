@@ -4,7 +4,6 @@
 //! larger index, as with Annoy, but the splits are axis-aligned.
 
 use ann_search_rs::cpu::kd_forest::KdTreeIndex;
-use ann_search_rs::prelude::AnnSearchErrors;
 use ann_search_rs::{build_kd_tree_index, query_kd_tree_index, query_kd_tree_self};
 use pyo3::prelude::*;
 
@@ -33,9 +32,9 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
         n_trees: usize,
         seed: usize,
     ) -> PyResult<Self> {
-        build_dispatch!(py, x, KdTreeInner, |data, n, dim| Ok::<_, AnnSearchErrors>(
+        build_dispatch!(py, x, KdTreeInner, |data, n, dim| {
             build_kd_tree_index((data, n, dim), &metric, n_trees, seed)
-        ))
+        })
     }
 
     /// Descend the forest for external queries.

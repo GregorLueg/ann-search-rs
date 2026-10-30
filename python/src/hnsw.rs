@@ -4,7 +4,6 @@
 //! HNSW has no internal default to fall back on.
 
 use ann_search_rs::cpu::hnsw::HnswIndex;
-use ann_search_rs::prelude::AnnSearchErrors;
 use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self};
 use pyo3::prelude::*;
 
@@ -39,9 +38,9 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
         seed: usize,
         verbose: bool,
     ) -> PyResult<Self> {
-        build_dispatch!(py, x, HnswInner, |data, n, dim| Ok::<_, AnnSearchErrors>(
+        build_dispatch!(py, x, HnswInner, |data, n, dim| {
             build_hnsw_index((data, n, dim), m, ef_construction, &metric, seed, verbose)
-        ))
+        })
     }
 
     /// Search the graph for external queries.
