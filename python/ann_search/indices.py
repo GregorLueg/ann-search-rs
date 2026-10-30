@@ -171,7 +171,10 @@ class AnnoyIndex(BaseAnnIndex):
 
     def _build(self, x: np.ndarray) -> Any:
         return _core.Annoy.build(
-            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed,
+            x,
+            metric=self._core_metric,
+            n_trees=self.n_trees,
+            seed=self.seed,
             verbose=self.verbose,
         )
 
@@ -585,7 +588,9 @@ class BallTreeIndex(BaseAnnIndex):
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.BallTree.build(x, metric=self._core_metric, seed=self.seed, verbose=self.verbose)
+        return _core.BallTree.build(
+            x, metric=self._core_metric, seed=self.seed, verbose=self.verbose
+        )
 
 
 class KdTreeIndex(BaseAnnIndex):
@@ -639,7 +644,10 @@ class KdTreeIndex(BaseAnnIndex):
 
     def _build(self, x: np.ndarray) -> Any:
         return _core.KdTree.build(
-            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed,
+            x,
+            metric=self._core_metric,
+            n_trees=self.n_trees,
+            seed=self.seed,
             verbose=self.verbose,
         )
 

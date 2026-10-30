@@ -93,7 +93,9 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.ExhaustiveGpu.build(x, metric=self._core_metric, verbose=self.verbose)
+        return _core.ExhaustiveGpu.build(
+            x, metric=self._core_metric, verbose=self.verbose
+        )
 
 
 class IvfGpuIndex(_BaseGpuIndex):

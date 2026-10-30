@@ -93,7 +93,9 @@ class ExhaustiveMlxIndex(_BaseMlxIndex):
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.ExhaustiveMlx.build(x, metric=self._core_metric, verbose=self.verbose)
+        return _core.ExhaustiveMlx.build(
+            x, metric=self._core_metric, verbose=self.verbose
+        )
 
 
 class IvfMlxIndex(_BaseMlxIndex):
