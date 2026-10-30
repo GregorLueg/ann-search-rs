@@ -178,14 +178,14 @@ pub enum AnnSearchErrors {
         actual: usize,
     },
 
-    /// Size mismatch error for locally stored files
+    /// A store file exists but cannot be used
     #[cfg(feature = "binary")]
-    #[error("Size mismatch: expected {expected} bytes, got {actual} bytes.")]
-    SizeMismatch {
-        /// Expected size of the file
-        expected: usize,
-        /// Actual size of the file
-        actual: usize,
+    #[error("Unusable vector store file '{path}': {reason}.")]
+    StoreInvalid {
+        /// The store file
+        path: String,
+        /// What is wrong with it
+        reason: String,
     },
 
     /// A store file could not be opened

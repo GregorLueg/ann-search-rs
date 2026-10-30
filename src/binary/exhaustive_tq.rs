@@ -53,12 +53,13 @@ pub struct TurboQuantExhaustive<T> {
     n: usize,
     /// Optional on-disk original vectors for exact reranking.
     #[cfg_attr(feature = "serialise", serde(skip))]
-    vector_store: Option<MmapVectorStore<T>>,
-    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    vector_store: Option<VectorStore<T>>,
+    /// Fingerprint of `vector_store`, checked when it is re-opened after a
+    /// load. Only
     /// read by the `serialise` feature; the field is kept unconditionally so
     /// the constructors stay free of `cfg`.
     #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
-    store_meta: Option<StoreMeta>,
+    store_fingerprint: Option<u64>,
 }
 
 //////////////////////////////
@@ -146,7 +147,7 @@ where
             corrections_f32,
             n,
             vector_store: None,
-            store_meta: None,
+            store_fingerprint: None,
         })
     }
 
@@ -182,12 +183,9 @@ where
             .map(compute_l2_norm)
             .collect();
 
-        std::fs::create_dir_all(&save_path)?;
-        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
-
-        MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
-        index.vector_store = Some(MmapVectorStore::new(vectors_path, norms_path, dim, n)?);
-        index.store_meta = Some(StoreMeta { dim, n });
+        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        index.store_fingerprint = Some(vector_store.fingerprint());
+        index.vector_store = Some(vector_store);
 
         Ok(index)
     }
@@ -304,7 +302,7 @@ where
     /// `(indices, distances)` sorted nearest-first by exact distance.
     fn rerank_candidates(
         &self,
-        vector_store: &MmapVectorStore<T>,
+        vector_store: &VectorStore<T>,
         query_vec: &[T],
         candidates: &[usize],
         k: usize,
@@ -596,7 +594,7 @@ where
             (0..n)
                 .into_par_iter()
                 .map(|i| {
-                    let vec = vector_store.load_vector(i);
+                    let vec = vector_store.row(i);
                     let out = self.query_reranking(vec, k, Some(rerank_factor))?;
                     progress.tick_n(1);
                     Ok(out)
@@ -619,7 +617,7 @@ where
                     let mut luts_owned: Vec<QueryLut> = Vec::with_capacity(batch_nq);
                     let mut qnorms = [0.0f32; 4];
                     for qi in 0..batch_nq {
-                        let qvec = vector_store.load_vector(start + qi);
+                        let qvec = vector_store.row(start + qi);
                         let eq = self.quantiser.encode_query(qvec)?;
                         let (q_rot_f32, levels_f32) =
                             prepare_scalar_scoring(&eq, &self.quantiser.encoder);
@@ -651,7 +649,7 @@ where
 
                     let mut out = Vec::with_capacity(batch_nq);
                     for qi in 0..batch_nq {
-                        let qvec = vector_store.load_vector(start + qi);
+                        let qvec = vector_store.row(start + qi);
                         let cands: Vec<usize> = approx[qi].0.iter().map(|&x| x as usize).collect();
                         out.push(self.rerank_candidates(vector_store, qvec, &cands, k));
                     }
@@ -696,7 +694,7 @@ use crate::utils::staging::StagedFiles;
 #[cfg(feature = "serialise")]
 impl<T> IndexIo for TurboQuantExhaustive<T>
 where
-    T: AnnSearchFloat,
+    T: AnnSearchFloat + Pod,
 {
     type Elem = T;
 
@@ -710,10 +708,12 @@ where
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
-        if let Some(meta) = self.store_meta {
-            meta.check(self.n, self.quantiser.storage.dim)?;
-        }
-        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.vector_store = VectorStore::open_for(
+            dir,
+            self.store_fingerprint,
+            self.n,
+            self.quantiser.storage.dim,
+        )?;
 
         Ok(())
     }

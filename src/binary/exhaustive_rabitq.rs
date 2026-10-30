@@ -37,12 +37,13 @@ pub struct ExhaustiveIndexRaBitQ<T> {
     n: usize,
     /// Optional on-disk vector storage
     #[cfg_attr(feature = "serialise", serde(skip))]
-    vector_store: Option<MmapVectorStore<T>>,
-    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    vector_store: Option<VectorStore<T>>,
+    /// Fingerprint of `vector_store`, checked when it is re-opened after a
+    /// load. Only
     /// read by the `serialise` feature; the field is kept unconditionally so
     /// the constructors stay free of `cfg`.
     #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
-    store_meta: Option<StoreMeta>,
+    store_fingerprint: Option<u64>,
 }
 
 //////////////////////////
@@ -139,7 +140,7 @@ where
             quantiser,
             n,
             vector_store: None,
-            store_meta: None,
+            store_fingerprint: None,
         })
     }
 
@@ -177,17 +178,13 @@ where
         let quantiser =
             RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
 
-        std::fs::create_dir_all(&save_path)?;
-
         let norms: Vec<T> = vectors_flat
             .chunks_exact(dim)
             .map(compute_l2_norm)
             .collect();
 
-        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
-
-        MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
-        let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
+        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let store_fingerprint = Some(vector_store.fingerprint());
 
         log.finish();
 
@@ -195,7 +192,7 @@ where
             quantiser,
             n,
             vector_store: Some(vector_store),
-            store_meta: Some(StoreMeta { dim, n }),
+            store_fingerprint,
         })
     }
 
@@ -437,7 +434,7 @@ where
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let vec = vector_store.load_vector(i);
+                let vec = vector_store.row(i);
 
                 progress.tick();
 
@@ -469,7 +466,7 @@ use crate::utils::staging::StagedFiles;
 #[cfg(feature = "serialise")]
 impl<T> IndexIo for ExhaustiveIndexRaBitQ<T>
 where
-    T: AnnSearchFloat,
+    T: AnnSearchFloat + Pod,
 {
     type Elem = T;
 
@@ -483,10 +480,12 @@ where
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
-        if let Some(meta) = self.store_meta {
-            meta.check(self.n, self.quantiser.encoder.dim)?;
-        }
-        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.vector_store = VectorStore::open_for(
+            dir,
+            self.store_fingerprint,
+            self.n,
+            self.quantiser.encoder.dim,
+        )?;
         self.quantiser.storage.reblock_for_this_arch();
 
         Ok(())

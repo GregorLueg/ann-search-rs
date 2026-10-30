@@ -40,7 +40,7 @@ const MAGIC: &[u8; 8] = b"ANNSRS\0\0";
 /// retyping a field in any persisted struct needs a bump here; *appending* a
 /// field is safe because the old file runs out of bytes and the decode errors.
 /// Nothing checks this automatically.
-const FORMAT_VERSION: u32 = 7;
+const FORMAT_VERSION: u32 = 8;
 
 /// Name of the bincode payload inside an index directory.
 const INDEX_FILE: &str = "index.bin";
@@ -789,7 +789,7 @@ mod tests {
         use crate::binary::ivf_rabitq::*;
         use crate::binary::ivf_tq::*;
         use crate::binary::qg::*;
-        use crate::binary::vec_store::{MmapVectorStore, StoreMeta, NORMS_FILE, VECTORS_FILE};
+        use crate::binary::vec_store::{VectorStore, VECTORS_FILE};
 
         /// Bits per binary code. Must be a multiple of 8.
         const N_BITS: usize = 64;
@@ -1042,7 +1042,6 @@ mod tests {
 
             index.save_index(index_dir.path()).unwrap();
             assert!(index_dir.path().join(VECTORS_FILE).exists());
-            assert!(index_dir.path().join(NORMS_FILE).exists());
 
             // Drop the originals: the saved directory must stand on its own
             store_dir.close().unwrap();
@@ -1139,7 +1138,6 @@ mod tests {
 
                     index.save_index(index_dir.path()).unwrap();
                     assert!(index_dir.path().join(VECTORS_FILE).exists());
-                    assert!(index_dir.path().join(NORMS_FILE).exists());
 
                     // Drop the originals: the saved directory must stand alone
                     drop(index);
@@ -1428,22 +1426,22 @@ mod tests {
 
             let saved = TempDir::new().unwrap();
             index.save_index(saved.path()).unwrap();
-            std::fs::remove_file(saved.path().join(NORMS_FILE)).unwrap();
+            std::fs::remove_file(saved.path().join(VECTORS_FILE)).unwrap();
 
             let err = expect_err(TurboQuantExhaustive::<f32>::load_index(saved.path()));
             match err {
                 AnnSearchErrors::StoreFileUnavailable { path, .. } => {
-                    assert!(path.ends_with(NORMS_FILE), "wrong file named: {path}")
+                    assert!(path.ends_with(VECTORS_FILE), "wrong file named: {path}")
                 }
                 other => panic!("unexpected error: {other}"),
             }
         }
 
-        /// A store of the wrong shape must be rejected rather than re-ranked
-        /// against. Swapping in a *same-shape* store from another dataset still
-        /// loads clean; nothing on disk distinguishes them.
+        /// A store swapped in from elsewhere must be rejected rather than
+        /// re-ranked against: by shape when it differs, by fingerprint when a
+        /// different dataset happens to share the shape.
         #[test]
-        fn test_store_of_the_wrong_shape_is_rejected() {
+        fn test_foreign_store_is_rejected() {
             let data = random_matrix(N_DATA, DIM, 7);
             let store_dir = TempDir::new().unwrap();
             let saved = TempDir::new().unwrap();
@@ -1460,36 +1458,25 @@ mod tests {
             .unwrap();
             index.save_index(saved.path()).unwrap();
 
-            // Half as many vectors, same dimensionality
-            let short = random_matrix(N_DATA / 2, DIM, 3);
-            let flat: Vec<f32> = (0..N_DATA / 2)
-                .flat_map(|i| short.row(i).iter().cloned().collect::<Vec<_>>())
-                .collect();
-            let norms = vec![1.0f32; N_DATA / 2];
-            let (v, n) = MmapVectorStore::<f32>::paths_in(saved.path());
-            MmapVectorStore::save(&flat, &norms, DIM, N_DATA / 2, &v, &n).unwrap();
-
-            let err = expect_err(TurboQuantExhaustive::<f32>::load_index(saved.path()));
-            assert!(matches!(err, AnnSearchErrors::SizeMismatch { .. }));
-        }
-
-        /// The recorded shape has to agree with the index it belongs to.
-        #[test]
-        fn test_store_meta_is_cross_checked() {
-            let meta = StoreMeta {
-                dim: DIM,
-                n: N_DATA,
+            let overwrite = |n: usize, seed: u64| {
+                let other = random_matrix(n, DIM, seed);
+                let flat: Vec<f32> = (0..n)
+                    .flat_map(|i| other.row(i).iter().cloned().collect::<Vec<_>>())
+                    .collect();
+                let norms: Vec<f32> = flat
+                    .chunks_exact(DIM)
+                    .map(|r| r.iter().map(|x| x * x).sum::<f32>().sqrt())
+                    .collect();
+                VectorStore::create(saved.path(), &flat, &norms, n, DIM).unwrap();
             };
 
-            assert!(meta.check(N_DATA, DIM).is_ok());
-            assert!(matches!(
-                meta.check(N_DATA + 1, DIM),
-                Err(AnnSearchErrors::StoreShapeMismatch { .. })
-            ));
-            assert!(matches!(
-                meta.check(N_DATA, DIM + 1),
-                Err(AnnSearchErrors::StoreShapeMismatch { .. })
-            ));
+            overwrite(N_DATA / 2, 3);
+            let err = expect_err(TurboQuantExhaustive::<f32>::load_index(saved.path()));
+            assert!(matches!(err, AnnSearchErrors::StoreShapeMismatch { .. }));
+
+            overwrite(N_DATA, 3);
+            let err = expect_err(TurboQuantExhaustive::<f32>::load_index(saved.path()));
+            assert!(matches!(err, AnnSearchErrors::StoreInvalid { .. }));
         }
 
         /// Saving into the directory the store already occupies must not
@@ -1521,7 +1508,7 @@ mod tests {
             .unwrap();
 
             let inode = |name: &str| std::fs::metadata(dir.path().join(name)).unwrap().ino();
-            let (vectors_before, norms_before) = (inode(VECTORS_FILE), inode(NORMS_FILE));
+            let vectors_before = inode(VECTORS_FILE);
 
             let rerank = |i: &TurboQuantExhaustive<f32>| {
                 unwrap_knn(query_exhaustive_index_turboquant(
@@ -1539,7 +1526,6 @@ mod tests {
             index.save_index(dir.path()).unwrap();
 
             assert_eq!(vectors_before, inode(VECTORS_FILE));
-            assert_eq!(norms_before, inode(NORMS_FILE));
 
             // The live index still re-ranks the same, and so does a reload
             assert_same_knn(&before, &rerank(&index));
@@ -1551,8 +1537,8 @@ mod tests {
         /// Building a second index into a directory a live index is mapped to
         /// must not pull the first index's vectors out from under it.
         ///
-        /// `MmapVectorStore::save` used to `File::create` both files, which
-        /// truncates. Index A silently started answering with B's vectors.
+        /// Writing the store with a plain `File::create` truncates it, and
+        /// index A silently starts answering with B's vectors.
         #[test]
         fn test_building_into_a_live_store_directory_leaves_the_first_index_alone() {
             let data_a = random_matrix(N_DATA, DIM, 7);
