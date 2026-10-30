@@ -92,10 +92,20 @@ let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, V
 let (graph, _) = query_hnsw_self(&index, 15, 200, false, Verbosity::Quiet)?;
 ```
 
-Every build and query takes a `Verbosity`. `Quiet` prints nothing but
-warnings. `Normal` prints one line at the start and end of a build or query,
-plus a progress line every 100_000 queried samples. `Detailed` adds the timed
-build stages and per-iteration lines. NN-Descent on 200k x 32 at `Detailed`:
+Every index follows the same `build_*` / `query_*` / `query_*_self` pattern.
+Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
+row-major slice with its shape. Rows are samples, columns are features, always:
+
+```rust
+let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, Verbosity::Quiet)?;
+```
+
+The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
+Quickest way to see how one behaves on your kind of data. Moreover, every build
+and query takes a `Verbosity`. `Quiet` prints nothing but warnings. `Normal`
+prints one line at the start and end of a build or query, plus a progress line
+every 100_000 queried samples. `Detailed` adds the timed build stages and
+per-iteration lines. NN-Descent on 200k x 32 at `Detailed`:
 
 ```text
 Building NNDescent index ...
@@ -118,17 +128,6 @@ Querying NNDescent index (self) ...
 
 Callers that carry verbosity as an integer (R or Python bindings) can use
 `parse_annsearch_verbosity(0 | 1 | 2)`.
-
-Every index follows the same `build_*` / `query_*` / `query_*_self` pattern.
-Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
-row-major slice with its shape. Rows are samples, columns are features, always:
-
-```rust
-let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, Verbosity::Quiet)?;
-```
-
-The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
-Quickest way to see how one behaves on your kind of data.
 
 ## Benchmarks
 

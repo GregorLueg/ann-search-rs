@@ -8,11 +8,8 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 **Features**
 
 - `build_knn_graph_nndescent()`: matrix in, kNN graph out, on the CPU. Nothing
-  else is kept. The seeding trees are built in batches of one per thread, joined
-  and dropped, so the full forest never sits in memory. With the same seed and
-  tree count it returns the same graph as `extract_knn` on an NN-Descent index.
-  Takes `NNDescentKnnParams` (`k`, iterations, candidates, trees, `delta`,
-  `include_self`, `return_dist`).
+  else is kept. With the same seed and tree count it returns the same graph as
+  `extract_knn` on an NN-Descent index.
 - `build_knn_graph_nndescent_gpu()`: the same on the GPU, through the
   clustered build, so datasets past the per-binding limit work too. Takes
   `NNDescentGpuKnnParams`.
@@ -21,50 +18,36 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   into the NSG instead of being copied. Takes `NNDescentGpuKnnParams` for the
   kNN graph. `build_nsg_from_gpu_knn` stays for reusing one graph across
   several NSG builds.
-- The two kNN-graph builders return a flat `KnnGraph<T>`: `n * k` `u32` ids, optional distances,
-  rows sorted ascending, `KNN_GRAPH_EMPTY` for unfilled slots. `include_self`
-  puts each point first in its own row at distance zero, as UMAP expects.
+- The two kNN-graph builders return a flat `KnnGraph<T>`: `n * k` `u32` ids,
+  optional distancess rows sorted ascending.
 - Manhattan NN-Descent seeds by Kd-tree leaf join as well, instead of one
-  forest query per point. Recall@15 at 200k x 32 goes from 0.960 to 0.970.
-
+  forest query per point.
 - One verbosity grammar across every index, k-means and kNN-graph builder:
   `Verbosity { Quiet, Normal, Detailed }`. `Normal` prints `Building <name>
   ...` / `... built <name> in 1.23s`, `Querying <name> ...`, a progress line
   every 100_000 samples and `... queried <name> in`. `Detailed` adds timed
   build stages (forest, k-means, assignment, quantiser training, NSG steps,
-  CAGRA prune) and per-iteration lines. A sub-component run by a parent (the
-  k-means inside IVF, the NN-Descent inside NSG) stays quiet and the parent
-  prints one timed line for it. Warnings still print at `Quiet`.
+  CAGRA prune) and per-iteration lines.
 - `parse_annsearch_verbosity(usize)` maps `0`/`1`/`2` to the enum for callers
   that carry verbosity as an integer.
 - The binary, RaBitQ and TurboQuant indices (exhaustive and IVF) can keep
   their re-ranking store at f16: `StoreEncoding::F16`, against the default
   `StoreEncoding::Full`. Halves the store file. Rows decode in chunks through
   `half` (F16C or the aarch64 fp16 conversion, picked at runtime) into the
-  existing SIMD kernels, so re-ranking runs at f32 speed on an M1 Max. Over
-  four synthetic datasets at dim 32 to 512 and rerank factor 20, the mean
-  distance ratio moves by at most 0.0001 and Recall@15 drops by 0.001 to
-  0.022, worst on correlated data. Data past the f16 range (65504) refuses the
-  build. `parse_store_encoding` takes `"full"` or `"f16"`.
+  existing SIMD kernels, so re-ranking runs at f32 speed.
 
 **Memory**
 
 - Annoy and Kd forests build in place: one `u32` permutation per tree,
-  partitioned recursively, with leaves as ranges into it. No per-node `Vec`s
-  and no transient build tree. Leaf ids are `u32` instead of `usize`. The trees
-  are bit-identical to before.
+  partitioned recursively, with leaves as ranges into it. Reduction in
+  allocations and in memory.
 - The NN-Descent index no longer keeps a second, reordered copy of the vectors
-  inside its forest. The router walks the trees and scores the candidates
-  against the index's own vectors. At 200k x 32, `memory_usage_bytes` drops
-  from 175 MB to 102 MB (Euclidean), 175 MB to 99 MB (cosine) and 139 MB to
-  84 MB (Manhattan).
+  inside its forest, reducing index size substantially.
 - Stored point ids are `u32` crate-wide: `original_ids` on every index, the
   IVF-family id and offset arrays, the k-means assignments, the HNSW update
   buffers, the NN-Descent and NSG build buffers and the GPU/MLX host storage.
   Index arithmetic stays `usize`.
-- `build_nsg_index` runs its internal NN-Descent graph-only: no forest or
-  query graph, and the vectors move into the NSG instead of being copied. The
-  resulting index is identical.
+- `build_nsg_index` runs its internal NN-Descent graph-only, see above.
 - Ball tree builds in place on the same pattern and drops `leaf_indices`, which
   had become the identity once the vectors were stored in leaf order.
 
