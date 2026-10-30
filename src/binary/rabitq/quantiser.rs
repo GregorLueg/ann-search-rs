@@ -600,7 +600,7 @@ pub fn build_rabitq_storage<T>(
     encoder: &RaBitQEncoder<T>,
 ) -> Result<RaBitQStorage<T>, AnnSearchErrors>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance + Clone,
+    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance + Send + Sync,
 {
     let padded_dim = encoder.padded_dim;
     let n_bytes = encoder.n_bytes;
@@ -658,29 +658,34 @@ where
     // nothing else ever wants this one.
     let mut codes_flat = vec![0u8; n * n_bytes];
     let mut insert_pos = offsets[..nlist].to_vec();
-
     for vec_idx in 0..n {
         let cluster_idx = assignments[vec_idx] as usize;
-        let pos = insert_pos[cluster_idx] as usize;
+        storage.vector_indices[insert_pos[cluster_idx] as usize] = vec_idx as u32;
         insert_pos[cluster_idx] += 1;
-
-        let vec = &data[vec_idx * dim..(vec_idx + 1) * dim];
-        let centroid = &centroids[cluster_idx * dim..(cluster_idx + 1) * dim];
-
-        let (binary, dist, dot_corr) = encoder.encode_vector(vec, centroid)?;
-
-        let byte_start = pos * n_bytes;
-        codes_flat[byte_start..byte_start + n_bytes].copy_from_slice(&binary);
-
-        storage.packed_vectors[pos] = RaBitQPackedVector::from_code(
-            &binary,
-            dist,
-            dot_corr,
-            &storage.centroids_rotated[cluster_idx * padded_dim..(cluster_idx + 1) * padded_dim],
-        );
-
-        storage.vector_indices[pos] = vec_idx as u32;
     }
+
+    let centroids_rotated = &storage.centroids_rotated;
+    let vector_indices = &storage.vector_indices;
+    codes_flat
+        .par_chunks_mut(n_bytes)
+        .zip(storage.packed_vectors.par_iter_mut())
+        .enumerate()
+        .try_for_each(|(pos, (code, packed))| -> Result<(), AnnSearchErrors> {
+            let vec_idx = vector_indices[pos] as usize;
+            let c = assignments[vec_idx] as usize;
+            let (binary, dist, dot_corr) = encoder.encode_vector(
+                &data[vec_idx * dim..(vec_idx + 1) * dim],
+                &centroids[c * dim..(c + 1) * dim],
+            )?;
+            *packed = RaBitQPackedVector::from_code(
+                &binary,
+                dist,
+                dot_corr,
+                &centroids_rotated[c * padded_dim..(c + 1) * padded_dim],
+            );
+            code.copy_from_slice(&binary);
+            Ok(())
+        })?;
 
     storage.blocked = (0..nlist)
         .map(|c| {
