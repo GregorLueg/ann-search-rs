@@ -37,6 +37,15 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   prints one timed line for it. Warnings still print at `Quiet`.
 - `parse_annsearch_verbosity(usize)` maps `0`/`1`/`2` to the enum for callers
   that carry verbosity as an integer.
+- The binary, RaBitQ and TurboQuant indices (exhaustive and IVF) can keep
+  their re-ranking store at f16: `StoreEncoding::F16`, against the default
+  `StoreEncoding::Full`. Halves the store file. Rows decode in chunks through
+  `half` (F16C or the aarch64 fp16 conversion, picked at runtime) into the
+  existing SIMD kernels, so re-ranking runs at f32 speed on an M1 Max. Over
+  four synthetic datasets at dim 32 to 512 and rerank factor 20, the mean
+  distance ratio moves by at most 0.0001 and Recall@15 drops by 0.001 to
+  0.022, worst on correlated data. Data past the f16 range (65504) refuses the
+  build. `parse_store_encoding` takes `"full"` or `"f16"`.
 
 **Memory**
 
@@ -89,8 +98,23 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `cluster_vector_indices` returns `&[u32]`.
 - `compact_knn_rows` returns `(u32, T)` and lost its id type parameter. The
   `GraphPid` trait is gone.
-- Save format bumped from 6 to 7: the Annoy, Kd, NN-Descent, ball tree and
-  IVF-family layouts changed. Older indices error on load.
+- The vector store behind the binary indices is one file, `vectors.bin`,
+  instead of `vectors_flat.bin` plus `norms.bin`. It carries its own header
+  (magic, version, float type, encoding, shape) and a fingerprint of the
+  norms, which the index records and checks on load. A store from a
+  different dataset of the same shape used to load silently; it is refused
+  now. Little-endian hosts only.
+- `build_exhaustive_index_binary`, `build_ivf_index_binary`,
+  `build_exhaustive_index_rabitq`, `build_ivf_index_rabitq`,
+  `build_exhaustive_index_turboquant` and `build_ivf_index_turboquant` take
+  `store_encoding: StoreEncoding` after `save_path`, as do the matching
+  `new_with_vector_store` / `build_with_vector_store` constructors.
+- `MmapVectorStore` is `VectorStore`, `load_vector` is `row` and returns a
+  `Cow<[T]>`. The old `VectorStore` trait and `StoreMeta` are gone.
+  `AnnSearchErrors::SizeMismatch` is replaced by `StoreInvalid { path, reason }`.
+- The `binary` feature pulls in `half`.
+- Save format bumped from 6 to 7: the Annoy, Kd, NN-Descent, ball tree,
+  IVF-family and binary-index layouts changed. Older indices error on load.
 
 ## 0.11.2
 
