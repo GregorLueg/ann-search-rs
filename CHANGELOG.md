@@ -16,7 +16,12 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 - `build_knn_graph_nndescent_gpu()`: the same on the GPU, through the
   clustered build, so datasets past the per-binding limit work too. Takes
   `NNDescentGpuKnnParams`.
-- Both return a flat `KnnGraph<T>`: `n * k` `u32` ids, optional distances,
+- `build_nsg_index_gpu()`: matrix in, NSG out, with the kNN graph built on
+  the GPU through the clustered build. The vectors move from the kNN handoff
+  into the NSG instead of being copied. Takes `NNDescentGpuKnnParams` for the
+  kNN graph. `build_nsg_from_gpu_knn` stays for reusing one graph across
+  several NSG builds.
+- The two kNN-graph builders return a flat `KnnGraph<T>`: `n * k` `u32` ids, optional distances,
   rows sorted ascending, `KNN_GRAPH_EMPTY` for unfilled slots. `include_self`
   puts each point first in its own row at distance zero, as UMAP expects.
 - Manhattan NN-Descent seeds by Kd-tree leaf join as well, instead of one
@@ -51,12 +56,12 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `Result` now, like the other builders.
 - `KnnValidation::original_ids` returns `&[u32]`.
 - `KnnGraphGpu::knn_graph` and `KnnGraphMlx::knn_graph` hold `(u32, T)` pairs.
-  `build_nsg_from_knn_index` takes `&[(u32, T)]`.
+  `NsgIndex::build_from_knn` takes `&[(u32, T)]`.
 - `k_means_clusters_gpu`, `k_means_clusters_mlx`, `k_means_gpu_flat`,
   `assign_all_gpu`, `assign_all_mlx` and `assign_all_parallel` return `u32`
   assignments. `build_csr_layout` and `invert_assignments_csr` return `u32` ids
-  and offsets. `assign_secondary_soar`, `select_probed_clusters` and
-  `adjust_centers` take `u32` slices.
+  and offsets. `assign_secondary_soar` and `adjust_centers` take `u32`
+  assignments, `select_probed_clusters` takes `u32` offsets.
 - `RaBitQStorage::vector_indices` and `offsets` are `Vec<u32>`, and
   `cluster_vector_indices` returns `&[u32]`.
 - `compact_knn_rows` returns `(u32, T)` and lost its id type parameter. The

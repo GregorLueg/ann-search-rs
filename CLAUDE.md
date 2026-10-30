@@ -115,9 +115,11 @@ Every index follows the same pattern in `src/lib.rs`:
 - `query_<name>_index(query_mat, &index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for cross-set queries.
 - `query_<name>_self(&index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
 
-NSG is the exception: it builds from an existing kNN graph, so alongside `build_nsg_index` there are `build_nsg_from_knn_index` and `build_nsg_from_gpu_knn`.
+NSG is the exception: it builds from an existing kNN graph, so alongside `build_nsg_index` (CPU kNN) and `build_nsg_index_gpu` (GPU kNN) there are `build_nsg_from_knn_index` and `build_nsg_from_gpu_knn`. The two matrix-in builders run the descent graph-only and move the vectors into the NSG.
 
 `build_knn_graph_gpu` and `build_clustered_knn_graph_gpu` are also exceptions: they return a bare `KnnGraphGpu` handoff with no query functions, for feeding NSG or unpacking raw kNN.
+
+`build_knn_graph_nndescent` and `build_knn_graph_nndescent_gpu` are the matrix-in, graph-out paths: they return a flat `KnnGraph<T>` (`n * k` `u32` ids, optional distances, `KNN_GRAPH_EMPTY` padding) and keep nothing else.
 
 `KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>`. Distances are optional so callers can skip storing them when they only need indices.
 

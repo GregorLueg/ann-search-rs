@@ -143,7 +143,9 @@ runtime, so a smaller GPU gets smaller staging tiles.
 Beyond the indices, `build_knn_graph_gpu` returns a raw kNN graph for anything
 that fits the device's per-binding limit, and `build_clustered_knn_graph_gpu`
 splits larger datasets into overlapping k-means clusters first. Either can feed
-`build_nsg_from_gpu_knn`.
+`build_nsg_from_gpu_knn`, which is the way to sweep NSG parameters over one
+graph. `build_nsg_index_gpu` does both in one call, matrix in, NSG out, and
+moves the vectors into the NSG instead of copying them.
 
 ## MLX (experimental)
 
