@@ -75,6 +75,7 @@ fn main() {
         let idx = build_exhaustive_index_rabitq(
             data.as_ref(),
             None,
+            0,
             &cli.distance,
             cli.seed as usize,
             true,
@@ -116,6 +117,7 @@ fn main() {
             data.as_ref(),
             Some(nlist),
             None,
+            0,
             &cli.distance,
             cli.seed as usize,
             true,

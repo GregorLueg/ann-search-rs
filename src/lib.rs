@@ -4941,6 +4941,10 @@ where
 ///   ndarray 2-D array (with the `ndarray` feature) or a row-major
 ///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
 /// * `n_clust_rabitq` - Number of clusters (None for automatic)
+/// * `ex_bits` - Magnitude bits per coordinate on top of the sign, `0..=8`.
+///   Above zero, candidates the one-bit bound cannot rule out are re-scored on
+///   the wider code, which lifts recall without a vector store. Zero is the
+///   plain one-bit index.
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
 /// * `seed` - Random seed
@@ -4958,6 +4962,7 @@ where
 pub fn build_exhaustive_index_rabitq<T>(
     mat: impl AnnMatrix<T>,
     n_clust_rabitq: Option<usize>,
+    ex_bits: usize,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
@@ -4981,13 +4986,14 @@ where
             mat,
             &metric,
             n_clust_rabitq,
+            ex_bits,
             seed,
             verbosity,
             path,
             store_encoding,
         )
     } else {
-        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed, verbosity)
+        ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, ex_bits, seed, verbosity)
     }
 }
 
@@ -5003,7 +5009,9 @@ where
 /// * `k` - Number of neighbours to return
 /// * `n_probe` - Number of clusters to search (None for default 20%)
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+///   `None` lets the estimate's error bound pick which candidates need an
+///   exact distance
 /// * `return_dist` - Shall the distances be returned
 /// * `verbosity` - See [`Verbosity`]
 ///
@@ -5048,7 +5056,9 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `n_probe` - Number of clusters to search (None for default 20%)
-/// * `rerank_factor` - Multiplier for candidate set size
+/// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+///   `None` lets the estimate's error bound pick which candidates need an
+///   exact distance
 /// * `return_dist` - Return distances
 /// * `verbosity` - See [`Verbosity`]
 ///
@@ -5087,6 +5097,10 @@ where
 ///   defaults.
 /// * `dist_metric` - Distance metric: "euclidean" or "cosine". "manhatten" is
 ///   not supported.
+/// * `ex_bits` - Magnitude bits per coordinate on top of the sign, `0..=8`.
+///   Above zero, candidates the one-bit bound cannot rule out are re-scored on
+///   the wider code, which lifts recall without a vector store. Zero is the
+///   plain one-bit index.
 /// * `seed` - Random seed
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
@@ -5103,6 +5117,7 @@ pub fn build_ivf_index_rabitq<T>(
     mat: impl AnnMatrix<T>,
     nlist: Option<usize>,
     k_means_params: Option<KMeansTrainingParams>,
+    ex_bits: usize,
     dist_metric: &str,
     seed: usize,
     save_store: bool,
@@ -5127,13 +5142,14 @@ where
             metric,
             nlist,
             k_means_params,
+            ex_bits,
             seed,
             verbosity,
             path,
             store_encoding,
         )
     } else {
-        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbosity)
+        IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, ex_bits, seed, verbosity)
     }
 }
 
@@ -5149,7 +5165,9 @@ where
 /// * `k` - Number of neighbours to return
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
 /// * `rerank` - Whether to use exact distance reranking (requires vector store)
-/// * `rerank_factor` - Multiplier for candidate set size (only used if rerank is true)
+/// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+///   `None` lets the estimate's error bound pick which candidates need an
+///   exact distance
 /// * `return_dist` - Shall the distances be returned
 /// * `verbosity` - See [`Verbosity`]
 ///
@@ -5194,7 +5212,9 @@ where
 /// * `index` - Reference to built index
 /// * `k` - Number of neighbours
 /// * `nprobe` - Number of IVF cells to probe (None for sqrt(nlist))
-/// * `rerank_factor` - Multiplier for candidate set size
+/// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+///   `None` lets the estimate's error bound pick which candidates need an
+///   exact distance
 /// * `return_dist` - Return distances
 /// * `verbosity` - See [`Verbosity`]
 ///

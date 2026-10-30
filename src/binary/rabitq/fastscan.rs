@@ -181,22 +181,38 @@ pub fn unpack_rabitq_blocked(
                 if v >= n_vectors {
                     break;
                 }
-                let byte = if src_arch == ARCH_X86 {
-                    // Lanes 0..16 hold the high nibbles of the pair, 16..32 the
-                    // low ones, with the pair members at `j` and `j + 16`.
-                    let (j, shift) = (X86_PERM_INV[lane % 16], 4 * (lane / 16) as u32);
-                    let hi = (group[j] >> shift) & 0x0F;
-                    let lo = (group[16 + j] >> shift) & 0x0F;
-                    (hi << 4) | lo
-                } else {
-                    group[lane]
-                };
-                out[v * n_bytes + g] = byte.reverse_bits();
+                out[v * n_bytes + g] = lane_byte(group, lane, src_arch);
             }
         }
     }
 
     out
+}
+
+/// One lane's code byte from a blocked byte-group, in the original bit order.
+///
+/// ### Params
+///
+/// * `group` - The [`BLOCK`]-byte slice for one (block, byte-group)
+/// * `lane` - Lane within the block
+/// * `src_arch` - The [`BLOCKED_ARCH`] tag the layout was written with
+///
+/// ### Returns
+///
+/// The byte as the encoder wrote it, coordinate `d` in bit `d % 8`
+#[inline]
+fn lane_byte(group: &[u8], lane: usize, src_arch: u8) -> u8 {
+    let byte = if src_arch == ARCH_X86 {
+        // Lanes 0..16 hold the high nibbles of the pair, 16..32 the low ones,
+        // with the pair members at `j` and `j + 16`.
+        let (j, shift) = (X86_PERM_INV[lane % 16], 4 * (lane / 16) as u32);
+        let hi = (group[j] >> shift) & 0x0F;
+        let lo = (group[16 + j] >> shift) & 0x0F;
+        (hi << 4) | lo
+    } else {
+        group[lane]
+    };
+    byte.reverse_bits()
 }
 
 /////////
@@ -235,6 +251,81 @@ pub struct SignScanQuery<T> {
     /// The rotated, metric-normalised query, `padded_dim` long. Each probed
     /// cluster needs `||q - c||` from it.
     pub rotated: Vec<T>,
+    /// `sum(rotated)`, the centring correction of the full-width estimate
+    pub sum: T,
+    /// Exact sign sums for the full-width estimate, see [`build_sign_sums`];
+    /// empty when the index has no magnitude bits
+    pub sign_sums: Vec<T>,
+}
+
+/// Entries in one row of [`build_sign_sums`], one per nibble value.
+const NIBBLE_VALUES: usize = 16;
+
+/// Partial sums of a rotated query over every 4-bit pattern of a sign code.
+///
+/// Entry `i * 16 + v` is the sum of `rotated[4i + b]` over the set bits `b` of
+/// `v`, so `<q, s01>` is one lookup per nibble instead of a data-dependent
+/// branch per bit. Unlike the fast-scan table nothing is rounded, which is
+/// what the full-width estimate needs: there the sign product is scaled by
+/// `2^ex_bits` and a byte-quantised one sets the error floor.
+///
+/// ### Params
+///
+/// * `rotated` - Rotated query, length a multiple of eight
+///
+/// ### Returns
+///
+/// The table, `rotated.len() / 4 * 16` entries
+pub fn build_sign_sums<T: AnnSearchFloat>(rotated: &[T]) -> Vec<T> {
+    let mut lut = vec![T::zero(); rotated.len() / 4 * NIBBLE_VALUES];
+    for (i, row) in lut.chunks_exact_mut(NIBBLE_VALUES).enumerate() {
+        let q = &rotated[i * 4..(i + 1) * 4];
+        // Each entry extends the one with its highest bit cleared.
+        for v in 1..NIBBLE_VALUES {
+            let high = (usize::BITS - 1 - v.leading_zeros()) as usize;
+            row[v] = row[v & !(1 << high)] + q[high];
+        }
+    }
+    lut
+}
+
+/// Exact `<q, s01>` of one blocked lane, read in place.
+///
+/// The lane's block has just been through fast-scan, so its bytes are still
+/// in cache; reading them here avoids keeping a second, row-major copy of the
+/// sign codes.
+///
+/// ### Params
+///
+/// * `sums` - Table from [`build_sign_sums`]
+/// * `blocked` - Blocked codes of the cluster
+/// * `n_bytes` - Bytes per code
+/// * `local` - The vector's index within the cluster
+///
+/// ### Returns
+///
+/// The sum of the query coordinates whose sign bit is set
+#[inline]
+pub fn blocked_sign_ip<T: AnnSearchFloat>(
+    sums: &[T],
+    blocked: &[u8],
+    n_bytes: usize,
+    local: usize,
+) -> T {
+    let (block_idx, lane) = (local / BLOCK, local % BLOCK);
+    let groups = &blocked[block_idx * n_bytes * BLOCK..(block_idx + 1) * n_bytes * BLOCK];
+
+    // Two accumulators so the adds do not form one serial chain.
+    let (mut lo, mut hi) = (T::zero(), T::zero());
+    for (group, row) in groups
+        .chunks_exact(BLOCK)
+        .zip(sums.chunks_exact(2 * NIBBLE_VALUES))
+    {
+        let byte = lane_byte(group, lane, BLOCKED_ARCH);
+        lo += row[(byte & 0x0F) as usize];
+        hi += row[NIBBLE_VALUES + (byte >> 4) as usize];
+    }
+    lo + hi
 }
 
 /////////////

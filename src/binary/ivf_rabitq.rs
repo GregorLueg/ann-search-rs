@@ -111,6 +111,9 @@ where
     /// * `k_means_params` - Optional k-means trainings parameters, see
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out are
+    ///   re-scored on the wider code, see [`VectorDistanceRaBitQ::rabitq_scan`]
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
@@ -122,10 +125,20 @@ where
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
-        Self::build_with_rotator_kind(data, metric, nlist, k_means_params, None, seed, verbosity)
+        Self::build_with_rotator_kind(
+            data,
+            metric,
+            nlist,
+            k_means_params,
+            None,
+            ex_bits,
+            seed,
+            verbosity,
+        )
     }
 
     /// Build IVF-RaBitQ index with an explicitly chosen rotation
@@ -140,6 +153,9 @@ where
     ///   defaults.
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out are
+    ///   re-scored on the wider code, see [`VectorDistanceRaBitQ::rabitq_scan`]
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
@@ -153,6 +169,7 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
@@ -277,6 +294,7 @@ where
             nlist,
             &assignments,
             &encoder,
+            ex_bits,
         )?;
 
         log.finish();
@@ -302,6 +320,9 @@ where
     /// * `k_means_params` - Optional k-means trainings parameters, see
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out are
+    ///   re-scored on the wider code, see [`VectorDistanceRaBitQ::rabitq_scan`]
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
@@ -316,6 +337,7 @@ where
         metric: Dist,
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
@@ -327,6 +349,7 @@ where
             nlist,
             k_means_params,
             None,
+            ex_bits,
             seed,
             verbosity,
             save_path,
@@ -346,6 +369,9 @@ where
     ///   defaults.
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out are
+    ///   re-scored on the wider code, see [`VectorDistanceRaBitQ::rabitq_scan`]
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
@@ -361,6 +387,7 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
@@ -482,6 +509,7 @@ where
             nlist,
             &assignments,
             &encoder,
+            ex_bits,
         )?;
 
         // Save vector store
@@ -531,12 +559,19 @@ where
         let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
         let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
 
-        let query = self.encoder.encode_query(&query_normalised)?;
+        let query = self
+            .encoder
+            .encode_query(&query_normalised, self.storage().ex_bits)?;
 
         // The heap ranks on *squared* distance: the square root is monotone, so
         // it only needs applying to the k survivors.
         Ok(self
-            .rabitq_scan(&query, &probed, k, None::<fn(usize) -> T>)
+            .rabitq_scan(
+                &query,
+                &probed,
+                k,
+                Refine::without_store(self.storage().ex_bits),
+            )
             .into_iter()
             .map(|(d, i)| (i, d.0.sqrt()))
             .unzip())
@@ -576,8 +611,10 @@ where
     /// * `query_vec` - Query vector
     /// * `k` - Number of neighbours to return
     /// * `nprobe` - Number of IVF cells to probe. If None, uses sqrt(nlist)
-    /// * `rerank_factor` - How many more neighbours to rank exactly. Defaults
-    ///   to `20`, i.e., `20 * k` neighbours get re-ranked.
+    /// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+    ///   `None` lets the estimate's error bound pick which candidates need an
+    ///   exact distance, see
+    ///   [`query_reranking_bounded`](Self::query_reranking_bounded).
     ///
     /// ### Returns
     ///
@@ -590,7 +627,9 @@ where
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        let rerank_factor = rerank_factor.unwrap_or(20);
+        let Some(rerank_factor) = rerank_factor else {
+            return self.query_reranking_bounded(query_vec, k, nprobe);
+        };
         let vector_store = self
             .vector_store
             .as_ref()
@@ -669,7 +708,9 @@ where
         let query_normalised = self.encoder.normalise_query(query_vec);
         let mut cluster_dists = self.get_centroids_prenorm(&query_normalised, nprobe);
         let probed = select_probed_clusters(&mut cluster_dists, &self.storage.offsets, nprobe, k);
-        let query = self.encoder.encode_query(&query_normalised)?;
+        let query = self
+            .encoder
+            .encode_query(&query_normalised, self.storage().ex_bits)?;
 
         // The estimate lives in the normalised space for cosine, where the
         // squared distance is twice the cosine distance.
@@ -683,7 +724,7 @@ where
         };
 
         Ok(self
-            .rabitq_scan(&query, &probed, k, Some(exact))
+            .rabitq_scan(&query, &probed, k, Refine::Exact(exact))
             .into_iter()
             .map(|(d, i)| match metric {
                 Dist::Cosine => (i, d.0 / two),
@@ -699,8 +740,10 @@ where
     /// * `query_row` - Query row reference
     /// * `k` - Number of neighbours to return
     /// * `nprobe` - Number of IVF cells to probe. If None, uses sqrt(nlist)
-    /// * `rerank_factor` - How many more neighbours to rank exactly. Defaults
-    ///   to `20`, i.e., `20 * k` neighbours get re-ranked.
+    /// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+    ///   `None` lets the estimate's error bound pick which candidates need an
+    ///   exact distance, see
+    ///   [`query_reranking_bounded`](Self::query_reranking_bounded).
     ///
     /// ### Returns
     ///
@@ -728,7 +771,8 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of IVF cells to probe per query
-    /// * `rerank_factor` - Reranking factor for exact distances
+    /// * `rerank_factor` - Shortlist multiplier for exact distances, `None` for
+    ///   the bound-gated rerank
     /// * `return_dist` - Whether to return distances
     /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
@@ -841,6 +885,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -861,6 +906,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(25),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -881,6 +927,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -901,6 +948,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -922,6 +970,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -941,6 +990,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -960,6 +1010,7 @@ mod tests {
             Dist::Cosine,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -980,6 +1031,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -1001,6 +1053,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -1022,6 +1075,7 @@ mod tests {
             Dist::Cosine,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -1052,6 +1106,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(10),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -1077,6 +1132,7 @@ mod tests {
             Dist::Cosine,
             Some(5),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -1105,6 +1161,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -1124,6 +1181,7 @@ mod tests {
             Dist::SquaredEuclidean,
             Some(5),
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -1144,6 +1202,7 @@ mod tests {
             Dist::SquaredEuclidean,
             None,
             get_default_k_means(),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -1169,6 +1228,7 @@ mod tests {
                 metric,
                 Some(8),
                 get_default_k_means(),
+                0,
                 42,
                 Verbosity::Quiet,
                 temp_dir.path(),
@@ -1197,6 +1257,50 @@ mod tests {
                 "{metric:?}: {agree} / {}",
                 20 * k
             );
+        }
+    }
+
+    #[test]
+    fn test_ex_bits_lift_recall_over_one_bit() {
+        // Store-free queries: the wider code must find more of the true
+        // neighbours than the sign bits alone, for both metrics.
+        let (n, dim, k) = (600usize, 64usize, 10usize);
+        let data = Mat::from_fn(n, dim, |i, j| {
+            let x = ((i * 7919 + j * 104_729) % 1009) as f32 / 1009.0;
+            x + (i % 5) as f32 * 0.5
+        });
+
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let recall = |ex_bits: usize| {
+                let temp_dir = TempDir::new().unwrap();
+                let index = IvfIndexRaBitQ::build_with_vector_store(
+                    data.as_ref(),
+                    metric,
+                    Some(6),
+                    get_default_k_means(),
+                    ex_bits,
+                    42,
+                    Verbosity::Quiet,
+                    temp_dir.path(),
+                    StoreEncoding::Full,
+                )
+                .unwrap();
+
+                let mut hits = 0;
+                for qi in 0..30 {
+                    let query: Vec<f32> = data.row(qi * 17).iter().map(|x| x + 0.01).collect();
+                    let (truth, _) = index
+                        .query_reranking(&query, k, Some(6), Some(n / k))
+                        .unwrap();
+                    let (got, _) = index.query(&query, k, Some(6)).unwrap();
+                    hits += got.iter().filter(|i| truth.contains(i)).count();
+                }
+                hits as f64 / (30 * k) as f64
+            };
+
+            let (one_bit, wide) = (recall(0), recall(6));
+            assert!(wide > one_bit, "{metric:?}: {wide} vs {one_bit}");
+            assert!(wide >= 0.95, "{metric:?}: {wide}");
         }
     }
 }

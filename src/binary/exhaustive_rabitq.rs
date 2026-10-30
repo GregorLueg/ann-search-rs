@@ -83,6 +83,9 @@ where
     /// * `data` - Data matrix (n_samples × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out
+    ///   are re-scored on the wider code
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start and end at `Normal`
     ///
@@ -93,11 +96,12 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("Exhaustive-RaBitQ index", verbosity);
-        let index = Self::with_rotator_kind(data, metric, n_clusters, None, seed);
+        let index = Self::with_rotator_kind(data, metric, n_clusters, ex_bits, None, seed);
         log.finish();
         index
     }
@@ -111,6 +115,9 @@ where
     /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out
+    ///   are re-scored on the wider code
     /// * `seed` - Random seed
     ///
     /// ### Returns
@@ -120,6 +127,7 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        ex_bits: usize,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
@@ -132,6 +140,7 @@ where
             (&vectors_flat[..], n, dim),
             metric,
             n_clusters,
+            ex_bits,
             rotator_kind,
             seed,
         )?;
@@ -150,6 +159,9 @@ where
     /// * `data` - Data matrix (n_samples × dim)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `n_clusters` - Number of clusters. If None, uses 0.5 * sqrt(n)
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out
+    ///   are re-scored on the wider code
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start and end at `Normal`
     /// * `save_path` - Where to save the vector storage
@@ -162,6 +174,7 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        ex_bits: usize,
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
@@ -176,8 +189,13 @@ where
         // copy for cosine; the store needs the raw vectors for exact
         // re-ranking, so `vectors_flat` must stay untouched here.
         let (vectors_flat, n, dim) = data.into_row_major();
-        let quantiser =
-            RaBitQQuantiser::new((&vectors_flat[..], n, dim), metric, n_clusters, seed)?;
+        let quantiser = RaBitQQuantiser::new(
+            (&vectors_flat[..], n, dim),
+            metric,
+            n_clusters,
+            ex_bits,
+            seed,
+        )?;
 
         let norms: Vec<T> = vectors_flat
             .chunks_exact(dim)
@@ -232,12 +250,20 @@ where
             .map(|(_, c_idx)| c_idx)
             .collect();
 
-        let query = self.quantiser.encoder.encode_query(&query_normalised)?;
+        let query = self
+            .quantiser
+            .encoder
+            .encode_query(&query_normalised, self.storage().ex_bits)?;
 
         // The heap ranks on *squared* distance: the square root is monotone, so
         // it only needs applying to the k survivors.
         Ok(self
-            .rabitq_scan(&query, &probed, k, None::<fn(usize) -> T>)
+            .rabitq_scan(
+                &query,
+                &probed,
+                k,
+                Refine::without_store(self.storage().ex_bits),
+            )
             .into_iter()
             .map(|(d, i)| (i, d.0.sqrt()))
             .unzip())
@@ -278,8 +304,10 @@ where
     /// * `k` - Number of neighbours to return
     /// * `n_probe` - Number of clusters to search. If None, searches 25% of the
     ///   centroids.
-    /// * `rerank_factor` - How many more neighbours to rank exactly. Defaults
-    ///   to `20`, i.e., `20 * k` neighbours get re-ranked.
+    /// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+    ///   `None` lets the estimate's error bound pick which candidates need an
+    ///   exact distance, see
+    ///   [`query_reranking_bounded`](Self::query_reranking_bounded).
     ///
     /// ### Returns
     ///
@@ -292,7 +320,9 @@ where
         n_probe: Option<usize>,
         rerank_factor: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
-        let rerank_factor = rerank_factor.unwrap_or(20);
+        let Some(rerank_factor) = rerank_factor else {
+            return self.query_reranking_bounded(query_vec, k, n_probe);
+        };
         let vector_store = self
             .vector_store
             .as_ref()
@@ -377,7 +407,10 @@ where
             .take(n_probe)
             .map(|(_, c_idx)| c_idx)
             .collect();
-        let query = self.quantiser.encoder.encode_query(&query_normalised)?;
+        let query = self
+            .quantiser
+            .encoder
+            .encode_query(&query_normalised, self.storage().ex_bits)?;
 
         // The estimate lives in the normalised space for cosine, where the
         // squared distance is twice the cosine distance.
@@ -391,7 +424,7 @@ where
         };
 
         Ok(self
-            .rabitq_scan(&query, &probed, k, Some(exact))
+            .rabitq_scan(&query, &probed, k, Refine::Exact(exact))
             .into_iter()
             .map(|(d, i)| match metric {
                 Dist::Cosine => (i, d.0 / two),
@@ -410,8 +443,10 @@ where
     /// * `k` - Number of neighbours to return
     /// * `n_probe` - Number of clusters to search. If None, searches 25% of the
     ///   centroids.
-    /// * `rerank_factor` - How many more neighbours to rank exactly. Defaults
-    ///   to `20`, i.e., `20 * k` neighbours get re-ranked.
+    /// * `rerank_factor` - `Some(f)` ranks the `f * k` best estimates exactly.
+    ///   `None` lets the estimate's error bound pick which candidates need an
+    ///   exact distance, see
+    ///   [`query_reranking_bounded`](Self::query_reranking_bounded).
     ///
     /// ### Returns
     ///
@@ -440,7 +475,8 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `n_probe` - Number of clusters to search per query
-    /// * `rerank_factor` - Reranking factor for exact distances
+    /// * `rerank_factor` - Shortlist multiplier for exact distances, `None` for
+    ///   the bound-gated rerank
     /// * `return_dist` - Whether to return distances
     /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
@@ -578,6 +614,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(40),
+            0,
             Some(RotatorKind::FhtKac),
             42,
         )
@@ -608,6 +645,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -625,6 +663,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -644,6 +683,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -664,6 +704,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(5),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -682,6 +723,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -700,6 +742,7 @@ mod tests {
             data.as_ref(),
             &Dist::Cosine,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -719,6 +762,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -739,6 +783,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(5),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -759,6 +804,7 @@ mod tests {
             data.as_ref(),
             &Dist::Cosine,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -788,6 +834,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(10),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -812,6 +859,7 @@ mod tests {
             data.as_ref(),
             &Dist::Cosine,
             Some(5),
+            0,
             42,
             Verbosity::Quiet,
             temp_dir.path(),
@@ -839,6 +887,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(5),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -858,6 +907,7 @@ mod tests {
             data.as_ref(),
             &Dist::SquaredEuclidean,
             Some(5),
+            0,
             42,
             Verbosity::Quiet,
         )
@@ -886,6 +936,7 @@ mod tests {
                 data.as_ref(),
                 &metric,
                 Some(8),
+                0,
                 42,
                 Verbosity::Quiet,
                 temp_dir.path(),

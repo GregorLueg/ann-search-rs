@@ -9,9 +9,12 @@ use rayon::prelude::*;
 use std::iter::Sum;
 
 use crate::binary::dist_binary::*;
-use crate::binary::rabitq::ex_bits::ERROR_EPSILON;
+use crate::binary::rabitq::ex_bits::{
+    const_scaling_factor, encode_ex_bits, excode_bytes, ERROR_EPSILON, MAX_EX_BITS,
+};
 use crate::binary::rabitq::fastscan::{
-    build_sign_lut, pack_rabitq_blocked, unpack_rabitq_blocked, SignScanQuery, BLOCKED_ARCH,
+    build_sign_lut, build_sign_sums, pack_rabitq_blocked, unpack_rabitq_blocked, SignScanQuery,
+    BLOCKED_ARCH,
 };
 use crate::binary::rabitq::rotator::{RaBitQRotator, RotatorKind};
 use crate::binary::turboquant::pack::BlockedCodes;
@@ -24,6 +27,10 @@ use crate::utils::k_means_utils::*;
 
 /// Number of iterations for RaBitQ k-means clustering.
 const RABITQ_K_MEANS_ITER: usize = 30;
+
+/// Seed for the averaged magnitude scale. The scale is a mean over random
+/// directions, so the seed only fixes it for reproducibility.
+const T_CONST_SEED: u64 = 42;
 
 ///////////////////
 // RaBitQEncoder //
@@ -212,17 +219,32 @@ where
     ///
     /// * `query` - Query vector, already passed through
     ///   [`normalise_query`](Self::normalise_query)
+    /// * `ex_bits` - Magnitude bits of the index the query is for. Above zero
+    ///   the exact sign sums of the full-width estimate are built too.
     ///
     /// ### Returns
     ///
     /// The prepared query, or an error on a dimension mismatch
     #[inline]
-    pub fn encode_query(&self, query: &[T]) -> Result<SignScanQuery<T>, AnnSearchErrors> {
+    pub fn encode_query(
+        &self,
+        query: &[T],
+        ex_bits: usize,
+    ) -> Result<SignScanQuery<T>, AnnSearchErrors>
+    where
+        T: AnnSearchFloat,
+    {
         self.check_dim(query.len())?;
 
         let rotated = self.apply_rotation(query);
         Ok(SignScanQuery {
             lut: build_sign_lut(&rotated)?,
+            sum: rotated.iter().fold(T::zero(), |a, &b| a + b),
+            sign_sums: if ex_bits > 0 {
+                build_sign_sums(&rotated)
+            } else {
+                Vec::new()
+            },
             rotated,
         })
     }
@@ -386,6 +408,15 @@ pub struct RaBitQStorage<T> {
     pub padded_dim: usize,
     /// Number of bytes
     pub n_bytes: usize,
+    /// Magnitude bits per coordinate on top of the sign, 0 for plain one-bit
+    pub ex_bits: usize,
+    /// Packed magnitude levels in cluster order, `n * ex_bytes`, empty at
+    /// `ex_bits` 0. Read one vector at a time, only for candidates the
+    /// one-bit bound cannot rule out, so row-major rather than blocked.
+    pub ex_codes: Vec<u8>,
+    /// `(f_add, f_rescale)` of the full-width estimate per vector in cluster
+    /// order, interleaved; empty at `ex_bits` 0
+    pub ex_factors: Vec<T>,
 }
 
 impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
@@ -416,6 +447,9 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
             dim,
             padded_dim,
             n_bytes,
+            ex_bits: 0,
+            ex_codes: Vec::new(),
+            ex_factors: Vec::new(),
         }
     }
 
@@ -572,6 +606,8 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
             + self.packed_vectors.capacity() * std::mem::size_of::<RaBitQPackedVector<T>>()
             + self.vector_indices.capacity() * std::mem::size_of::<u32>()
             + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.ex_codes.capacity()
+            + self.ex_factors.capacity() * std::mem::size_of::<T>()
     }
 }
 
@@ -586,10 +622,13 @@ impl<T: Float + FromPrimitive + Clone> RaBitQStorage<T> {
 /// * `nlist` - Number of centroids generated
 /// * `assignments` - Assignment of vector to cluster
 /// * `encoder` - The RaBitQEncoder
+/// * `ex_bits` - Magnitude bits per coordinate, `0..=MAX_EX_BITS`. Zero keeps
+///   the plain one-bit code
 ///
 /// ### Returns
 ///
-/// The RaBitQStorage
+/// The RaBitQStorage, or an error when `ex_bits` is out of range
+#[allow(clippy::too_many_arguments)]
 pub fn build_rabitq_storage<T>(
     data: &[T],
     dim: usize,
@@ -598,10 +637,18 @@ pub fn build_rabitq_storage<T>(
     nlist: usize,
     assignments: &[u32],
     encoder: &RaBitQEncoder<T>,
+    ex_bits: usize,
 ) -> Result<RaBitQStorage<T>, AnnSearchErrors>
 where
-    T: Float + FromPrimitive + ToPrimitive + ComplexField + Sum + SimdDistance + Send + Sync,
+    T: AnnSearchFloat,
 {
+    if ex_bits > MAX_EX_BITS {
+        return Err(AnnSearchErrors::RaBitQInvalidExBits {
+            ex_bits,
+            max: MAX_EX_BITS,
+        });
+    }
+
     let padded_dim = encoder.padded_dim;
     let n_bytes = encoder.n_bytes;
 
@@ -651,6 +698,9 @@ where
         dim,
         padded_dim,
         n_bytes,
+        ex_bits,
+        ex_codes: Vec::new(),
+        ex_factors: Vec::new(),
     };
 
     // Row-major codes live only until they are blocked, which is why they are
@@ -664,28 +714,66 @@ where
         insert_pos[cluster_idx] += 1;
     }
 
+    // At `ex_bits` 0 an empty buffer yields no chunks and the zip below would
+    // encode nothing, so keep a one-byte placeholder stride and drop it after.
+    let ex_bytes = excode_bytes(padded_dim, ex_bits);
+    let ex_stride = ex_bytes.max(1);
+    let mut ex_codes = vec![0u8; n * ex_stride];
+    let mut ex_factors = vec![T::zero(); n * 2];
+
+    // One averaged scale instead of a sweep per vector, as the reference's
+    // IVF does. The exact sweep's cost grows with the width.
+    let t_const = (ex_bits > 0).then(|| const_scaling_factor(padded_dim, ex_bits, T_CONST_SEED));
+
     let centroids_rotated = &storage.centroids_rotated;
     let vector_indices = &storage.vector_indices;
     codes_flat
         .par_chunks_mut(n_bytes)
         .zip(storage.packed_vectors.par_iter_mut())
+        .zip(ex_codes.par_chunks_mut(ex_stride))
+        .zip(ex_factors.par_chunks_mut(2))
         .enumerate()
-        .try_for_each(|(pos, (code, packed))| -> Result<(), AnnSearchErrors> {
-            let vec_idx = vector_indices[pos] as usize;
-            let c = assignments[vec_idx] as usize;
-            let (binary, dist, dot_corr) = encoder.encode_vector(
-                &data[vec_idx * dim..(vec_idx + 1) * dim],
-                &centroids[c * dim..(c + 1) * dim],
-            )?;
-            *packed = RaBitQPackedVector::from_code(
-                &binary,
-                dist,
-                dot_corr,
-                &centroids_rotated[c * padded_dim..(c + 1) * padded_dim],
-            );
-            code.copy_from_slice(&binary);
-            Ok(())
-        })?;
+        .try_for_each(
+            |(pos, (((code, packed), ex_code), ex_factor))| -> Result<(), AnnSearchErrors> {
+                let vec_idx = vector_indices[pos] as usize;
+                let c = assignments[vec_idx] as usize;
+                let c_rot = &centroids_rotated[c * padded_dim..(c + 1) * padded_dim];
+
+                // Rotate the vector, not the residual: the rotation is linear,
+                // and both codes then read their signs off one residual array,
+                // so they cannot disagree on a coordinate.
+                let rotated = encoder.apply_rotation(&data[vec_idx * dim..(vec_idx + 1) * dim]);
+                let residual = T::subtract_simd(&rotated, c_rot);
+
+                let dist = compute_l2_norm(&residual);
+                let l1 = compute_l1_norm(&residual);
+                let dot_correction_inv = if l1 > T::from_f32(1e-6).unwrap() * dist {
+                    dist / l1
+                } else {
+                    T::zero()
+                };
+                for (d, &r) in residual.iter().enumerate() {
+                    if r > T::zero() {
+                        code[d / 8] |= 1u8 << (d % 8);
+                    }
+                }
+                *packed = RaBitQPackedVector::from_code(code, dist, dot_correction_inv, c_rot);
+
+                if ex_bits > 0 {
+                    let encoded = encode_ex_bits(&rotated, c_rot, ex_bits, t_const)?;
+                    debug_assert_eq!(encoded.sign_code.as_slice(), &*code);
+                    ex_code.copy_from_slice(&encoded.ex_code);
+                    ex_factor[0] = encoded.f_add;
+                    ex_factor[1] = encoded.f_rescale;
+                }
+                Ok(())
+            },
+        )?;
+
+    if ex_bits > 0 {
+        storage.ex_codes = ex_codes;
+        storage.ex_factors = ex_factors;
+    }
 
     storage.blocked = (0..nlist)
         .map(|c| {
@@ -726,6 +814,9 @@ where
     /// * `metric` - Which distance metric to use
     /// * `n_clusters` - Optional number of centroids. If not provided, defaults
     ///   to `0.5 * sqrt(n)`.
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out
+    ///   are re-scored on the wider code
     /// * `seed` - Seed for reproducibility
     ///
     /// ### Returns
@@ -735,9 +826,10 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        ex_bits: usize,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
-        Self::with_rotator_kind(data, metric, n_clusters, None, seed)
+        Self::with_rotator_kind(data, metric, n_clusters, ex_bits, None, seed)
     }
 
     /// Create a new RaBitQ quantiser with an explicitly chosen rotation
@@ -748,6 +840,9 @@ where
     /// * `metric` - Which distance metric to use
     /// * `n_clusters` - Optional number of centroids. If not provided, defaults
     ///   to `0.5 * sqrt(n)`.
+    /// * `ex_bits` - Magnitude bits per coordinate on top of the sign,
+    ///   `0..=8`. Above zero, candidates the one-bit bound cannot rule out
+    ///   are re-scored on the wider code
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let
     ///   [`resolve_rotator_kind`](crate::binary::rabitq::rotator::resolve_rotator_kind)
     ///   decide
@@ -760,6 +855,7 @@ where
         data: impl AnnMatrix<T>,
         metric: &Dist,
         n_clusters: Option<usize>,
+        ex_bits: usize,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
     ) -> Result<Self, AnnSearchErrors> {
@@ -846,6 +942,7 @@ where
             k,
             &assignments,
             &encoder,
+            ex_bits,
         )?;
 
         Ok(Self { encoder, storage })
@@ -958,7 +1055,8 @@ mod tests {
     #[test]
     fn test_stored_rotated_centroids_match_the_encoder() {
         let data = rotation_test_data(200, 32);
-        let q = RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(6), 42).unwrap();
+        let q =
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(6), 0, 42).unwrap();
 
         for c in 0..q.storage.nlist {
             let expected = q.encoder.apply_rotation(q.storage.centroid(c));
@@ -1043,7 +1141,7 @@ mod tests {
         let encoder = RaBitQEncoder::<f32>::new(8, Dist::SquaredEuclidean, 42);
         let query = vec![1.0; 8];
 
-        let encoded = encoder.encode_query(&query).unwrap();
+        let encoded = encoder.encode_query(&query, 0).unwrap();
 
         assert_eq!(encoded.lut.n_byte_groups, encoder.n_bytes);
         assert_eq!(encoded.lut.luts_u8.len(), encoder.n_bytes * 32);
@@ -1054,7 +1152,7 @@ mod tests {
         let encoder = RaBitQEncoder::<f32>::new(4, Dist::Cosine, 42);
         let normalised = encoder.normalise_query(&[2.0, 0.0, 0.0, 0.0]);
 
-        let encoded = encoder.encode_query(&normalised).unwrap();
+        let encoded = encoder.encode_query(&normalised, 0).unwrap();
 
         // Unit length in, unit length out: the rotation is orthogonal.
         let norm = encoded.rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1083,7 +1181,8 @@ mod tests {
         let encoder = RaBitQEncoder::new(dim, Dist::SquaredEuclidean, 42);
 
         let storage =
-            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder).unwrap();
+            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder, 0)
+                .unwrap();
 
         assert_eq!(storage.nlist, 2);
         assert_eq!(storage.n_vectors(), 6);
@@ -1105,7 +1204,8 @@ mod tests {
         let encoder = RaBitQEncoder::new(dim, Dist::SquaredEuclidean, 42);
 
         let storage =
-            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder).unwrap();
+            build_rabitq_storage(&data, dim, n, &centroids, nlist, &assignments, &encoder, 0)
+                .unwrap();
 
         let centroid_0 = storage.centroid(0);
         assert_eq!(centroid_0.len(), dim);
@@ -1135,7 +1235,7 @@ mod tests {
         let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
 
         let quantiser =
-            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, Some(2), 42).unwrap();
+            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, Some(2), 0, 42).unwrap();
 
         assert_eq!(quantiser.n_clusters(), 2);
         assert_eq!(quantiser.n_vectors(), 6);
@@ -1147,7 +1247,7 @@ mod tests {
         let data = sample_data_2d();
         let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
 
-        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Cosine, Some(2), 42).unwrap();
+        let quantiser = RaBitQQuantiser::new(mat.as_ref(), &Dist::Cosine, Some(2), 0, 42).unwrap();
 
         assert_eq!(quantiser.n_clusters(), 2);
         assert_eq!(quantiser.encoder.metric, Dist::Cosine);
@@ -1158,10 +1258,10 @@ mod tests {
         let data = sample_data_2d();
         let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
         let quantiser =
-            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, Some(2), 42).unwrap();
+            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, Some(2), 0, 42).unwrap();
 
         let query = vec![0.8, 0.2];
-        let encoded = quantiser.encoder.encode_query(&query).unwrap();
+        let encoded = quantiser.encoder.encode_query(&query, 0).unwrap();
 
         assert_eq!(encoded.lut.n_byte_groups, quantiser.encoder.n_bytes);
         assert_eq!(encoded.rotated.len(), quantiser.encoder.padded_dim);
@@ -1173,7 +1273,7 @@ mod tests {
         let mat = Mat::from_fn(6, 2, |i, j| data[i * 2 + j]);
 
         let quantiser =
-            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, None, 42).unwrap();
+            RaBitQQuantiser::new(mat.as_ref(), &Dist::SquaredEuclidean, None, 0, 42).unwrap();
 
         // Should default to 0.5 * sqrt(6) ≈ 1.22, ceiled and clamped
         assert!(quantiser.n_clusters() >= 1);

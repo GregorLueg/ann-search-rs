@@ -898,6 +898,7 @@ mod tests {
             |m| build_exhaustive_index_rabitq(
                 m,
                 Some(NLIST),
+                0,
                 "euclidean",
                 1,
                 false,
@@ -933,6 +934,7 @@ mod tests {
                 m,
                 Some(NLIST),
                 None,
+                0,
                 "euclidean",
                 1,
                 false,
@@ -1221,6 +1223,7 @@ mod tests {
             |m, p| build_exhaustive_index_rabitq(
                 m,
                 Some(NLIST),
+                0,
                 "euclidean",
                 1,
                 true,
@@ -1248,6 +1251,7 @@ mod tests {
                 m,
                 Some(NLIST),
                 None,
+                0,
                 "euclidean",
                 1,
                 true,

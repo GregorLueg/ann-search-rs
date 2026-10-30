@@ -793,6 +793,7 @@ fn exhaustive_rabitq_cosine_is_non_negative() {
     let index = build_exhaustive_index_rabitq(
         (&data[..], n, dim),
         None,
+        0,
         "cosine",
         42,
         true,
@@ -831,6 +832,7 @@ fn ivf_rabitq_cosine_is_non_negative() {
         (&data[..], n, dim),
         Some(16),
         None,
+        0,
         "cosine",
         42,
         true,

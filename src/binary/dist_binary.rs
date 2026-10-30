@@ -5,9 +5,10 @@
 use num_traits::{Float, FromPrimitive};
 use std::collections::BinaryHeap;
 
+use crate::binary::rabitq::ex_bits::{ex_inner_product, excode_bytes};
 #[cfg(test)]
 use crate::binary::rabitq::fastscan::unpack_rabitq_blocked;
-use crate::binary::rabitq::fastscan::{score_sign_block, SignScanQuery};
+use crate::binary::rabitq::fastscan::{blocked_sign_ip, score_sign_block, SignScanQuery};
 use crate::binary::rabitq::*;
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -767,22 +768,85 @@ where
         (min_est, min_low)
     }
 
+    /// Full-width estimate for one vector, reusing its one-bit inner product
+    ///
+    /// The reference's `split_distance_boosting`, with one change: the sign
+    /// product is recomputed exactly rather than reused from the fast-scan
+    /// lane. It is scaled by `2^ex_bits` here, so the byte-rounded lane caps
+    /// recall once the magnitude code is finer than the table (the reference
+    /// switches to a 16-bit table for the same reason).
+    ///
+    /// ```text
+    /// est = f_add + g_add + f_rescale * (2^ex * <q, s01> + <q, ex> + cb * sum(q))
+    /// ```
+    ///
+    /// with `cb = -(2^ex - 1/2)`.
+    ///
+    /// ### Params
+    ///
+    /// * `query` - The prepared query, with its sign sums
+    /// * `cluster_idx` - The vector's cluster
+    /// * `local` - The vector's index within the cluster
+    /// * `g_add` - `||q - c||^2` for its cluster
+    ///
+    /// ### Returns
+    ///
+    /// The estimated squared distance
+    #[inline]
+    fn rabitq_estimate_ex(
+        &self,
+        query: &SignScanQuery<T>,
+        cluster_idx: usize,
+        local: usize,
+        g_add: T,
+    ) -> T
+    where
+        T: AnnSearchFloat,
+    {
+        let storage = self.storage();
+        let pos = storage.offsets[cluster_idx] as usize + local;
+        let w = storage.ex_bits;
+        let ex_bytes = excode_bytes(storage.padded_dim, w);
+        let ip_ex = ex_inner_product(
+            &query.rotated,
+            &storage.ex_codes[pos * ex_bytes..(pos + 1) * ex_bytes],
+            w,
+        );
+
+        let half = T::from_f64(0.5).unwrap();
+        let step = T::from_u64(1u64 << w).unwrap();
+        let ip_s01 = blocked_sign_ip(
+            &query.sign_sums,
+            &storage.cluster_blocked(cluster_idx).data,
+            storage.n_bytes,
+            local,
+        );
+        let cb = half - step;
+        let (f_add, f_rescale) = (storage.ex_factors[2 * pos], storage.ex_factors[2 * pos + 1]);
+
+        (f_add + g_add + f_rescale * (step * ip_s01 + ip_ex + cb * query.sum)).max(T::zero())
+    }
+
     /// Scan the probed clusters and keep the `k` best
     ///
-    /// Without `exact` the heap ranks on the estimates. With it, the
-    /// reference's one-stage rerank: a candidate whose lower bound beats the
-    /// current `k`-th distance gets an exact distance and enters the heap on
-    /// that, everything else is dropped unscored. The bound is probabilistic,
-    /// so this can miss a neighbour a fixed shortlist would have caught, but it
-    /// pays for exact distances only where the estimate is ambiguous.
+    /// The reference's one-stage search. Every lane gets a one-bit estimate
+    /// and a lower bound. What happens next depends on `refine`:
+    ///
+    /// - [`Refine::Estimate`]: the heap ranks on the one-bit estimates.
+    /// - [`Refine::ExBits`]: a lane whose bound beats the current `k`-th
+    ///   distance is re-scored on the full-width code.
+    /// - [`Refine::Exact`]: the same gate, but the lane gets an exact distance.
+    ///
+    /// The bound is probabilistic, so a gated scan can miss a neighbour a fixed
+    /// shortlist would have caught, but it pays for refinement only where the
+    /// one-bit estimate is ambiguous.
     ///
     /// ### Params
     ///
     /// * `query` - The prepared query
     /// * `probed` - Clusters to scan
     /// * `k` - Number of neighbours to keep
-    /// * `exact` - Exact squared distance (in the estimate's space) by
-    ///   original index, or `None` to rank on the estimates
+    /// * `refine` - What a lane that passes the bound gets
     ///
     /// ### Returns
     ///
@@ -792,13 +856,15 @@ where
         query: &SignScanQuery<T>,
         probed: &[usize],
         k: usize,
-        mut exact: Option<F>,
+        mut refine: Refine<F>,
     ) -> Vec<(OrderedFloat<T>, usize)>
     where
-        T: SimdDistance,
+        T: AnnSearchFloat,
         F: FnMut(usize) -> T,
     {
         let storage = self.storage();
+        debug_assert!(!matches!(refine, Refine::ExBits) || storage.ex_bits > 0);
+
         let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
         let mut est = [T::zero(); RABITQ_BLOCK];
         let mut low = [T::zero(); RABITQ_BLOCK];
@@ -830,32 +896,29 @@ where
                     &mut low[..take],
                 );
 
-                match exact.as_mut() {
-                    None if min_est < top(&heap) => {
-                        for j in 0..take {
-                            if est[j] < top(&heap) {
-                                if heap.len() == k {
-                                    heap.pop();
-                                }
-                                heap.push((OrderedFloat(est[j]), indices[local_idx + j] as usize));
+                let gate = if matches!(refine, Refine::Estimate) {
+                    min_est
+                } else {
+                    min_low
+                };
+                if gate < top(&heap) {
+                    for j in 0..take {
+                        let idx = indices[local_idx + j] as usize;
+                        let d = match &mut refine {
+                            Refine::Estimate => est[j],
+                            _ if low[j] >= top(&heap) => continue,
+                            Refine::ExBits => {
+                                self.rabitq_estimate_ex(query, c_idx, local_idx + j, g_add)
                             }
+                            Refine::Exact(exact) => exact(idx),
+                        };
+                        if d < top(&heap) {
+                            if heap.len() == k {
+                                heap.pop();
+                            }
+                            heap.push((OrderedFloat(d), idx));
                         }
                     }
-                    Some(exact) if min_low < top(&heap) => {
-                        for j in 0..take {
-                            if low[j] < top(&heap) {
-                                let idx = indices[local_idx + j] as usize;
-                                let d = exact(idx);
-                                if d < top(&heap) {
-                                    if heap.len() == k {
-                                        heap.pop();
-                                    }
-                                    heap.push((OrderedFloat(d), idx));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
 
                 local_idx += take;
@@ -863,6 +926,38 @@ where
         }
 
         heap.into_sorted_vec()
+    }
+}
+
+/// What [`VectorDistanceRaBitQ::rabitq_scan`] does with a candidate whose
+/// lower bound beats the current `k`-th distance.
+pub enum Refine<F> {
+    /// Nothing: rank every lane on its one-bit estimate
+    Estimate,
+    /// Re-score on the stored full-width code, see
+    /// [`VectorDistanceRaBitQ::rabitq_estimate_ex`]
+    ExBits,
+    /// Exact squared distance (in the estimate's space) by original index
+    Exact(F),
+}
+
+impl<T> Refine<fn(usize) -> T> {
+    /// The refinement a store-free query gets
+    ///
+    /// ### Params
+    ///
+    /// * `ex_bits` - Magnitude bits the index was built with
+    ///
+    /// ### Returns
+    ///
+    /// [`Refine::ExBits`] when there is a wider code, [`Refine::Estimate`]
+    /// otherwise
+    pub fn without_store(ex_bits: usize) -> Self {
+        if ex_bits > 0 {
+            Refine::ExBits
+        } else {
+            Refine::Estimate
+        }
     }
 }
 
@@ -1078,7 +1173,7 @@ mod tests {
     fn test_rabitq_trait_dim() {
         let data = create_test_data::<f32>(50, 32);
         let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 0, 42).unwrap();
 
         assert_eq!(quantiser.dim(), 32);
     }
@@ -1087,7 +1182,7 @@ mod tests {
     fn test_rabitq_trait_n_bytes() {
         let data = create_test_data::<f32>(50, 32);
         let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 42).unwrap();
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(5), 0, 42).unwrap();
 
         assert_eq!(quantiser.n_bytes(), 4);
     }
@@ -1195,10 +1290,10 @@ mod tests {
     fn test_rabitq_block_is_non_negative_and_deterministic() {
         for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
             let data = create_test_data::<f32>(100, 32);
-            let quantiser = RaBitQQuantiser::new(data.as_ref(), &metric, Some(10), 42).unwrap();
+            let quantiser = RaBitQQuantiser::new(data.as_ref(), &metric, Some(10), 0, 42).unwrap();
             let query = quantiser
                 .encoder
-                .encode_query(&quantiser.encoder.normalise_query(&[1.0f32; 32]))
+                .encode_query(&quantiser.encoder.normalise_query(&[1.0f32; 32]), 0)
                 .unwrap();
 
             for c_idx in 0..quantiser.storage().nlist {
@@ -1220,10 +1315,10 @@ mod tests {
         let (n, dim) = (200usize, 64usize);
         let data = clustered_data(n, dim);
         let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 0, 42).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
-        let prepared = quantiser.encoder.encode_query(&query).unwrap();
+        let prepared = quantiser.encoder.encode_query(&query, 0).unwrap();
 
         for c_idx in 0..quantiser.storage().nlist {
             let (est, _) = score_cluster(&quantiser, &prepared, c_idx);
@@ -1290,11 +1385,11 @@ mod tests {
         let (n, dim) = (400usize, 128usize);
         let data = clustered_data(n, dim);
         let quantiser =
-            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 42).unwrap();
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(4), 0, 42).unwrap();
         let storage = quantiser.storage();
 
         let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 4.0).collect();
-        let prepared = quantiser.encoder.encode_query(&query).unwrap();
+        let prepared = quantiser.encoder.encode_query(&query, 0).unwrap();
 
         let (mut held, mut total) = (0usize, 0usize);
         for c_idx in 0..storage.nlist {
@@ -1312,6 +1407,60 @@ mod tests {
             }
         }
         assert!(held as f64 >= 0.95 * total as f64, "{held} / {total}");
+    }
+
+    #[test]
+    fn test_split_ex_estimate_matches_the_full_code_estimate() {
+        // `rabitq_estimate_ex` reads the sign half out of the blocked layout
+        // and the magnitude half from `ex_codes`; reassembled into one
+        // `ExEncoding`, the reference-validated `estimate_ex` must agree.
+        use crate::binary::rabitq::ex_bits::{estimate_ex, excode_bytes, ExEncoding};
+
+        let (n, dim, ex_bits) = (150usize, 64usize, 4usize);
+        let data = clustered_data(n, dim);
+        let quantiser =
+            RaBitQQuantiser::new(data.as_ref(), &Dist::SquaredEuclidean, Some(3), ex_bits, 42)
+                .unwrap();
+        let storage = quantiser.storage();
+        let ex_bytes = excode_bytes(storage.padded_dim, ex_bits);
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.23).cos() * 2.0).collect();
+        let prepared = quantiser.encoder.encode_query(&query, ex_bits).unwrap();
+
+        for c_idx in 0..storage.nlist {
+            let c_rot = storage.centroid_rotated(c_idx);
+            let g_add: f32 = prepared
+                .rotated
+                .iter()
+                .zip(c_rot)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            let size = storage.cluster_size(c_idx);
+            let codes = unpack_rabitq_blocked(
+                &storage.cluster_blocked(c_idx).data,
+                size,
+                storage.n_bytes,
+                storage.blocked_arch,
+            );
+
+            for local in 0..size {
+                let pos = storage.offsets[c_idx] as usize + local;
+                let encoding = ExEncoding {
+                    sign_code: codes[local * storage.n_bytes..(local + 1) * storage.n_bytes]
+                        .to_vec(),
+                    ex_code: storage.ex_codes[pos * ex_bytes..(pos + 1) * ex_bytes].to_vec(),
+                    f_add: storage.ex_factors[2 * pos],
+                    f_rescale: storage.ex_factors[2 * pos + 1],
+                    f_error: 0.0,
+                };
+                approx::assert_relative_eq!(
+                    quantiser.rabitq_estimate_ex(&prepared, c_idx, local, g_add),
+                    estimate_ex(&encoding, &prepared.rotated, g_add, ex_bits).max(0.0),
+                    max_relative = 1e-4,
+                    epsilon = 1e-3
+                );
+            }
+        }
     }
 
     /////////////////////

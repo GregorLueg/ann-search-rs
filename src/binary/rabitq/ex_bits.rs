@@ -14,6 +14,9 @@
 //! High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor
 //! Search", SIGMOD 2025.
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -233,7 +236,10 @@ pub fn best_rescale_factor(abs_residual: &[f64], ex_bits: usize) -> f64 {
 ///
 /// [`best_rescale_factor`] costs a heap sweep per vector. For a large build the
 /// reference instead averages the scale over a sample of random directions once
-/// and reuses it, which is what [`quantise_ex`] takes as `t_const`.
+/// and reuses it, which is what [`quantise_ex`] takes as `t_const`. The probes
+/// are Gaussian, as in the reference: a randomly rotated residual looks like a
+/// Gaussian direction, and a uniform-on-the-cube probe has lighter tails and
+/// settles on a different scale.
 ///
 /// ### Params
 ///
@@ -245,20 +251,13 @@ pub fn best_rescale_factor(abs_residual: &[f64], ex_bits: usize) -> f64 {
 ///
 /// The averaged scale
 pub fn const_scaling_factor(dim: usize, ex_bits: usize, seed: u64) -> f64 {
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
-    };
-
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut total = 0.0f64;
     let mut probe = vec![0.0f64; dim];
 
     for _ in 0..CONST_SCALE_PROBES {
         for value in probe.iter_mut() {
-            *value = next();
+            *value = rng.sample(StandardNormal);
         }
         let norm = probe.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {
@@ -318,6 +317,44 @@ pub fn quantise_ex(abs_residual: &[f64], ex_bits: usize, t_const: Option<f64>) -
     } else {
         (levels, 1.0)
     }
+}
+
+/// Coordinates per byte-aligned group of packed magnitude levels.
+const CODE_GROUP: usize = 8;
+
+/// Inner product of a query with one vector's packed magnitude levels.
+///
+/// Reads the packed code in place; allocating a level buffer per vector would
+/// dominate a scan that is otherwise a handful of adds. Eight levels of `w`
+/// bits are exactly `w` whole bytes, so every group is byte-aligned and fits
+/// one u64 at any width up to [`MAX_EX_BITS`].
+///
+/// ### Params
+///
+/// * `query` - Rotated query, length a multiple of 8
+/// * `ex_code` - The vector's packed levels, see [`pack_excode`]
+/// * `ex_bits` - Magnitude bits per coordinate, `1..=MAX_EX_BITS`
+///
+/// ### Returns
+///
+/// `<q, levels>`
+#[inline]
+pub fn ex_inner_product<T: AnnSearchFloat>(query: &[T], ex_code: &[u8], ex_bits: usize) -> T {
+    let w = ex_bits;
+    let mask = (1u64 << w) - 1;
+
+    // One accumulator per lane so the adds do not form one serial chain.
+    let mut acc = [T::zero(); CODE_GROUP];
+    for (q, bytes) in query.chunks_exact(CODE_GROUP).zip(ex_code.chunks_exact(w)) {
+        let mut buf = [0u8; CODE_GROUP];
+        buf[..w].copy_from_slice(bytes);
+        let word = u64::from_le_bytes(buf);
+        for j in 0..CODE_GROUP {
+            let level = (word >> (j * w)) & mask;
+            acc[j] += q[j] * T::from_u64(level).unwrap_or_else(T::zero);
+        }
+    }
+    acc.iter().fold(T::zero(), |a, &b| a + b)
 }
 
 /////////////
