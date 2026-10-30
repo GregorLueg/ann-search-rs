@@ -78,7 +78,9 @@ fn main() {
 
     // RaBitQ exhaustive benchmark with reranking
     let temp_dir = TempDir::new().unwrap();
-    let rerank_factors = [5, 10, 20];
+    // `None` is the bound-gated rerank: exact distances only where the
+    // estimate's error bound cannot rule a candidate out.
+    let rerank_factors = [Some(5), Some(10), Some(20), None];
 
     println!("Building RaBitQ exhaustive index with reranking...");
     let start = Instant::now();
@@ -136,7 +138,7 @@ fn main() {
     for &rerank_factor in &rerank_factors {
         println!(
             "Querying RaBitQ exhaustive index (rerank_factor={})...",
-            rerank_factor
+            rf_label(rerank_factor)
         );
         let start = Instant::now();
         let (rabitq_neighbors, _) = query_exhaustive_index_rabitq(
@@ -145,7 +147,7 @@ fn main() {
             cli.k,
             None,
             true,
-            Some(rerank_factor),
+            rerank_factor,
             false,
             Verbosity::Quiet,
         )
@@ -165,7 +167,7 @@ fn main() {
         );
 
         results.push(BenchmarkResultSize {
-            method: format!("ExhaustiveRaBitQ-rf{} (query)", rerank_factor),
+            method: format!("ExhaustiveRaBitQ-rf{} (query)", rf_label(rerank_factor)),
             build_time_ms: build_time,
             query_time_ms: query_time,
             total_time_ms: build_time + query_time,
@@ -220,7 +222,7 @@ fn main() {
         (cli.n_samples as f32 * 2.0).sqrt() as usize,
     ];
 
-    let rerank_factors = [10, 20];
+    let rerank_factors = [Some(10), Some(20), None];
 
     for nlist in nlist_values {
         let temp_dir = TempDir::new().unwrap();
@@ -311,7 +313,9 @@ fn main() {
             for &rerank_factor in &rerank_factors {
                 println!(
                     "Querying IVF-RaBitQ index (nlist={}, nprobe={}, rerank_factor={})...",
-                    nlist, nprobe, rerank_factor
+                    nlist,
+                    nprobe,
+                    rf_label(rerank_factor)
                 );
                 let start = Instant::now();
                 let (approx_neighbors, _) = query_ivf_index_rabitq(
@@ -320,7 +324,7 @@ fn main() {
                     cli.k,
                     Some(*nprobe),
                     true,
-                    Some(rerank_factor),
+                    rerank_factor,
                     false,
                     Verbosity::Quiet,
                 )
@@ -342,7 +346,9 @@ fn main() {
                 results.push(BenchmarkResultSize {
                     method: format!(
                         "IVF-RaBitQ-nl{}-np{}-rf{} (query)",
-                        nlist, nprobe, rerank_factor
+                        nlist,
+                        nprobe,
+                        rf_label(rerank_factor)
                     ),
                     build_time_ms: build_time,
                     query_time_ms: query_time,
@@ -358,7 +364,7 @@ fn main() {
         // Self-query benchmark with reranking
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
         println!(
-            "Self-querying IVF-RaBitQ index (nprobe={}, rerank_factor=20)...",
+            "Self-querying IVF-RaBitQ index (nprobe={}, bound-gated rerank)...",
             nprobe_self
         );
         let start = Instant::now();
@@ -397,6 +403,79 @@ fn main() {
         });
     }
 
+    // Store-free multi-bit codes: candidates the one-bit bound cannot rule
+    // out are re-scored on the wider code instead of read from disk.
+    let nlist = (cli.n_samples as f32).sqrt() as usize;
+    for ex_bits in [2, 4, 8] {
+        println!(
+            "Building IVF-RaBitQ index (nlist={}, ex_bits={})...",
+            nlist, ex_bits
+        );
+        let start = Instant::now();
+        let ivf_rabitq_idx = build_ivf_index_rabitq(
+            data.as_ref(),
+            Some(nlist),
+            None,
+            ex_bits,
+            &cli.distance,
+            cli.seed as usize,
+            false,
+            None::<&std::path::Path>,
+            StoreEncoding::Full,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let build_time = start.elapsed().as_secs_f64() * 1000.0;
+        let index_size_mb = ivf_rabitq_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
+
+        for nprobe in [
+            (nlist as f32).sqrt() as usize,
+            (nlist as f32 * 2.0).sqrt() as usize,
+        ] {
+            if nprobe == 0 {
+                continue;
+            }
+            println!(
+                "Querying IVF-RaBitQ index (nlist={}, ex_bits={}, nprobe={})...",
+                nlist, ex_bits, nprobe
+            );
+            let start = Instant::now();
+            let (approx_neighbors, _) = query_ivf_index_rabitq(
+                query_data.as_ref(),
+                &ivf_rabitq_idx,
+                cli.k,
+                Some(nprobe),
+                false,
+                None,
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            let query_time = start.elapsed().as_secs_f64() * 1000.0;
+            let approx_dists =
+                exact_distances(&data, &query_data, &approx_neighbors, &cli.distance);
+
+            results.push(BenchmarkResultSize {
+                method: format!("IVF-RaBitQ-nl{}-ex{}-np{} (query)", nlist, ex_bits, nprobe),
+                build_time_ms: build_time,
+                query_time_ms: query_time,
+                total_time_ms: build_time + query_time,
+                recall_at_k: calculate_recall(&true_neighbors, &approx_neighbors, cli.k),
+                mean_dist_rat: calculate_mean_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &approx_dists,
+                    cli.k,
+                ),
+                median_dist_rat: calculate_median_distance_ratio(
+                    true_distances.as_ref().unwrap(),
+                    &approx_dists,
+                    cli.k,
+                ),
+                index_size_mb,
+            });
+        }
+    }
+
     print_results_size(
         &format!(
             "{}k samples, {}D - RaBitQ (IVF and exhaustive)",
@@ -405,4 +484,10 @@ fn main() {
         ),
         &results,
     );
+}
+
+/// Label for a rerank factor in the results table, `B` for the bound-gated
+/// rerank.
+fn rf_label(rerank_factor: Option<usize>) -> String {
+    rerank_factor.map_or("B".to_string(), |f| f.to_string())
 }
