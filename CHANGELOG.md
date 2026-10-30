@@ -3,6 +3,64 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.12.0
+
+**Features**
+
+- `build_knn_graph_nndescent()`: matrix in, kNN graph out, on the CPU. Nothing
+  else is kept. The seeding trees are built in batches of one per thread, joined
+  and dropped, so the full forest never sits in memory. With the same seed and
+  tree count it returns the same graph as `extract_knn` on an NN-Descent index.
+  Takes `NNDescentKnnParams` (`k`, iterations, candidates, trees, `delta`,
+  `include_self`, `return_dist`).
+- `build_knn_graph_nndescent_gpu()`: the same on the GPU, through the
+  clustered build, so datasets past the per-binding limit work too. Takes
+  `NNDescentGpuKnnParams`.
+- Both return a flat `KnnGraph<T>`: `n * k` `u32` ids, optional distances,
+  rows sorted ascending, `KNN_GRAPH_EMPTY` for unfilled slots. `include_self`
+  puts each point first in its own row at distance zero, as UMAP expects.
+- Manhattan NN-Descent seeds by Kd-tree leaf join as well, instead of one
+  forest query per point. Recall@15 at 200k x 32 goes from 0.960 to 0.970.
+
+**Memory**
+
+- Annoy and Kd forests build in place: one `u32` permutation per tree,
+  partitioned recursively, with leaves as ranges into it. No per-node `Vec`s
+  and no transient build tree. Leaf ids are `u32` instead of `usize`. The trees
+  are bit-identical to before.
+- The NN-Descent index no longer keeps a second, reordered copy of the vectors
+  inside its forest. The router walks the trees and scores the candidates
+  against the index's own vectors. At 200k x 32, `memory_usage_bytes` drops
+  from 175 MB to 102 MB (Euclidean), 175 MB to 99 MB (cosine) and 139 MB to
+  84 MB (Manhattan).
+- Stored point ids are `u32` crate-wide: `original_ids` on every index, the
+  IVF-family id and offset arrays, the k-means assignments, the HNSW update
+  buffers, the NN-Descent and NSG build buffers and the GPU/MLX host storage.
+  Index arithmetic stays `usize`.
+- Ball tree builds in place on the same pattern and drops `leaf_indices`, which
+  had become the identity once the vectors were stored in leaf order.
+
+**Breaking changes**
+
+- Datasets with more than `u32::MAX - 1` samples (`2^31 - 2` for NN-Descent and
+  RNN-Descent) are refused with the new `AnnSearchErrors::TooManySamples`.
+- `build_hnsw_index`, `build_kd_tree_index` and `build_vamana_index` return a
+  `Result` now, like the other builders.
+- `KnnValidation::original_ids` returns `&[u32]`.
+- `KnnGraphGpu::knn_graph` and `KnnGraphMlx::knn_graph` hold `(u32, T)` pairs.
+  `build_nsg_from_knn_index` takes `&[(u32, T)]`.
+- `k_means_clusters_gpu`, `k_means_clusters_mlx`, `k_means_gpu_flat`,
+  `assign_all_gpu`, `assign_all_mlx` and `assign_all_parallel` return `u32`
+  assignments. `build_csr_layout` and `invert_assignments_csr` return `u32` ids
+  and offsets. `assign_secondary_soar`, `select_probed_clusters` and
+  `adjust_centers` take `u32` slices.
+- `RaBitQStorage::vector_indices` and `offsets` are `Vec<u32>`, and
+  `cluster_vector_indices` returns `&[u32]`.
+- `compact_knn_rows` returns `(u32, T)` and lost its id type parameter. The
+  `GraphPid` trait is gone.
+- Save format bumped from 6 to 7: the Annoy, Kd, NN-Descent, ball tree and
+  IVF-family layouts changed. Older indices error on load.
+
 ## 0.11.2
 
 **Chore**

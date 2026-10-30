@@ -37,11 +37,24 @@ Every index has a `query_*_self` path for the full self-kNN graph, and most take
 a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
 re-entering, NN-Descent hands back the graph it built anyway.
 
+If all you want is the kNN graph (UMAP, Leiden, anything single cell),
+`build_knn_graph_nndescent` and `build_knn_graph_nndescent_gpu` skip the index
+entirely: matrix in, flat `u32` graph out, nothing kept.
+
+```rust
+use ann_search_rs::build_knn_graph_nndescent;
+use ann_search_rs::prelude::NNDescentKnnParams;
+
+let params = NNDescentKnnParams { k: 15, include_self: true, ..Default::default() };
+let graph = build_knn_graph_nndescent(data.as_ref(), "euclidean", Some(params), 42, false)?;
+let row = graph.row(0); // k + 1 ids, the point itself first
+```
+
 ## Installation
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.11", features = ["quantised", "binary"] }
+ann-search-rs = { version = "0.12", features = ["quantised", "binary"] }
 ```
 
 Optional features:
@@ -69,7 +82,7 @@ let index = build_hnsw_index(
     "euclidean", // or "cosine", "manhattan"
     42,          // seed
     false,       // verbose
-);
+)?;
 
 // Cross-set query: k = 15, ef_search = 200, return distances
 let query = Mat::from_fn(100, 32, |_, _| rand::random::<f32>());
@@ -84,7 +97,7 @@ Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
 row-major slice with its shape. Rows are samples, columns are features, always:
 
 ```rust
-let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, false);
+let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, false)?;
 ```
 
 The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
@@ -145,7 +158,7 @@ brew install mlx-c
 ```
 
 ```toml
-ann-search-rs = { version = "0.11", features = ["mlx"] }
+ann-search-rs = { version = "0.12", features = ["mlx"] }
 ```
 
 If mlx-c lives somewhere other than `/opt/homebrew`, set `MLX_C_PREFIX`. If it
