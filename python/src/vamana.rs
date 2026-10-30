@@ -51,7 +51,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
                 alpha_pass1,
                 alpha_pass2,
                 &metric,
-                seed
+                seed,
             )
         })
     }
