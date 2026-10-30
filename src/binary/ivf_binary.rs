@@ -298,6 +298,7 @@ where
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Directory to save vector store files
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -313,6 +314,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("IVF-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
@@ -420,7 +422,8 @@ where
                 .collect()
         };
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         let store_fingerprint = Some(vector_store.fingerprint());
 
         let mut idx = Self {
@@ -820,7 +823,7 @@ where
 
                     progress.tick();
 
-                    let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor)?;
+                    let (indices, dists) = self.query_reranking(&vec, k, nprobe, rerank_factor)?;
                     Ok((orig_id, indices, dists))
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
@@ -1148,6 +1151,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1273,6 +1277,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1324,6 +1329,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1568,6 +1574,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1592,6 +1599,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1623,6 +1631,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1650,6 +1659,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 

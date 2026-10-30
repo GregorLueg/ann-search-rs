@@ -373,6 +373,7 @@ where
     /// * `seed` - Random seed for clustering and the rotation
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Directory for the persisted vectors
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -387,6 +388,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         // One walk of the caller's matrix, shared by the index and the store.
         let (vectors_flat, n, dim) = data.into_row_major();
@@ -405,7 +407,8 @@ where
             .map(compute_l2_norm)
             .collect();
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         index.store_fingerprint = Some(vector_store.fingerprint());
         index.vector_store = Some(vector_store);
 
@@ -889,7 +892,7 @@ where
 
                 progress.tick();
 
-                self.query_reranking(vec, k, nprobe, rerank_factor)
+                self.query_reranking(&vec, k, nprobe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
         progress.finish();
@@ -1143,6 +1146,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1267,6 +1271,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 

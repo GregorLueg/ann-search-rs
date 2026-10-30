@@ -162,6 +162,7 @@ where
     /// * `seed` - Random seed for the rotation
     /// * `verbosity` - See [`Verbosity`]
     /// * `save_path` - Directory for the persisted vectors
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -173,6 +174,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         // One walk of the caller's matrix, shared by the index and the store.
         let (vectors_flat, n, dim) = data.into_row_major();
@@ -183,7 +185,8 @@ where
             .map(compute_l2_norm)
             .collect();
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         index.store_fingerprint = Some(vector_store.fingerprint());
         index.vector_store = Some(vector_store);
 
@@ -595,7 +598,7 @@ where
                 .into_par_iter()
                 .map(|i| {
                     let vec = vector_store.row(i);
-                    let out = self.query_reranking(vec, k, Some(rerank_factor))?;
+                    let out = self.query_reranking(&vec, k, Some(rerank_factor))?;
                     progress.tick_n(1);
                     Ok(out)
                 })
@@ -618,7 +621,7 @@ where
                     let mut qnorms = [0.0f32; 4];
                     for qi in 0..batch_nq {
                         let qvec = vector_store.row(start + qi);
-                        let eq = self.quantiser.encode_query(qvec)?;
+                        let eq = self.quantiser.encode_query(&qvec)?;
                         let (q_rot_f32, levels_f32) =
                             prepare_scalar_scoring(&eq, &self.quantiser.encoder);
                         luts_owned.push(build_query_lut(&q_rot_f32, &levels_f32, bits, dim)?);
@@ -651,7 +654,7 @@ where
                     for qi in 0..batch_nq {
                         let qvec = vector_store.row(start + qi);
                         let cands: Vec<usize> = approx[qi].0.iter().map(|&x| x as usize).collect();
-                        out.push(self.rerank_candidates(vector_store, qvec, &cands, k));
+                        out.push(self.rerank_candidates(vector_store, &qvec, &cands, k));
                     }
                     progress.tick_n(batch_nq);
                     Ok(out)
@@ -907,6 +910,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -937,6 +941,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -974,6 +979,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
         let (knn, dists) = index
@@ -1038,6 +1044,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 

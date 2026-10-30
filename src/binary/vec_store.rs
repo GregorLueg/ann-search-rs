@@ -5,8 +5,9 @@
 //! ```text
 //! [0..8)    magic        b"ANNVEC\0\0"
 //! [8..12)   version      u32
-//! [12]      encoding     u8    0 f32, 1 f64
-//! [13..16)  reserved
+//! [12]      float type   u8    0 f32, 1 f64; the norms, and full-precision rows
+//! [13]      row encoding u8    0 full, 1 f16, 2 bf16
+//! [14..16)  reserved
 //! [16..24)  n            u64
 //! [24..32)  dim          u64
 //! [32..40)  fingerprint  u64   FNV-1a over the header fields and the norms
@@ -15,18 +16,22 @@
 //! [..)      rows         n * dim elements, row-major, original data order
 //! ```
 //!
-//! Both sections start on a 64-byte boundary, so they cast straight to `&[T]`
+//! Both sections start on a 64-byte boundary, so they cast straight to slices
 //! from the page-aligned mapping. The index records the fingerprint and checks
 //! it on load, which catches a store swapped in from a different dataset.
 
 use bytemuck::Pod;
+use half::{bf16, f16};
 use memmap2::Mmap;
+use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
+use crate::utils::dist::cosine_from_dot;
 use crate::utils::staging::StagedFiles;
 
 ////////////
@@ -50,26 +55,103 @@ const HEADER_LEN: usize = 64;
 /// the alignment of every element type.
 const SECTION_ALIGN: usize = 64;
 
-/// Encoding byte for `f32` rows.
-const ENC_F32: u8 = 0;
+///////////////////
+// StoreEncoding //
+///////////////////
 
-/// Encoding byte for `f64` rows.
-const ENC_F64: u8 = 1;
+/// Precision the store keeps its rows at.
+///
+/// The norms always stay at the index float type. Under a half-precision
+/// encoding they are computed from the rounded rows, so a re-ranked Cosine
+/// distance is consistent with the vector it was taken against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StoreEncoding {
+    /// Rows at the index float type
+    #[default]
+    Full,
+    /// IEEE half precision. Five exponent bits: values past 65504 do not fit
+    /// and the build is refused.
+    F16,
+    /// bfloat16. The `f32` range at eight mantissa bits.
+    Bf16,
+}
+
+impl StoreEncoding {
+    /// The byte stored in the header.
+    ///
+    /// ### Returns
+    ///
+    /// 0 for full, 1 for f16, 2 for bf16.
+    fn to_u8(self) -> u8 {
+        match self {
+            StoreEncoding::Full => 0,
+            StoreEncoding::F16 => 1,
+            StoreEncoding::Bf16 => 2,
+        }
+    }
+
+    /// Parse the header byte.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - The header byte
+    ///
+    /// ### Returns
+    ///
+    /// The encoding, or `None` for an unknown byte.
+    fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(StoreEncoding::Full),
+            1 => Some(StoreEncoding::F16),
+            2 => Some(StoreEncoding::Bf16),
+            _ => None,
+        }
+    }
+
+    /// Bytes per stored row element.
+    ///
+    /// ### Returns
+    ///
+    /// `size_of::<T>()` for full precision, 2 otherwise.
+    fn elem_bytes<T>(self) -> usize {
+        match self {
+            StoreEncoding::Full => std::mem::size_of::<T>(),
+            StoreEncoding::F16 | StoreEncoding::Bf16 => 2,
+        }
+    }
+}
+
+/// Parse a store encoding from a string.
+///
+/// ### Params
+///
+/// * `s` - One of `"full"`, `"f16"` or `"bf16"`, case-insensitive
+///
+/// ### Returns
+///
+/// The encoding, or `None` for an unknown string.
+pub fn parse_store_encoding(s: &str) -> Option<StoreEncoding> {
+    match s.to_lowercase().as_str() {
+        "full" => Some(StoreEncoding::Full),
+        "f16" => Some(StoreEncoding::F16),
+        "bf16" => Some(StoreEncoding::Bf16),
+        _ => None,
+    }
+}
 
 /////////////
 // Helpers //
 /////////////
 
-/// Encoding byte for the element type `T`.
+/// Float-type byte for the element type `T`.
 ///
 /// ### Returns
 ///
-/// The encoding byte, or `None` for an element width the format has no
-/// encoding for.
-fn encoding_of<T>() -> Option<u8> {
+/// 0 for a 4-byte float, 1 for an 8-byte one, `None` otherwise.
+fn float_type_of<T>() -> Option<u8> {
     match std::mem::size_of::<T>() {
-        4 => Some(ENC_F32),
-        8 => Some(ENC_F64),
+        4 => Some(0),
+        8 => Some(1),
         _ => None,
     }
 }
@@ -79,16 +161,16 @@ fn encoding_of<T>() -> Option<u8> {
 /// ### Params
 ///
 /// * `n` - Number of vectors
-/// * `elem` - Bytes per element
+/// * `norm_bytes` - Bytes per norm
 ///
 /// ### Returns
 ///
 /// Offset of the first row, a multiple of [`SECTION_ALIGN`].
-fn rows_offset(n: usize, elem: usize) -> usize {
-    HEADER_LEN + (n * elem).next_multiple_of(SECTION_ALIGN)
+fn rows_offset(n: usize, norm_bytes: usize) -> usize {
+    HEADER_LEN + (n * norm_bytes).next_multiple_of(SECTION_ALIGN)
 }
 
-/// FNV-1a over the shape, encoding and norm bytes.
+/// FNV-1a over the shape, type bytes and norm bytes.
 ///
 /// The norms are a cheap summary of the data: two different datasets of the
 /// same shape practically never share them, and hashing them costs one pass
@@ -98,13 +180,13 @@ fn rows_offset(n: usize, elem: usize) -> usize {
 ///
 /// * `n` - Number of vectors
 /// * `dim` - Dimensionality
-/// * `encoding` - Encoding byte
+/// * `types` - Float-type and row-encoding bytes
 /// * `norm_bytes` - Raw bytes of the norms section, without padding
 ///
 /// ### Returns
 ///
 /// The 64-bit fingerprint.
-fn fingerprint(n: usize, dim: usize, encoding: u8, norm_bytes: &[u8]) -> u64 {
+fn fingerprint(n: usize, dim: usize, types: [u8; 2], norm_bytes: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -113,12 +195,61 @@ fn fingerprint(n: usize, dim: usize, encoding: u8, norm_bytes: &[u8]) -> u64 {
         .to_le_bytes()
         .into_iter()
         .chain((dim as u64).to_le_bytes())
-        .chain([encoding]);
+        .chain(types);
     for b in shape.chain(norm_bytes.iter().copied()) {
         h ^= b as u64;
         h = h.wrapping_mul(PRIME);
     }
     h
+}
+
+/// Round rows to a half-precision encoding.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Rows at the index float type
+/// * `encoding` - [`StoreEncoding::F16`] or [`StoreEncoding::Bf16`]
+///
+/// ### Returns
+///
+/// The raw half bits, or `None` when a finite value overflows the encoding.
+fn encode_half<T: AnnSearchFloat>(vectors_flat: &[T], encoding: StoreEncoding) -> Option<Vec<u16>> {
+    vectors_flat
+        .par_iter()
+        .map(|&x| {
+            let x = x.to_f64().expect("float to f64 cannot fail");
+            let (bits, inf) = match encoding {
+                StoreEncoding::Bf16 => {
+                    let h = bf16::from_f64(x);
+                    (h.to_bits(), h.is_infinite())
+                }
+                _ => {
+                    let h = f16::from_f64(x);
+                    (h.to_bits(), h.is_infinite())
+                }
+            };
+            (!inf || x.is_infinite()).then_some(bits)
+        })
+        .collect()
+}
+
+/// Decode one half-precision value.
+///
+/// ### Params
+///
+/// * `encoding` - [`StoreEncoding::F16`] or [`StoreEncoding::Bf16`]
+/// * `bits` - The raw bits
+///
+/// ### Returns
+///
+/// The value as `T`.
+#[inline(always)]
+fn decode_half<T: AnnSearchFloat>(encoding: StoreEncoding, bits: u16) -> T {
+    let x = match encoding {
+        StoreEncoding::Bf16 => bf16::from_bits(bits).to_f32(),
+        _ => f16::from_bits(bits).to_f32(),
+    };
+    T::from_f32(x).expect("f32 to float cannot fail")
 }
 
 /// Resolve a path to a comparable absolute form.
@@ -211,6 +342,8 @@ pub struct VectorStore<T> {
     n: usize,
     /// Vector dimensionality
     dim: usize,
+    /// Precision of the rows section
+    encoding: StoreEncoding,
     /// Fingerprint from the header, see [`fingerprint`]
     fingerprint: u64,
     /// Byte offset of the rows section
@@ -234,19 +367,22 @@ where
     ///
     /// * `dir` - Directory to write into, created if missing
     /// * `vectors_flat` - Original vectors, row-major, `n * dim`
-    /// * `norms` - L2 norm of each vector, length `n`
+    /// * `norms` - L2 norm of each vector, length `n`. Ignored under a
+    ///   half-precision encoding, which recomputes them from the rounded rows.
     /// * `n` - Number of vectors
     /// * `dim` - Dimensionality
+    /// * `encoding` - Precision to store the rows at
     ///
     /// ### Returns
     ///
-    /// The opened store, or a shape / IO error.
+    /// The opened store, or a shape / range / IO error.
     pub fn create(
         dir: impl AsRef<Path>,
         vectors_flat: &[T],
         norms: &[T],
         n: usize,
         dim: usize,
+        encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         if vectors_flat.len() != n * dim {
             return Err(AnnSearchErrors::BufferLengthMismatch {
@@ -266,19 +402,46 @@ where
         if cfg!(target_endian = "big") {
             return Err(invalid(&path, "big-endian hosts are not supported"));
         }
-        let encoding = encoding_of::<T>()
+        let float_type = float_type_of::<T>()
             .ok_or_else(|| invalid(&path, "element type has no store encoding"))?;
+
+        let half_rows =
+            match encoding {
+                StoreEncoding::Full => None,
+                _ => Some(encode_half(vectors_flat, encoding).ok_or_else(|| {
+                    invalid(&path, format!("values exceed the {encoding:?} range"))
+                })?),
+            };
+        let half_norms: Option<Vec<T>> = half_rows.as_ref().map(|bits| {
+            bits.par_chunks_exact(dim.max(1))
+                .map(|row| {
+                    row.iter()
+                        .map(|&b| {
+                            let x = decode_half::<T>(encoding, b);
+                            x * x
+                        })
+                        .sum::<T>()
+                        .sqrt()
+                })
+                .collect()
+        });
+        let norms = half_norms.as_deref().unwrap_or(norms);
+        let row_bytes: &[u8] = match &half_rows {
+            Some(bits) => bytemuck::cast_slice(bits),
+            None => bytemuck::cast_slice(vectors_flat),
+        };
 
         std::fs::create_dir_all(dir)?;
 
+        let types = [float_type, encoding.to_u8()];
         let norm_bytes: &[u8] = bytemuck::cast_slice(norms);
         let mut header = [0u8; HEADER_LEN];
         header[0..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&STORE_VERSION.to_le_bytes());
-        header[12] = encoding;
+        header[12..14].copy_from_slice(&types);
         header[16..24].copy_from_slice(&(n as u64).to_le_bytes());
         header[24..32].copy_from_slice(&(dim as u64).to_le_bytes());
-        header[32..40].copy_from_slice(&fingerprint(n, dim, encoding, norm_bytes).to_le_bytes());
+        header[32..40].copy_from_slice(&fingerprint(n, dim, types, norm_bytes).to_le_bytes());
 
         let pad = rows_offset(n, std::mem::size_of::<T>()) - HEADER_LEN - norm_bytes.len();
 
@@ -288,7 +451,7 @@ where
         writer.write_all(&header)?;
         writer.write_all(norm_bytes)?;
         writer.write_all(&[0u8; SECTION_ALIGN][..pad])?;
-        writer.write_all(bytemuck::cast_slice(vectors_flat))?;
+        writer.write_all(row_bytes)?;
         // BufWriter flushes on Drop but swallows the error; surface it instead
         writer.flush()?;
         drop(writer);
@@ -299,9 +462,9 @@ where
 
     /// Open the store that lives in `dir`.
     ///
-    /// Validates magic, version, encoding, file length and the fingerprint
-    /// against the norms section. Rows are not hashed, so a corrupted row is
-    /// not caught here.
+    /// Validates magic, version, float type, encoding, file length and the
+    /// fingerprint against the norms section. Rows are not hashed, so a
+    /// corrupted row is not caught here.
     ///
     /// ### Params
     ///
@@ -334,21 +497,22 @@ where
                 format!("format version {version}, expected {STORE_VERSION}"),
             ));
         }
-        let encoding = mmap[12];
-        if Some(encoding) != encoding_of::<T>() {
+        if Some(mmap[12]) != float_type_of::<T>() {
             return Err(invalid(
                 &path,
-                format!("encoding {encoding} does not match the index float type"),
+                format!("float type {} does not match the index", mmap[12]),
             ));
         }
+        let encoding = StoreEncoding::from_u8(mmap[13])
+            .ok_or_else(|| invalid(&path, format!("unknown row encoding {}", mmap[13])))?;
 
         let n = read_u64(&mmap, 16) as usize;
         let dim = read_u64(&mmap, 24) as usize;
         let recorded = read_u64(&mmap, 32);
 
-        let elem = std::mem::size_of::<T>();
-        let rows_offset = rows_offset(n, elem);
-        let expected = rows_offset + n * dim * elem;
+        let norm_elem = std::mem::size_of::<T>();
+        let rows_offset = rows_offset(n, norm_elem);
+        let expected = rows_offset + n * dim * encoding.elem_bytes::<T>();
         if mmap.len() != expected {
             return Err(invalid(
                 &path,
@@ -356,8 +520,8 @@ where
             ));
         }
 
-        let norm_bytes = &mmap[HEADER_LEN..HEADER_LEN + n * elem];
-        if fingerprint(n, dim, encoding, norm_bytes) != recorded {
+        let norm_bytes = &mmap[HEADER_LEN..HEADER_LEN + n * norm_elem];
+        if fingerprint(n, dim, [mmap[12], mmap[13]], norm_bytes) != recorded {
             return Err(invalid(&path, "fingerprint does not match its contents"));
         }
 
@@ -366,6 +530,7 @@ where
             path,
             n,
             dim,
+            encoding,
             fingerprint: recorded,
             rows_offset,
             _phantom: PhantomData,
@@ -442,18 +607,13 @@ where
         Ok(())
     }
 
-    /// One original vector.
-    ///
-    /// ### Params
-    ///
-    /// * `idx` - Row in original data order
+    /// Precision the rows are stored at.
     ///
     /// ### Returns
     ///
-    /// The vector, length `dim`.
-    #[inline]
-    pub fn row(&self, idx: usize) -> &[T] {
-        &self.vectors_flat()[idx * self.dim..(idx + 1) * self.dim]
+    /// The encoding.
+    pub fn encoding(&self) -> StoreEncoding {
+        self.encoding
     }
 
     /// Fingerprint the owning index records to recognise this store on load.
@@ -464,28 +624,108 @@ where
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
-}
 
-////////////////////
-// VectorDistance //
-////////////////////
-
-impl<T> VectorDistance<T> for VectorStore<T>
-where
-    T: AnnSearchFloat + Pod,
-{
-    fn vectors_flat(&self) -> &[T] {
-        let len = self.n * self.dim * std::mem::size_of::<T>();
-        bytemuck::cast_slice(&self.mmap[self.rows_offset..self.rows_offset + len])
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn norms(&self) -> &[T] {
+    /// L2 norms of the stored rows.
+    ///
+    /// ### Returns
+    ///
+    /// One norm per vector, in original data order.
+    pub fn norms(&self) -> &[T] {
         let len = self.n * std::mem::size_of::<T>();
         bytemuck::cast_slice(&self.mmap[HEADER_LEN..HEADER_LEN + len])
+    }
+
+    /// Raw bytes of one stored row.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Row in original data order
+    ///
+    /// ### Returns
+    ///
+    /// The row's bytes at the stored encoding.
+    #[inline]
+    fn row_bytes(&self, idx: usize) -> &[u8] {
+        let stride = self.dim * self.encoding.elem_bytes::<T>();
+        let start = self.rows_offset + idx * stride;
+        &self.mmap[start..start + stride]
+    }
+
+    /// One stored vector, decoded to `T` when the store is half precision.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Row in original data order
+    ///
+    /// ### Returns
+    ///
+    /// The vector, length `dim`; borrowed from the mapping at full precision.
+    #[inline]
+    pub fn row(&self, idx: usize) -> Cow<'_, [T]> {
+        match self.encoding {
+            StoreEncoding::Full => Cow::Borrowed(bytemuck::cast_slice(self.row_bytes(idx))),
+            enc => Cow::Owned(
+                bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
+                    .iter()
+                    .map(|&b| decode_half(enc, b))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Squared Euclidean distance from a stored vector to a query.
+    ///
+    /// The half-precision arms decode element by element in scalar code.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Row in original data order
+    /// * `query` - Query vector, length `dim`
+    ///
+    /// ### Returns
+    ///
+    /// The squared distance.
+    #[inline]
+    pub fn euclidean_distance_to_query(&self, idx: usize, query: &[T]) -> T {
+        match self.encoding {
+            StoreEncoding::Full => {
+                T::euclidean_simd(bytemuck::cast_slice(self.row_bytes(idx)), query)
+            }
+            enc => bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
+                .iter()
+                .zip(query)
+                .map(|(&b, &q)| {
+                    let d = decode_half::<T>(enc, b) - q;
+                    d * d
+                })
+                .sum(),
+        }
+    }
+
+    /// Cosine distance from a stored vector to a query.
+    ///
+    /// The half-precision arms decode element by element in scalar code.
+    ///
+    /// ### Params
+    ///
+    /// * `idx` - Row in original data order
+    /// * `query` - Query vector, length `dim`
+    /// * `query_norm` - L2 norm of the query
+    ///
+    /// ### Returns
+    ///
+    /// `1 - cos`, or 1 when either norm is zero.
+    #[inline]
+    pub fn cosine_distance_to_query(&self, idx: usize, query: &[T], query_norm: T) -> T {
+        let dot = match self.encoding {
+            StoreEncoding::Full => T::dot_simd(bytemuck::cast_slice(self.row_bytes(idx)), query),
+            enc => bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
+                .iter()
+                .zip(query)
+                .map(|(&b, &q)| decode_half::<T>(enc, b) * q)
+                .sum(),
+        };
+        cosine_from_dot(dot, query_norm * self.norms()[idx])
     }
 }
 
@@ -508,25 +748,32 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (vectors, norms) = fixture();
 
-        let store = VectorStore::create(dir.path(), &vectors, &norms, 3, 2).unwrap();
+        let store =
+            VectorStore::create(dir.path(), &vectors, &norms, 3, 2, StoreEncoding::Full).unwrap();
 
-        assert_eq!(store.row(0), &[1.0, 2.0]);
-        assert_eq!(store.row(2), &[5.0, 6.0]);
-        assert_eq!(store.vectors_flat(), vectors.as_slice());
+        assert_eq!(&*store.row(0), &[1.0, 2.0]);
+        assert_eq!(&*store.row(2), &[5.0, 6.0]);
         assert_eq!(store.norms(), norms.as_slice());
 
         let reopened = VectorStore::<f32>::open(dir.path()).unwrap();
         assert_eq!(reopened.fingerprint(), store.fingerprint());
-        assert_eq!(reopened.row(1), &[3.0, 4.0]);
+        assert_eq!(&*reopened.row(1), &[3.0, 4.0]);
     }
 
     #[test]
     fn test_f64_round_trip() {
         let dir = TempDir::new().unwrap();
-        let store =
-            VectorStore::create(dir.path(), &[1.0f64, 2.0, 3.0, 4.0], &[2.24, 5.0], 2, 2).unwrap();
+        let store = VectorStore::create(
+            dir.path(),
+            &[1.0f64, 2.0, 3.0, 4.0],
+            &[2.24, 5.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
-        assert_eq!(store.row(1), &[3.0, 4.0]);
+        assert_eq!(&*store.row(1), &[3.0, 4.0]);
         assert_eq!(store.norms(), &[2.24, 5.0]);
     }
 
@@ -534,18 +781,26 @@ mod tests {
     fn test_sections_are_aligned() {
         let dir = TempDir::new().unwrap();
         // Odd n so the norms section needs padding
-        let store = VectorStore::create(dir.path(), &[1.0f32; 3 * 5], &[1.0f32; 3], 3, 5).unwrap();
+        let store = VectorStore::create(
+            dir.path(),
+            &[1.0f32; 3 * 5],
+            &[1.0f32; 3],
+            3,
+            5,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
         assert_eq!(store.rows_offset % SECTION_ALIGN, 0);
-        assert_eq!(store.row(2), &[1.0; 5]);
+        assert_eq!(&*store.row(2), &[1.0; 5]);
     }
 
     #[test]
     fn test_empty_store() {
         let dir = TempDir::new().unwrap();
-        let store = VectorStore::<f32>::create(dir.path(), &[], &[], 0, 4).unwrap();
+        let store =
+            VectorStore::<f32>::create(dir.path(), &[], &[], 0, 4, StoreEncoding::Full).unwrap();
 
-        assert!(store.vectors_flat().is_empty());
         assert!(store.norms().is_empty());
     }
 
@@ -553,13 +808,27 @@ mod tests {
     fn test_create_rejects_wrong_lengths() {
         let dir = TempDir::new().unwrap();
 
-        let rows = VectorStore::create(dir.path(), &[1.0f32, 2.0, 3.0], &[1.0, 1.0], 2, 2);
+        let rows = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 2.0, 3.0],
+            &[1.0, 1.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        );
         assert!(matches!(
             rows,
             Err(AnnSearchErrors::BufferLengthMismatch { .. })
         ));
 
-        let norms = VectorStore::create(dir.path(), &[1.0f32, 2.0, 3.0, 4.0], &[1.0], 2, 2);
+        let norms = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &[1.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        );
         assert!(matches!(
             norms,
             Err(AnnSearchErrors::BufferLengthMismatch { .. })
@@ -573,7 +842,7 @@ mod tests {
     fn test_open_rejects_wrong_float_type() {
         let dir = TempDir::new().unwrap();
         let (vectors, norms) = fixture();
-        VectorStore::create(dir.path(), &vectors, &norms, 3, 2).unwrap();
+        VectorStore::create(dir.path(), &vectors, &norms, 3, 2, StoreEncoding::Full).unwrap();
 
         assert!(matches!(
             VectorStore::<f64>::open(dir.path()),
@@ -585,7 +854,7 @@ mod tests {
     fn test_open_rejects_truncated_file() {
         let dir = TempDir::new().unwrap();
         let (vectors, norms) = fixture();
-        VectorStore::create(dir.path(), &vectors, &norms, 3, 2).unwrap();
+        VectorStore::create(dir.path(), &vectors, &norms, 3, 2, StoreEncoding::Full).unwrap();
 
         let path = dir.path().join(VECTORS_FILE);
         let bytes = std::fs::read(&path).unwrap();
@@ -612,7 +881,7 @@ mod tests {
     fn test_open_rejects_tampered_norms() {
         let dir = TempDir::new().unwrap();
         let (vectors, norms) = fixture();
-        VectorStore::create(dir.path(), &vectors, &norms, 3, 2).unwrap();
+        VectorStore::create(dir.path(), &vectors, &norms, 3, 2, StoreEncoding::Full).unwrap();
 
         let path = dir.path().join(VECTORS_FILE);
         let mut bytes = std::fs::read(&path).unwrap();
@@ -629,7 +898,7 @@ mod tests {
     fn test_open_for_checks_shape_and_fingerprint() {
         let dir = TempDir::new().unwrap();
         let (vectors, norms) = fixture();
-        let fp = VectorStore::create(dir.path(), &vectors, &norms, 3, 2)
+        let fp = VectorStore::create(dir.path(), &vectors, &norms, 3, 2, StoreEncoding::Full)
             .unwrap()
             .fingerprint();
 
@@ -654,16 +923,31 @@ mod tests {
     #[test]
     fn test_create_does_not_disturb_a_live_mapping() {
         let dir = TempDir::new().unwrap();
-        let live =
-            VectorStore::create(dir.path(), &[1.0f32, 2.0, 3.0, 4.0], &[2.24, 5.0], 2, 2).unwrap();
+        let live = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &[2.24, 5.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
-        VectorStore::create(dir.path(), &[9.0f32; 4], &[9.0; 2], 2, 2).unwrap();
+        VectorStore::create(
+            dir.path(),
+            &[9.0f32; 4],
+            &[9.0; 2],
+            2,
+            2,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
-        assert_eq!(live.row(0), &[1.0, 2.0]);
+        assert_eq!(&*live.row(0), &[1.0, 2.0]);
         assert_eq!(live.norms(), &[2.24, 5.0]);
 
         let fresh = VectorStore::<f32>::open(dir.path()).unwrap();
-        assert_eq!(fresh.row(0), &[9.0, 9.0]);
+        assert_eq!(&*fresh.row(0), &[9.0, 9.0]);
     }
 
     /// The store path is canonicalised on open, so an unnormalised directory
@@ -674,7 +958,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
-        VectorStore::create(dir.path(), &[1.0f32, 2.0, 3.0, 4.0], &[2.24, 5.0], 2, 2).unwrap();
+        VectorStore::create(
+            dir.path(),
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &[2.24, 5.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
         let store = VectorStore::<f32>::open(nested.join("..")).unwrap();
 
@@ -684,15 +976,22 @@ mod tests {
         staged.commit().unwrap();
 
         let copied = VectorStore::<f32>::open(target.path()).unwrap();
-        assert_eq!(copied.row(1), &[3.0, 4.0]);
+        assert_eq!(&*copied.row(1), &[3.0, 4.0]);
         assert_eq!(copied.fingerprint(), store.fingerprint());
     }
 
     #[test]
     fn test_copy_into_own_directory_stages_nothing() {
         let dir = TempDir::new().unwrap();
-        let store =
-            VectorStore::create(dir.path(), &[1.0f32, 2.0, 3.0, 4.0], &[2.24, 5.0], 2, 2).unwrap();
+        let store = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &[2.24, 5.0],
+            2,
+            2,
+            StoreEncoding::Full,
+        )
+        .unwrap();
 
         let mut staged = StagedFiles::new();
         store.stage_copy_into(dir.path(), &mut staged).unwrap();
@@ -711,5 +1010,98 @@ mod tests {
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("opening a missing store should have failed"),
         }
+    }
+
+    #[test]
+    fn test_half_encodings_round_trip_within_precision() {
+        let vectors: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let norms = vec![0.0f32; 8];
+
+        for (enc, tol) in [(StoreEncoding::F16, 1e-3), (StoreEncoding::Bf16, 1e-2)] {
+            let dir = TempDir::new().unwrap();
+            let store = VectorStore::create(dir.path(), &vectors, &norms, 8, 8, enc).unwrap();
+            let reopened = VectorStore::<f32>::open(dir.path()).unwrap();
+            assert_eq!(reopened.encoding(), enc);
+
+            for i in 0..8 {
+                let row = reopened.row(i);
+                let orig = &vectors[i * 8..(i + 1) * 8];
+                for (a, b) in row.iter().zip(orig) {
+                    assert!(
+                        (a - b).abs() <= tol * b.abs().max(1.0),
+                        "{enc:?}: {a} vs {b}"
+                    );
+                }
+                // Norms come from the rounded rows, not from the caller
+                let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!((reopened.norms()[i] - norm).abs() < 1e-5);
+            }
+
+            let full_len = std::fs::metadata(dir.path().join(VECTORS_FILE))
+                .unwrap()
+                .len();
+            assert_eq!(
+                full_len as usize,
+                rows_offset(8, 4) + 8 * 8 * 2,
+                "{enc:?} rows should take two bytes each"
+            );
+            assert_eq!(store.fingerprint(), reopened.fingerprint());
+        }
+    }
+
+    #[test]
+    fn test_half_distances_match_decoded_rows() {
+        let vectors: Vec<f32> = (0..32).map(|i| (i as f32 * 0.91).cos()).collect();
+        let norms = vec![0.0f32; 4];
+        let query: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        let qnorm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        for enc in [StoreEncoding::F16, StoreEncoding::Bf16] {
+            let dir = TempDir::new().unwrap();
+            let store = VectorStore::create(dir.path(), &vectors, &norms, 4, 8, enc).unwrap();
+
+            for i in 0..4 {
+                let row = store.row(i);
+                let eucl: f32 = row.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum();
+                let dot: f32 = row.iter().zip(&query).map(|(a, b)| a * b).sum();
+                let cos = 1.0 - dot / (qnorm * store.norms()[i]);
+
+                assert!((store.euclidean_distance_to_query(i, &query) - eucl).abs() < 1e-5);
+                assert!((store.cosine_distance_to_query(i, &query, qnorm) - cos).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn test_f16_rejects_out_of_range_values() {
+        let dir = TempDir::new().unwrap();
+        let res = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 1.0e6],
+            &[0.0; 1],
+            1,
+            2,
+            StoreEncoding::F16,
+        );
+        assert!(matches!(res, Err(AnnSearchErrors::StoreInvalid { .. })));
+
+        // bf16 has the f32 range
+        let ok = VectorStore::create(
+            dir.path(),
+            &[1.0f32, 1.0e6],
+            &[0.0; 1],
+            1,
+            2,
+            StoreEncoding::Bf16,
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn test_parse_store_encoding() {
+        assert_eq!(parse_store_encoding("full"), Some(StoreEncoding::Full));
+        assert_eq!(parse_store_encoding("F16"), Some(StoreEncoding::F16));
+        assert_eq!(parse_store_encoding("bf16"), Some(StoreEncoding::Bf16));
+        assert_eq!(parse_store_encoding("int8"), None);
     }
 }

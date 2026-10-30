@@ -154,6 +154,7 @@ where
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start and end at `Normal`
     /// * `save_path` - Where to save the vector storage
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -165,6 +166,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("Exhaustive-RaBitQ index", verbosity);
         if *metric == Dist::Manhattan {
@@ -183,7 +185,8 @@ where
             .map(compute_l2_norm)
             .collect();
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         let store_fingerprint = Some(vector_store.fingerprint());
 
         log.finish();
@@ -438,7 +441,7 @@ where
 
                 progress.tick();
 
-                self.query_reranking(vec, k, n_probe, rerank_factor)
+                self.query_reranking(&vec, k, n_probe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
         progress.finish();
@@ -711,6 +714,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -730,6 +734,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -758,6 +763,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -781,6 +787,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 

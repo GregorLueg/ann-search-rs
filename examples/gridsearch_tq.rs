@@ -98,6 +98,7 @@ fn main() {
             cli.seed as usize,
             true,
             Some(temp_dir.path()),
+            StoreEncoding::Full,
             Verbosity::Quiet,
         )
         .unwrap();
@@ -254,6 +255,7 @@ fn main() {
                 cli.seed as usize,
                 true,
                 Some(temp_dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();

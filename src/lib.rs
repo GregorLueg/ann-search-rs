@@ -29,6 +29,8 @@ pub mod errors;
 pub mod prelude;
 pub mod utils;
 
+#[cfg(feature = "binary")]
+pub use crate::binary::vec_store::{parse_store_encoding, StoreEncoding};
 pub use crate::utils::verbosity::{parse_annsearch_verbosity, Verbosity};
 
 #[cfg(feature = "gpu")]
@@ -4604,6 +4606,8 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
@@ -4618,6 +4622,7 @@ pub fn build_exhaustive_index_binary<T>(
     dist_metric: &str,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexBinary<T>, AnnSearchErrors>
 where
@@ -4640,6 +4645,7 @@ where
             seed,
             verbosity,
             path,
+            store_encoding,
         )
     } else {
         ExhaustiveIndexBinary::new(mat, binary_init, n_bits, metric, seed, verbosity)
@@ -4767,6 +4773,8 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store
 ///   is true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
@@ -4783,6 +4791,7 @@ pub fn build_ivf_index_binary<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<IvfIndexBinary<T>, AnnSearchErrors>
 where
@@ -4807,6 +4816,7 @@ where
             seed,
             verbosity,
             path,
+            store_encoding,
         )
     } else {
         IvfIndexBinary::build(
@@ -4937,11 +4947,14 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
 /// The initialised `ExhaustiveIndexRaBitQ`
+#[allow(clippy::too_many_arguments)]
 pub fn build_exhaustive_index_rabitq<T>(
     mat: impl AnnMatrix<T>,
     n_clust_rabitq: Option<usize>,
@@ -4949,6 +4962,7 @@ pub fn build_exhaustive_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<ExhaustiveIndexRaBitQ<T>, AnnSearchErrors>
 where
@@ -4970,6 +4984,7 @@ where
             seed,
             verbosity,
             path,
+            store_encoding,
         )
     } else {
         ExhaustiveIndexRaBitQ::new(mat, &metric, n_clust_rabitq, seed, verbosity)
@@ -5076,6 +5091,8 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
@@ -5090,6 +5107,7 @@ pub fn build_ivf_index_rabitq<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<IvfIndexRaBitQ<T>, AnnSearchErrors>
 where
@@ -5112,6 +5130,7 @@ where
             seed,
             verbosity,
             path,
+            store_encoding,
         )
     } else {
         IvfIndexRaBitQ::build(mat, metric, nlist, k_means_params, seed, verbosity)
@@ -5215,11 +5234,14 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
 ///
 /// The initialised `TurboQuantExhaustive`
+#[allow(clippy::too_many_arguments)]
 pub fn build_exhaustive_index_turboquant<T>(
     mat: impl AnnMatrix<T>,
     dist_metric: &str,
@@ -5227,6 +5249,7 @@ pub fn build_exhaustive_index_turboquant<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<TurboQuantExhaustive<T>, AnnSearchErrors>
 where
@@ -5240,7 +5263,15 @@ where
     });
     if save_store {
         let path = save_path.expect("save_path required when save_store is true");
-        TurboQuantExhaustive::new_with_vector_store(mat, &metric, bits, seed, verbosity, path)
+        TurboQuantExhaustive::new_with_vector_store(
+            mat,
+            &metric,
+            bits,
+            seed,
+            verbosity,
+            path,
+            store_encoding,
+        )
     } else {
         TurboQuantExhaustive::new(mat, &metric, bits, seed, verbosity)
     }
@@ -5336,6 +5367,8 @@ where
 /// * `save_store` - Whether to save vector store for reranking
 /// * `save_path` - Path to save vector store files (required if save_store is
 ///   true)
+/// * `store_encoding` - Precision the store keeps the rows at. Ignored
+///   without `save_store`.
 /// * `verbosity` - See [`Verbosity`]
 ///
 /// ### Returns
@@ -5351,6 +5384,7 @@ pub fn build_ivf_index_turboquant<T>(
     seed: usize,
     save_store: bool,
     save_path: Option<impl AsRef<Path>>,
+    store_encoding: StoreEncoding,
     verbosity: Verbosity,
 ) -> Result<IvfTurboQuant<T>, AnnSearchErrors>
 where
@@ -5374,6 +5408,7 @@ where
             seed,
             verbosity,
             path,
+            store_encoding,
         )
     } else {
         IvfTurboQuant::build(mat, metric, nlist, k_means_params, bits, seed, verbosity)

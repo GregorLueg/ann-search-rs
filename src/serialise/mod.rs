@@ -814,6 +814,7 @@ mod tests {
                 "cosine",
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -841,6 +842,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -874,6 +876,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -899,6 +902,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -933,6 +937,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -958,6 +963,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -984,6 +990,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1025,6 +1032,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1079,6 +1087,7 @@ mod tests {
                 1,
                 false,
                 NO_PATH,
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1162,6 +1171,7 @@ mod tests {
                 "cosine",
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1189,6 +1199,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1214,6 +1225,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1240,6 +1252,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1265,6 +1278,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1291,6 +1305,7 @@ mod tests {
                 1,
                 true,
                 Some(p),
+                StoreEncoding::Full,
                 Verbosity::Quiet
             )
             .unwrap(),
@@ -1324,6 +1339,7 @@ mod tests {
                 "cosine",
                 true,
                 Some(store_dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1376,6 +1392,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1420,6 +1437,7 @@ mod tests {
                 1,
                 true,
                 Some(dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1453,6 +1471,7 @@ mod tests {
                 1,
                 true,
                 Some(store_dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1467,7 +1486,8 @@ mod tests {
                     .chunks_exact(DIM)
                     .map(|r| r.iter().map(|x| x * x).sum::<f32>().sqrt())
                     .collect();
-                VectorStore::create(saved.path(), &flat, &norms, n, DIM).unwrap();
+                VectorStore::create(saved.path(), &flat, &norms, n, DIM, StoreEncoding::Full)
+                    .unwrap();
             };
 
             overwrite(N_DATA / 2, 3);
@@ -1503,6 +1523,7 @@ mod tests {
                 1,
                 true,
                 Some(dir.path()),
+                StoreEncoding::Full,
                 Verbosity::Quiet,
             )
             .unwrap();
@@ -1555,6 +1576,7 @@ mod tests {
                     1,
                     true,
                     Some(dir.path()),
+                    StoreEncoding::Full,
                     Verbosity::Quiet,
                 )
                 .unwrap()
@@ -1610,6 +1632,7 @@ mod tests {
                     1,
                     true,
                     Some(p),
+                    StoreEncoding::Full,
                     Verbosity::Quiet,
                 )
                 .unwrap()

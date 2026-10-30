@@ -306,6 +306,7 @@ where
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -319,6 +320,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         Self::build_with_vector_store_and_rotator_kind(
             data,
@@ -329,6 +331,7 @@ where
             seed,
             verbosity,
             save_path,
+            store_encoding,
         )
     }
 
@@ -347,6 +350,7 @@ where
     /// * `seed` - Random seed
     /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Path to save vector store
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -361,6 +365,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("IVF-RaBitQ index", verbosity);
         if metric == Dist::Manhattan {
@@ -482,7 +487,8 @@ where
 
         // Save vector store
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         let store_fingerprint = Some(vector_store.fingerprint());
 
         log.finish();
@@ -745,7 +751,7 @@ where
 
                 progress.tick();
 
-                self.query_reranking(vec, k, nprobe, rerank_factor)
+                self.query_reranking(&vec, k, nprobe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
         progress.finish();
@@ -992,6 +998,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1012,6 +1019,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1041,6 +1049,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1065,6 +1074,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 

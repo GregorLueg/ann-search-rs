@@ -20,6 +20,8 @@ pub use crate::utils::verbosity::{parse_annsearch_verbosity, Verbosity};
 pub use crate::utils::DimensionValidation;
 pub use crate::utils::FlattenData;
 
+#[cfg(feature = "binary")]
+pub use crate::binary::vec_store::{parse_store_encoding, StoreEncoding};
 #[cfg(feature = "gpu")]
 pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
 #[cfg(mlx_available)]

@@ -723,6 +723,7 @@ fn exhaustive_binary_cosine_is_non_negative() {
         "cosine",
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();
@@ -760,6 +761,7 @@ fn ivf_binary_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();
@@ -795,6 +797,7 @@ fn exhaustive_rabitq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();
@@ -832,6 +835,7 @@ fn ivf_rabitq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();
@@ -867,6 +871,7 @@ fn exhaustive_tq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();
@@ -904,6 +909,7 @@ fn ivf_tq_cosine_is_non_negative() {
         42,
         true,
         Some(temp_dir.path()),
+        StoreEncoding::Full,
         Verbosity::Quiet,
     )
     .unwrap();

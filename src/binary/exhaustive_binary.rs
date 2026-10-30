@@ -177,10 +177,12 @@ where
     /// * `seed` - Random seed for binariser
     /// * `verbosity` - Prints start and end at `Normal`
     /// * `save_path` - Directory to save vector store files
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive binary index with vector store
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_vector_store(
         data: impl AnnMatrix<T>,
         binarisation_init: &str,
@@ -189,6 +191,7 @@ where
         seed: usize,
         verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("Exhaustive-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
@@ -226,7 +229,8 @@ where
             .map(T::calculate_l2_norm)
             .collect();
 
-        let vector_store = VectorStore::create(&save_path, &vectors_flat, &norms, n, dim)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         let store_fingerprint = Some(vector_store.fingerprint());
 
         log.finish();
@@ -572,7 +576,7 @@ where
 
                     progress.tick();
 
-                    self.query_reranking(vec, k, rerank_factor)
+                    self.query_reranking(&vec, k, rerank_factor)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             progress.finish();
@@ -787,6 +791,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -852,6 +857,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -909,6 +915,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1138,6 +1145,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1160,6 +1168,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1187,6 +1196,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1213,6 +1223,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1277,6 +1288,7 @@ mod tests {
             "euclidean",
             false,
             None::<&Path>,
+            StoreEncoding::Full,
             Verbosity::Quiet,
         )
         .unwrap();
@@ -1319,6 +1331,7 @@ mod tests {
             42,
             Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         );
 
         assert!(matches!(
