@@ -4,6 +4,7 @@
 //! scale. The shared scale is what lets the integer code distance preserve the
 //! ordering of the float one, so the scan runs entirely on `u8` kernels.
 
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::prelude::DimensionValidation;
 use ann_search_rs::quantised::exhaustive_sq8::ExhaustiveSq8Index;
 use ann_search_rs::{
@@ -35,7 +36,8 @@ ann_handle!(
         /// * `quant_sample_rows` - Rows sampled for calibration, or `None` to
         ///   auto-pick.
         /// * `seed` - Fixes the calibration row sample.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
@@ -43,7 +45,7 @@ ann_handle!(
         #[staticmethod]
         #[pyo3(signature = (
             x, *, metric, quant_drop_ratio = None, quant_sample_rows = None, seed = 42,
-            verbose = false
+            verbose = 0
         ))]
         #[allow(clippy::too_many_arguments)]
         fn build(
@@ -53,11 +55,16 @@ ann_handle!(
             quant_drop_ratio: Option<f64>,
             quant_sample_rows: Option<usize>,
             seed: usize,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<Self> {
             let qp = quant_params(quant_drop_ratio, quant_sample_rows, seed);
             build_dispatch!(py, x, ExhaustiveSq8Inner, |data, n, dim| {
-                build_exhaustive_sq8_index((data, n, dim), &metric, qp, verbose)
+                build_exhaustive_sq8_index(
+                    (data, n, dim),
+                    &metric,
+                    qp,
+                    parse_annsearch_verbosity(verbose),
+                )
             })
         }
 
@@ -68,30 +75,43 @@ ann_handle!(
         /// * `q` - Queries by features, matching the index's float type.
         /// * `k` - Neighbours per query.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`. Distances are the codec's estimate. See
         /// [`QueryOut`].
-        #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
         fn query<'py>(
             &self,
             py: Python<'py>,
             q: &Bound<'py, PyAny>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveSq8Inner::F32(idx) => {
                     query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                        query_exhaustive_sq8_index((data, n, dim), idx, k, return_distance, verbose)
+                        query_exhaustive_sq8_index(
+                            (data, n, dim),
+                            idx,
+                            k,
+                            return_distance,
+                            parse_annsearch_verbosity(verbose),
+                        )
                     })
                 }
                 ExhaustiveSq8Inner::F64(idx) => {
                     query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                        query_exhaustive_sq8_index((data, n, dim), idx, k, return_distance, verbose)
+                        query_exhaustive_sq8_index(
+                            (data, n, dim),
+                            idx,
+                            k,
+                            return_distance,
+                            parse_annsearch_verbosity(verbose),
+                        )
                     })
                 }
             }
@@ -103,18 +123,19 @@ ann_handle!(
         ///
         /// * `k` - Neighbours per point.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-        #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
         fn query_self<'py>(
             &self,
             py: Python<'py>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveSq8Inner::F32(idx) => {
@@ -122,7 +143,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
                 ExhaustiveSq8Inner::F64(idx) => {
@@ -130,7 +151,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
             }

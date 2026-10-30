@@ -74,8 +74,9 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.ExhaustiveGpu
@@ -85,14 +86,14 @@ class ExhaustiveGpuIndex(_BaseGpuIndex):
         self,
         n_neighbors: int = 15,
         metric: str = "euclidean",
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.ExhaustiveGpu.build(x, metric=self._core_metric)
+        return _core.ExhaustiveGpu.build(x, metric=self._core_metric, verbose=self.verbose)
 
 
 class IvfGpuIndex(_BaseGpuIndex):
@@ -126,8 +127,9 @@ class IvfGpuIndex(_BaseGpuIndex):
             memory and lifts effective bandwidth on the assignment kernels, at
             the cost of needing ``shader-f16`` on the adapter.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.IvfGpu
@@ -145,7 +147,7 @@ class IvfGpuIndex(_BaseGpuIndex):
         kmeans_balanced: bool = False,
         quantise_to_f16: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -222,8 +224,9 @@ class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
         expand_per_iter: Extra neighbours explored per beam iteration, usually
             1 to 4. Search-time.
         seed: Fixes the seed graph and the sampling.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
 
     Note:
         The four beam parameters are all-or-nothing. Leave every one of them
@@ -263,7 +266,7 @@ class CagraGpuIndex(ExtractKnnMixin, _BaseGpuIndex):
         n_entry_points: int | None = None,
         expand_per_iter: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric

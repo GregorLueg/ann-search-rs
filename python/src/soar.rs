@@ -5,6 +5,7 @@
 //! is not supported.
 
 use ann_search_rs::cpu::soar::SoarIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::prelude::SoarRule;
 use ann_search_rs::utils::k_means_utils::{DEFAULT_ORTHOGONAL_LAMBDA, DEFAULT_SHIFT_MU};
 use ann_search_rs::{build_soar_index, query_soar_index, query_soar_self};
@@ -72,7 +73,8 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate default.
     /// * `kmeans_balanced` - Reseed starved centroids each iteration.
     /// * `seed` - Fixes the k-means initialisation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -80,7 +82,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, nlist = None, rule = None, rule_param = None, kmeans_iters = None,
-        kmeans_balanced = false, seed = 42, verbose = false
+        kmeans_balanced = false, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -93,7 +95,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let rule = soar_rule(rule, rule_param).map_err(PyValueError::new_err)?;
         let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
@@ -104,7 +106,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
             kmp,
             &metric,
             seed,
-            verbose
+            parse_annsearch_verbosity(verbose)
         ))
     }
 
@@ -117,12 +119,13 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     /// * `nprobe` - Cells to visit, or `None` for the library's heuristic. The
     ///   main recall knob.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, nprobe = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, nprobe = None, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -130,14 +133,28 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
         k: usize,
         nprobe: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             SoarInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_soar_index((data, n, dim), idx, k, nprobe, return_distance, verbose)
+                query_soar_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    nprobe,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             SoarInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_soar_index((data, n, dim), idx, k, nprobe, return_distance, verbose)
+                query_soar_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    nprobe,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -151,19 +168,20 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     /// * `k` - Neighbours per point.
     /// * `nprobe` - Cells to visit, or `None` for the heuristic.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, nprobe = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, nprobe = None, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         nprobe: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             SoarInner::F32(idx) => {
@@ -172,7 +190,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
                     k,
                     nprobe,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
             SoarInner::F64(idx) => {
@@ -181,7 +199,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
                     k,
                     nprobe,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
         }

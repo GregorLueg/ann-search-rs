@@ -9,6 +9,7 @@
 //! the same default, so the two sides of the Python surface behave alike.
 
 use ann_search_rs::cpu::lsh::LSHIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_lsh_index, query_lsh_index, query_lsh_self};
 use pyo3::prelude::*;
 
@@ -61,13 +62,16 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
     ///   for cosine, 2 for squared Euclidean, which needs more than a sign to
     ///   see vector magnitude.
     /// * `seed` - Fixes the random projections.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle, or a build error when `bits_per_hash` is out of range
     /// or the dataset is too large for the hash width.
     #[staticmethod]
-    #[pyo3(signature = (x, *, metric, num_tables, bits_per_hash, slot_bits = None, seed = 42))]
+    #[pyo3(signature = (x, *, metric, num_tables, bits_per_hash, slot_bits = None, seed = 42, verbose = 0))]
+    #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
@@ -76,6 +80,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
         bits_per_hash: usize,
         slot_bits: Option<usize>,
         seed: usize,
+        verbose: usize,
     ) -> PyResult<Self> {
         build_dispatch!(py, x, LshInner, |data, n, dim| build_lsh_index(
             (data, n, dim),
@@ -83,7 +88,8 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
             num_tables,
             bits_per_hash,
             slot_bits,
-            seed
+            seed,
+            parse_annsearch_verbosity(verbose),
         ))
     }
 
@@ -98,14 +104,14 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
     /// * `max_candidates` - Cap on candidates scored per query, or `None` for
     ///   no cap.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`. Also
-    ///   reports the miss rate, since a query can hash into empty buckets.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
     #[pyo3(signature = (
-        q, k, *, n_probe = None, max_candidates = None, return_distance = true, verbose = false
+        q, k, *, n_probe = None, max_candidates = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
@@ -116,7 +122,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
         n_probe: Option<usize>,
         max_candidates: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let probes = n_probe.unwrap_or_else(|| self.num_projections());
         match &self.inner {
@@ -128,7 +134,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
                     probes,
                     max_candidates,
                     return_distance,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             }),
             LshInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
@@ -139,7 +145,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
                     probes,
                     max_candidates,
                     return_distance,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             }),
         }
@@ -154,13 +160,14 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
     ///   projection.
     /// * `max_candidates` - Cap on candidates scored per point, or `None`.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
     #[pyo3(signature = (
-        k, *, n_probe = None, max_candidates = None, return_distance = true, verbose = false
+        k, *, n_probe = None, max_candidates = None, return_distance = true, verbose = 0
     ))]
     fn query_self<'py>(
         &self,
@@ -169,7 +176,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
         n_probe: Option<usize>,
         max_candidates: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             LshInner::F32(idx) => self_arm!(py, k, || query_lsh_self(
@@ -178,7 +185,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
                 n_probe,
                 max_candidates,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
             LshInner::F64(idx) => self_arm!(py, k, || query_lsh_self(
                 idx,
@@ -186,7 +193,7 @@ ann_handle!(PyLsh, LshInner, LSHIndex, "Lsh", {
                 n_probe,
                 max_candidates,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
         }
     }

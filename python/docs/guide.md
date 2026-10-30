@@ -134,8 +134,10 @@ or a shape mismatch, `TypeError` for a non-numeric array, and `NotFittedError`
 
 ## Sharp edges
 
-- `verbose=True` writes to the process stdout, not `sys.stdout`. In Jupyter that
-  lands in the terminal running the kernel, not in the cell.
+- `verbose` is a level: `0` quiet (the default), `1` start, end and progress
+  of builds and queries, `2` adds timed build stages and per-iteration lines.
+  It writes to the process stdout, not `sys.stdout`. In Jupyter that lands in
+  the terminal running the kernel, not in the cell.
 - Ctrl-C can't interrupt an index build. Python signal handlers only run while
   the GIL is held, and the build releases it.
 - `return_distance=False` saves the copy into numpy but not the distance

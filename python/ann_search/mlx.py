@@ -75,7 +75,8 @@ class ExhaustiveMlxIndex(_BaseMlxIndex):
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
-        verbose: Device versus host time split, to the process stdout.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.ExhaustiveMlx
@@ -85,14 +86,14 @@ class ExhaustiveMlxIndex(_BaseMlxIndex):
         self,
         n_neighbors: int = 15,
         metric: str = "euclidean",
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.ExhaustiveMlx.build(x, metric=self._core_metric)
+        return _core.ExhaustiveMlx.build(x, metric=self._core_metric, verbose=self.verbose)
 
 
 class IvfMlxIndex(_BaseMlxIndex):
@@ -112,7 +113,8 @@ class IvfMlxIndex(_BaseMlxIndex):
             runs; MLX k-means has no early stop.
         kmeans_balanced: Reseed starved centroids each iteration.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.IvfMlx
@@ -129,7 +131,7 @@ class IvfMlxIndex(_BaseMlxIndex):
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -179,7 +181,8 @@ class CagraMlxIndex(ExtractKnnMixin, _BaseMlxIndex):
         n_entry_points: Entry points per query. Search-time.
         expand_per_iter: Beam entries expanded per iteration. Search-time.
         seed: Fixes the seed graph and the sampling.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
 
     Note:
         The four beam parameters are all-or-nothing, exactly as on
@@ -215,7 +218,7 @@ class CagraMlxIndex(ExtractKnnMixin, _BaseMlxIndex):
         n_entry_points: int | None = None,
         expand_per_iter: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric

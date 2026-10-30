@@ -4,6 +4,7 @@
 //! IVF's vector memory, and the integer kernels usually make the scan faster
 //! rather than slower.
 
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::prelude::DimensionValidation;
 use ann_search_rs::quantised::ivf_sq8::IvfSq8Index;
 use ann_search_rs::{build_ivf_sq8_index, query_ivf_sq8_index, query_ivf_sq8_self};
@@ -33,7 +34,8 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     ///   auto-pick.
     /// * `seed` - Fixes the k-means initialisation and the calibration
     ///   sample.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -42,7 +44,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     #[staticmethod]
     #[pyo3(signature = (
             x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
-            quant_drop_ratio = None, quant_sample_rows = None, seed = 42, verbose = false
+            quant_drop_ratio = None, quant_sample_rows = None, seed = 42, verbose = 0
         ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -55,7 +57,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
         quant_drop_ratio: Option<f64>,
         quant_sample_rows: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
         let qp = quant_params(quant_drop_ratio, quant_sample_rows, seed);
@@ -66,7 +68,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
             &metric,
             seed,
             qp,
-            verbose
+            parse_annsearch_verbosity(verbose)
         ))
     }
 
@@ -79,12 +81,13 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     /// * `nprobe` - Cells to visit, or `None` for the library's heuristic.
     ///   The main recall knob.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, nprobe = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, nprobe = None, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -92,14 +95,28 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
         k: usize,
         nprobe: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             IvfSq8Inner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_ivf_sq8_index((data, n, dim), idx, k, nprobe, return_distance, verbose)
+                query_ivf_sq8_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    nprobe,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             IvfSq8Inner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_ivf_sq8_index((data, n, dim), idx, k, nprobe, return_distance, verbose)
+                query_ivf_sq8_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    nprobe,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -114,19 +131,20 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     /// * `k` - Neighbours per point.
     /// * `nprobe` - Cells to visit, or `None` for the heuristic.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, nprobe = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, nprobe = None, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         nprobe: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             IvfSq8Inner::F32(idx) => {
@@ -135,7 +153,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
                     k,
                     nprobe,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
             IvfSq8Inner::F64(idx) => {
@@ -144,7 +162,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
                     k,
                     nprobe,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
         }

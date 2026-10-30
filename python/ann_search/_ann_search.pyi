@@ -54,7 +54,7 @@ class _Handle:
         k: int,
         *,
         return_distance: bool = ...,
-        verbose: bool = ...,
+        verbose: int = ...,
         **kwargs: Any,
     ) -> tuple[np.ndarray, np.ndarray | None]: ...
     def query_self(
@@ -62,7 +62,7 @@ class _Handle:
         k: int,
         *,
         return_distance: bool = ...,
-        verbose: bool = ...,
+        verbose: int = ...,
         **kwargs: Any,
     ) -> tuple[np.ndarray, np.ndarray | None]: ...
     def save(self, path: Path, /) -> None: ...
@@ -144,7 +144,7 @@ class _GpuHandle:
         k: int,
         *,
         return_distance: bool = ...,
-        verbose: bool = ...,
+        verbose: int = ...,
         **kwargs: Any,
     ) -> tuple[np.ndarray, np.ndarray | None]: ...
     def query_self(
@@ -152,7 +152,7 @@ class _GpuHandle:
         k: int,
         *,
         return_distance: bool = ...,
-        verbose: bool = ...,
+        verbose: int = ...,
         **kwargs: Any,
     ) -> tuple[np.ndarray, np.ndarray | None]: ...
 

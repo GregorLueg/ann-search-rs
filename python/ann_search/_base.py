@@ -71,7 +71,7 @@ class BaseAnnIndex:
     # them off the instance.
     n_neighbors: int
     metric: str
-    verbose: bool
+    verbose: int
 
     # Unfitted state, as class attributes so subclasses need no `super().__init__`.
     _handle: _Handle | None = None

@@ -79,8 +79,9 @@ class ExhaustiveBf16Index(_BaseQuantisedIndex):
         n_neighbors: Neighbours per query, and the default ``k`` for
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"`` or ``"cosine"``.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.ExhaustiveBf16
@@ -90,7 +91,7 @@ class ExhaustiveBf16Index(_BaseQuantisedIndex):
         self,
         n_neighbors: int = 15,
         metric: str = "euclidean",
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -129,7 +130,8 @@ class IvfBf16Index(_BaseQuantisedIndex):
         kmeans_balanced: Reseed starved centroids each iteration, evening out
             the posting lists.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.IvfBf16
@@ -145,7 +147,7 @@ class IvfBf16Index(_BaseQuantisedIndex):
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -197,7 +199,8 @@ class ExhaustiveSq8Index(_BaseQuantisedIndex):
         quant_sample_rows: Rows sampled to calibrate the range. ``None``
             auto-picks, capped at the dataset size.
         seed: Fixes the calibration row sample.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.ExhaustiveSq8
@@ -210,7 +213,7 @@ class ExhaustiveSq8Index(_BaseQuantisedIndex):
         quant_drop_ratio: float | None = None,
         quant_sample_rows: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -260,7 +263,8 @@ class IvfSq8Index(_BaseQuantisedIndex):
         quant_sample_rows: Rows sampled to calibrate the range. ``None``
             auto-picks.
         seed: Fixes k-means initialisation and the calibration sample.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.IvfSq8
@@ -278,7 +282,7 @@ class IvfSq8Index(_BaseQuantisedIndex):
         quant_drop_ratio: float | None = None,
         quant_sample_rows: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -338,7 +342,8 @@ class HnswSq8uIndex(_BaseQuantisedIndex):
         quant_sample_rows: Rows sampled to calibrate the range. ``None``
             auto-picks.
         seed: Fixes the level assignment and the calibration sample.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.HnswSq8u
@@ -355,7 +360,7 @@ class HnswSq8uIndex(_BaseQuantisedIndex):
         quant_drop_ratio: float | None = None,
         quant_sample_rows: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -416,7 +421,8 @@ class HnswRaBitQIndex(_BaseQuantisedIndex):
         ef_search: Beam width at query time, the recall knob. Search-time:
             override it per call as ``index.kneighbors(ef_search=200)``.
         seed: Fixes the level assignment, the rotation and the k-means.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.HnswRaBitQ
@@ -433,7 +439,7 @@ class HnswRaBitQIndex(_BaseQuantisedIndex):
         nlist: int | None = None,
         ef_search: int = 100,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -487,8 +493,8 @@ class QgIndex(_BaseQuantisedIndex):
         ef_search: Beam width at query time, the recall knob. Search-time:
             override it per call as ``index.kneighbors(ef_search=200)``.
         seed: Fixes the graph and the rotation.
-        verbose: Progress to the process stdout on query, not ``sys.stdout``.
-            The build is silent.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.Qg
@@ -505,7 +511,7 @@ class QgIndex(_BaseQuantisedIndex):
         alpha_pass2: float = 1.2,
         ef_search: int = 100,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -526,6 +532,7 @@ class QgIndex(_BaseQuantisedIndex):
             alpha_pass1=self.alpha_pass1,
             alpha_pass2=self.alpha_pass2,
             seed=self.seed,
+            verbose=self.verbose,
         )
 
 
@@ -559,7 +566,8 @@ class ExhaustivePqIndex(_BaseQuantisedIndex):
             makes a code fit in a byte. Cannot exceed the sample count, so a
             small dataset needs this lowered.
         seed: Fixes the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.ExhaustivePq
@@ -573,7 +581,7 @@ class ExhaustivePqIndex(_BaseQuantisedIndex):
         max_iters: int | None = None,
         n_pq_centroids: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m
@@ -618,7 +626,8 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
             crate default. This is the build-cost knob.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         seed: Fixes the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.ExhaustiveOpq
@@ -632,7 +641,7 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
         max_iters: int | None = None,
         n_pq_centroids: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m
@@ -677,7 +686,8 @@ class IvfPqIndex(_BaseQuantisedIndex):
         kmeans_balanced: Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         seed: Fixes both the cell and the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.IvfPq
@@ -695,7 +705,7 @@ class IvfPqIndex(_BaseQuantisedIndex):
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m
@@ -744,7 +754,8 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         opq_iters: Alternating rotation/codebook iterations. ``None`` uses the
             crate default. This is the build-cost knob.
         seed: Fixes both the cell and the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.IvfOpq
@@ -763,7 +774,7 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         n_pq_centroids: int | None = None,
         opq_iters: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m
@@ -823,7 +834,8 @@ class SoarPqIndex(_BaseQuantisedIndex):
         kmeans_balanced: Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         seed: Fixes both the cell and the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.SoarPq
@@ -843,7 +855,7 @@ class SoarPqIndex(_BaseQuantisedIndex):
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m
@@ -904,7 +916,8 @@ class SoarOpqIndex(_BaseQuantisedIndex):
         opq_iters: Alternating rotation/codebook iterations. ``None`` uses the
             crate default. This is the build-cost knob.
         seed: Fixes both the cell and the codebook initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``.
     """
 
     _HANDLE = _core.SoarOpq
@@ -925,7 +938,7 @@ class SoarOpqIndex(_BaseQuantisedIndex):
         n_pq_centroids: int | None = None,
         opq_iters: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.m = m

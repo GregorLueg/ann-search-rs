@@ -7,6 +7,12 @@ Changes to the `ann-search` Python package. The Rust crate it wraps,
 
 Requires `ann-search-rs` 0.12.0
 
+- `verbose` takes an integer level instead of a bool: `0` quiet (default), `1`
+  build and query start, end and progress, `2` adds timed build stages and
+  per-iteration lines. `verbose=True` still works and maps to `1`.
+- Every estimator now passes `verbose` to its build as well as its queries.
+  Exhaustive (CPU, GPU, MLX), Annoy, BallTree, KdTree, LSH, Vamana and QG
+  printed nothing during `fit` before.
 - Smaller indices: the crate stores point ids as `u32` and the NN-Descent
   index no longer keeps a second copy of the vectors in its forest. The Python
   API is unchanged.

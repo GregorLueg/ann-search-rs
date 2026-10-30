@@ -4,6 +4,7 @@
 //! larger index, as with Annoy, but the splits are axis-aligned.
 
 use ann_search_rs::cpu::kd_forest::KdTreeIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_kd_tree_index, query_kd_tree_index, query_kd_tree_self};
 use pyo3::prelude::*;
 
@@ -19,21 +20,30 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
     /// * `metric` - Already validated by the Python layer.
     /// * `n_trees` - Trees in the forest. Trades index size for recall.
     /// * `seed` - Fixes the split dimensions and the spill overlap.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle. This builder cannot fail.
     #[staticmethod]
-    #[pyo3(signature = (x, *, metric, n_trees, seed = 42))]
+    #[pyo3(signature = (x, *, metric, n_trees, seed = 42, verbose = 0))]
     fn build(
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
         metric: String,
         n_trees: usize,
         seed: usize,
+        verbose: usize,
     ) -> PyResult<Self> {
         build_dispatch!(py, x, KdTreeInner, |data, n, dim| {
-            build_kd_tree_index((data, n, dim), &metric, n_trees, seed)
+            build_kd_tree_index(
+                (data, n, dim),
+                &metric,
+                n_trees,
+                seed,
+                parse_annsearch_verbosity(verbose),
+            )
         })
     }
 
@@ -46,12 +56,13 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
     /// * `search_budget` - Candidates to inspect, or `None` for the library's
     ///   own heuristic. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, search_budget = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, search_budget = None, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -59,7 +70,7 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
         k: usize,
         search_budget: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             KdTreeInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
@@ -69,7 +80,7 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
                     k,
                     search_budget,
                     return_distance,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             }),
             KdTreeInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
@@ -79,7 +90,7 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
                     k,
                     search_budget,
                     return_distance,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             }),
         }
@@ -92,19 +103,20 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
     /// * `k` - Neighbours per point.
     /// * `search_budget` - Candidates to inspect, or `None` for the heuristic.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, search_budget = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, search_budget = None, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         search_budget: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             KdTreeInner::F32(idx) => self_arm!(py, k, || query_kd_tree_self(
@@ -112,14 +124,14 @@ ann_handle!(PyKdTree, KdTreeInner, KdTreeIndex, "KdTree", {
                 k,
                 search_budget,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
             KdTreeInner::F64(idx) => self_arm!(py, k, || query_kd_tree_self(
                 idx,
                 k,
                 search_budget,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
         }
     }

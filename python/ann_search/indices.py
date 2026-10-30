@@ -46,8 +46,9 @@ class ExhaustiveIndex(BaseAnnIndex):
             `kneighbors`.
         metric: ``"euclidean"``/``"l2"``, ``"sqeuclidean"``, ``"cosine"`` or
             ``"manhattan"``/``"l1"``.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Exhaustive
@@ -57,14 +58,14 @@ class ExhaustiveIndex(BaseAnnIndex):
         self,
         n_neighbors: int = 15,
         metric: str = "euclidean",
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.Exhaustive.build(x, metric=self._core_metric)
+        return _core.Exhaustive.build(x, metric=self._core_metric, verbose=self.verbose)
 
 
 class KmknnIndex(BaseAnnIndex):
@@ -87,8 +88,9 @@ class KmknnIndex(BaseAnnIndex):
             default because it changes the partition, and therefore the index
             built on it.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Kmknn
@@ -103,7 +105,7 @@ class KmknnIndex(BaseAnnIndex):
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -141,8 +143,9 @@ class AnnoyIndex(BaseAnnIndex):
             ``None`` defaults to ``k * n_trees * 20``. Search-time: override it
             per call as ``index.kneighbors(search_budget=5000)``.
         seed: Fixes the random hyperplanes.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Annoy
@@ -157,7 +160,7 @@ class AnnoyIndex(BaseAnnIndex):
         n_trees: int = 25,
         search_budget: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -168,7 +171,8 @@ class AnnoyIndex(BaseAnnIndex):
 
     def _build(self, x: np.ndarray) -> Any:
         return _core.Annoy.build(
-            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed
+            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed,
+            verbose=self.verbose,
         )
 
 
@@ -199,8 +203,9 @@ class HnswIndex(BaseAnnIndex):
             fill it. Search-time: override it per call as
             ``index.kneighbors(ef_search=200)``.
         seed: Fixes the layer assignment.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Hnsw
@@ -215,7 +220,7 @@ class HnswIndex(BaseAnnIndex):
         ef_construction: int = 200,
         ef_search: int = 50,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -262,8 +267,9 @@ class IvfIndex(BaseAnnIndex):
             posting lists, at the cost of a partition that no longer matches an
             unbalanced run.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Ivf
@@ -280,7 +286,7 @@ class IvfIndex(BaseAnnIndex):
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -351,8 +357,9 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
             ``index.kneighbors(ef_search=200)``. Irrelevant to `extract_knn`,
             which does not search.
         seed: Fixes the seed graph and the sampling.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.NnDescent
@@ -370,7 +377,7 @@ class NNDescentIndex(ExtractKnnMixin, BaseAnnIndex):
         n_trees: int | None = None,
         ef_search: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -423,8 +430,9 @@ class VamanaIndex(BaseAnnIndex):
             to 75, and any value is raised to ``k``. Search-time: override it
             per call as ``index.kneighbors(ef_search=200)``.
         seed: Fixes the entry point and the pruning order.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Vamana
@@ -441,7 +449,7 @@ class VamanaIndex(BaseAnnIndex):
         alpha_pass2: float = 1.2,
         ef_search: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -462,6 +470,7 @@ class VamanaIndex(BaseAnnIndex):
             alpha_pass1=self.alpha_pass1,
             alpha_pass2=self.alpha_pass2,
             seed=self.seed,
+            verbose=self.verbose,
         )
 
 
@@ -487,8 +496,9 @@ class NsgIndex(BaseAnnIndex):
             to 100, and any value is raised to ``k``. Search-time: override it
             per call as ``index.kneighbors(ef_search=200)``.
         seed: Fixes the initial graph and the navigating node.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Nsg
@@ -505,7 +515,7 @@ class NsgIndex(BaseAnnIndex):
         knn_k: int = 64,
         ef_search: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -550,8 +560,9 @@ class BallTreeIndex(BaseAnnIndex):
             Search-time: override it per call as
             ``index.kneighbors(search_budget=5000)``.
         seed: Fixes the pivot choice at each split.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.BallTree
@@ -565,7 +576,7 @@ class BallTreeIndex(BaseAnnIndex):
         metric: str = "euclidean",
         search_budget: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -574,7 +585,7 @@ class BallTreeIndex(BaseAnnIndex):
         self.verbose = verbose
 
     def _build(self, x: np.ndarray) -> Any:
-        return _core.BallTree.build(x, metric=self._core_metric, seed=self.seed)
+        return _core.BallTree.build(x, metric=self._core_metric, seed=self.seed, verbose=self.verbose)
 
 
 class KdTreeIndex(BaseAnnIndex):
@@ -595,8 +606,9 @@ class KdTreeIndex(BaseAnnIndex):
             ``None`` defaults to ``k * n_trees * 20``. Search-time: override it
             per call as ``index.kneighbors(search_budget=5000)``.
         seed: Fixes the split dimensions and the spill overlap.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
 
     Note:
         The trees are spill-trees: points near a split land in both children,
@@ -616,7 +628,7 @@ class KdTreeIndex(BaseAnnIndex):
         n_trees: int = 25,
         search_budget: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -627,7 +639,8 @@ class KdTreeIndex(BaseAnnIndex):
 
     def _build(self, x: np.ndarray) -> Any:
         return _core.KdTree.build(
-            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed
+            x, metric=self._core_metric, n_trees=self.n_trees, seed=self.seed,
+            verbose=self.verbose,
         )
 
 
@@ -661,8 +674,9 @@ class LshIndex(BaseAnnIndex):
         max_candidates: Cap on candidates scored per query. ``None`` means no
             cap, so every point the probes turned up gets scored. Search-time.
         seed: Fixes the random projections.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.Lsh
@@ -680,7 +694,7 @@ class LshIndex(BaseAnnIndex):
         n_probe: int | None = None,
         max_candidates: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -700,6 +714,7 @@ class LshIndex(BaseAnnIndex):
             bits_per_hash=self.bits_per_hash,
             slot_bits=self.slot_bits,
             seed=self.seed,
+            verbose=self.verbose,
         )
 
 
@@ -741,8 +756,9 @@ class SoarIndex(BaseAnnIndex):
             defaults to 30.
         kmeans_balanced: Reseed starved centroids each iteration.
         seed: Fixes k-means initialisation.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
 
     Raises:
         ValueError: On `fit`, if `rule` is not one of the three names.
@@ -764,7 +780,7 @@ class SoarIndex(BaseAnnIndex):
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric
@@ -824,8 +840,9 @@ class RnnDescentIndex(BaseAnnIndex):
         k_search: Neighbours expanded per hop during the search. ``None``
             defaults to 32, capped at `r`. Search-time.
         seed: Fixes the seed graph and the sampling.
-        verbose: Progress to the process stdout, not ``sys.stdout``. In Jupyter
-            that lands in the terminal running the kernel.
+        verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
+            process stdout, not ``sys.stdout``; in Jupyter that is the
+            terminal running the kernel.
     """
 
     _HANDLE = _core.RnnDescent
@@ -844,7 +861,7 @@ class RnnDescentIndex(BaseAnnIndex):
         ef_search: int | None = None,
         k_search: int | None = None,
         seed: int = 42,
-        verbose: bool = False,
+        verbose: int = 0,
     ) -> None:
         self.n_neighbors = n_neighbors
         self.metric = metric

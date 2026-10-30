@@ -12,6 +12,7 @@
 
 use ann_search_rs::gpu::cagra_gpu_search::CagraGpuSearchParams;
 use ann_search_rs::gpu::nndescent_gpu::NNDescentGpu;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{
     build_nndescent_index_gpu, extract_nndescent_knn_gpu, query_nndescent_index_gpu,
     query_nndescent_index_gpu_self,
@@ -72,7 +73,8 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
     /// * `retain_gpu` - Upload the navigational graph at build time. On by
     ///   default: the first query would otherwise pay for it.
     /// * `seed` - Fixes the seed graph.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -80,7 +82,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, k = None, build_k = None, max_iters = None, n_trees = None, delta = None,
-        rho = None, refine_knn = None, retain_gpu = true, seed = 42, verbose = false
+        rho = None, refine_knn = None, retain_gpu = true, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -96,7 +98,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
         refine_knn: Option<usize>,
         retain_gpu: bool,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let a = f32_array!(x);
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -114,7 +116,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
                         rho,
                         refine_knn,
                         seed,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                         retain_gpu,
                         default_device(),
                     )
@@ -135,14 +137,15 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
     /// * `n_entry_points` - Graph entry points, or `None`.
     /// * `expand_per_iter` - Neighbours explored per iteration, or `None`.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
     #[pyo3(signature = (
         q, k, *, beam_width = None, max_beam_iters = None, n_entry_points = None,
-        expand_per_iter = None, return_distance = true, verbose = false
+        expand_per_iter = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
@@ -154,7 +157,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
         n_entry_points: Option<usize>,
         expand_per_iter: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let py = slf.py();
         let a = f32_array!(q);
@@ -171,7 +174,7 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
                         k,
                         params,
                         return_distance,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                     )
                 })
             })
@@ -193,15 +196,15 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
     /// * `n_entry_points` - Graph entry points, or `None`.
     /// * `expand_per_iter` - Neighbours explored per iteration, or `None`.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Accepted and ignored; the library's self-query takes no
-    ///   verbosity flag. Present so the estimator can pass it uniformly.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
     #[pyo3(signature = (
         k, *, beam_width = None, max_beam_iters = None, n_entry_points = None,
-        expand_per_iter = None, return_distance = true, verbose = false
+        expand_per_iter = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query_self<'py>(
@@ -212,16 +215,23 @@ gpu_handle!(PyCagraGpu, NNDescentGpu, "CagraGpu", {
         n_entry_points: Option<usize>,
         expand_per_iter: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
-        let _ = verbose;
         let py = slf.py();
         let params = cagra_params(beam_width, max_beam_iters, n_entry_points, expand_per_iter);
         let mut guard = slf.borrow_mut();
         let idx = &mut guard.inner;
         let (ids, dists) = py
             .detach(|| {
-                crate::pool::run(|| query_nndescent_index_gpu_self(idx, k, params, return_distance))
+                crate::pool::run(|| {
+                    query_nndescent_index_gpu_self(
+                        idx,
+                        k,
+                        params,
+                        return_distance,
+                        parse_annsearch_verbosity(verbose),
+                    )
+                })
             })
             .map_err(crate::error::AnnErr)?;
         drop(guard);

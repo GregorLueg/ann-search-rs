@@ -4,6 +4,7 @@
 //! HNSW has no internal default to fall back on.
 
 use ann_search_rs::cpu::hnsw::HnswIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self};
 use pyo3::prelude::*;
 
@@ -21,14 +22,15 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
     ///   a better graph and a slower build.
     /// * `metric` - Already validated by the Python layer.
     /// * `seed` - Level assignment is randomised; this fixes it.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle. This builder is infallible in the library, hence the
     /// `Ok` wrapper below.
     #[staticmethod]
-    #[pyo3(signature = (x, *, m, ef_construction, metric, seed = 42, verbose = false))]
+    #[pyo3(signature = (x, *, m, ef_construction, metric, seed = 42, verbose = 0))]
     fn build(
         py: Python<'_>,
         x: &Bound<'_, PyAny>,
@@ -36,10 +38,17 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
         ef_construction: usize,
         metric: String,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         build_dispatch!(py, x, HnswInner, |data, n, dim| {
-            build_hnsw_index((data, n, dim), m, ef_construction, &metric, seed, verbose)
+            build_hnsw_index(
+                (data, n, dim),
+                m,
+                ef_construction,
+                &metric,
+                seed,
+                parse_annsearch_verbosity(verbose),
+            )
         })
     }
 
@@ -51,12 +60,13 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
     /// * `k` - Neighbours per query.
     /// * `ef_search` - Candidate list size. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -64,14 +74,28 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
         k: usize,
         ef_search: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             HnswInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_hnsw_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_hnsw_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             HnswInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_hnsw_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_hnsw_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -85,19 +109,20 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
     /// * `k` - Neighbours per point.
     /// * `ef_search` - Candidate list size. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         ef_search: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             HnswInner::F32(idx) => {
@@ -106,7 +131,7 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
                     k,
                     ef_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
             HnswInner::F64(idx) => {
@@ -115,7 +140,7 @@ ann_handle!(PyHnsw, HnswInner, HnswIndex, "Hnsw", {
                     k,
                     ef_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
         }

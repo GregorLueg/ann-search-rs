@@ -5,6 +5,7 @@
 //! regardless of the index element type, so no cast is needed here.
 
 use ann_search_rs::cpu::vamana::VamanaIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_vamana_index, query_vamana_index, query_vamana_self};
 use pyo3::prelude::*;
 
@@ -25,12 +26,14 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
     /// * `alpha_pass2` - Relaxation factor for the second. Above 1.0 keeps
     ///   longer edges, which shortens search paths.
     /// * `seed` - Fixes the entry point and traversal order.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle. Infallible in the library, hence the `Ok` wrapper.
     #[staticmethod]
-    #[pyo3(signature = (x, *, metric, r, l_build, alpha_pass1, alpha_pass2, seed = 42))]
+    #[pyo3(signature = (x, *, metric, r, l_build, alpha_pass1, alpha_pass2, seed = 42, verbose = 0))]
     #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
@@ -41,6 +44,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
         alpha_pass1: f32,
         alpha_pass2: f32,
         seed: usize,
+        verbose: usize,
     ) -> PyResult<Self> {
         build_dispatch!(py, x, VamanaInner, |data, n, dim| {
             build_vamana_index(
@@ -52,6 +56,7 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
                 alpha_pass2,
                 &metric,
                 seed,
+                parse_annsearch_verbosity(verbose),
             )
         })
     }
@@ -65,12 +70,13 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
     /// * `ef_search` - Candidate list size, or `None` for the library's
     ///   heuristic. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, ef_search = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, ef_search = None, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -78,14 +84,28 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
         k: usize,
         ef_search: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             VamanaInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_vamana_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_vamana_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             VamanaInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_vamana_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_vamana_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -97,19 +117,20 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
     /// * `k` - Neighbours per point.
     /// * `ef_search` - Candidate list size, or `None` for the heuristic.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, ef_search = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, ef_search = None, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         ef_search: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             VamanaInner::F32(idx) => self_arm!(py, k, || query_vamana_self(
@@ -117,14 +138,14 @@ ann_handle!(PyVamana, VamanaInner, VamanaIndex, "Vamana", {
                 k,
                 ef_search,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
             VamanaInner::F64(idx) => self_arm!(py, k, || query_vamana_self(
                 idx,
                 k,
                 ef_search,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
         }
     }
