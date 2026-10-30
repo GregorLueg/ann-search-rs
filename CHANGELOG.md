@@ -37,6 +37,9 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   IVF-family id and offset arrays, the k-means assignments, the HNSW update
   buffers, the NN-Descent and NSG build buffers and the GPU/MLX host storage.
   Index arithmetic stays `usize`.
+- `build_nsg_index` runs its internal NN-Descent graph-only: no forest or
+  query graph, and the vectors move into the NSG instead of being copied. The
+  resulting index is identical.
 - Ball tree builds in place on the same pattern and drops `leaf_indices`, which
   had become the identity once the vectors were stored in leaf order.
 
