@@ -4433,6 +4433,109 @@ where
     NsgIndex::build_from_gpu_knn(knn_gpu, params, seed, verbose)
 }
 
+#[cfg(feature = "gpu")]
+/// Build an NSG index from a matrix, with the kNN graph built on the GPU.
+///
+/// Matrix in, NSG out. The kNN graph goes through
+/// [`build_clustered_knn_graph_gpu`], so a dataset past the device's
+/// per-binding limit is built in balanced batches. The vectors move from the
+/// kNN handoff into the NSG rather than being copied, and the kNN graph is
+/// dropped once the NSG is built. To sweep NSG parameters over one kNN graph,
+/// build it once and use [`build_nsg_from_gpu_knn`] instead.
+///
+/// ### Params
+///
+/// * `mat` - Input data as samples x features. Accepts a faer matrix, an
+///   ndarray 2-D array (with the `ndarray` feature) or a row-major
+///   `(&[T], n_samples, n_features)` tuple. See [`AnnMatrix`].
+/// * `r` - Maximum out-degree of the NSG graph
+/// * `l_build` - Beam width for the per-node candidate search on the input
+///   kNN graph
+/// * `c` - Cap on the candidate-set size before MRNG pruning
+/// * `dist_metric` - Distance metric string
+/// * `knn_params` - Optional [`crate::gpu::nndescent_gpu::NNDescentGpuKnnParams`]
+///   for the kNN graph; `k` is the input degree. `include_self` and
+///   `return_dist` are ignored. `None` uses the defaults.
+/// * `cluster_params` - Optional
+///   [`crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams`]; `None`
+///   plans the cluster count from the device limits
+/// * `seed` - Random seed
+/// * `verbose` - Print progress
+/// * `device` - CubeCL runtime device
+///
+/// ### Returns
+///
+/// The built [`NsgIndex`] on success.
+///
+/// ### Note
+///
+/// The GPU kNN graph is not reproducible run to run, so neither is the NSG.
+#[allow(clippy::too_many_arguments)]
+pub fn build_nsg_index_gpu<T>(
+    mat: impl AnnMatrix<T>,
+    r: usize,
+    l_build: usize,
+    c: usize,
+    dist_metric: &str,
+    knn_params: Option<crate::gpu::nndescent_gpu::NNDescentGpuKnnParams>,
+    cluster_params: Option<crate::gpu::clustered_nndescent_gpu::ClusteredBuildParams>,
+    seed: usize,
+    verbose: bool,
+    device: Device,
+) -> Result<NsgIndex<T>, AnnSearchErrors>
+where
+    T: AnnSearchFloat + CubeclFloat,
+    NsgIndex<T>: NsgState<T>,
+    NNDescent<T>: ApplySortedUpdates<T> + NNDescentQuery<T>,
+{
+    let mat = mat.into_row_major();
+    check_n_samples(mat.1, MAX_SAMPLES_NND)?;
+    let metric = parse_ann_dist(dist_metric).unwrap_or_else(|| {
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
+        Dist::default()
+    });
+    let p = knn_params.unwrap_or_default();
+
+    let KnnGraphGpu {
+        vectors_flat,
+        dim,
+        n,
+        k,
+        norms,
+        metric,
+        knn_graph,
+        ..
+    } = crate::gpu::clustered_nndescent_gpu::build_clustered_knn_graph_gpu::<T>(
+        mat,
+        metric,
+        Some(p.k),
+        p.build_k,
+        p.max_iters,
+        p.n_trees,
+        p.delta,
+        p.rho,
+        p.refine_knn,
+        cluster_params,
+        seed,
+        verbose,
+        device,
+    )?;
+
+    let params = NsgBuildParams::new(r, l_build, c, k);
+    NsgIndex::build_from_knn(
+        vectors_flat,
+        n,
+        dim,
+        norms,
+        metric,
+        &knn_graph,
+        k,
+        params,
+        seed,
+        verbose,
+    )
+}
+
 ////////////
 // Binary //
 ////////////
