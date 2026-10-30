@@ -212,6 +212,10 @@ name = "gridsearch_rabitq"
 required-features = ["binary"]
 
 [[example]]
+name = "gridsearch_store_encoding"
+required-features = ["binary"]
+
+[[example]]
 name = "gridsearch_tq"
 required-features = ["binary"]
 
