@@ -71,9 +71,9 @@ pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>
 /// `(new_temp, old_temp)` holding `(priority, pid)` entries.
 type CandScratch = (Vec<(u64, u32)>, Vec<(u64, u32)>);
 
-///////////////
-// Constants //
-///////////////
+////////////
+// Consts //
+////////////
 
 /// Target byte budget for one chunk's update batch.
 ///
@@ -209,58 +209,6 @@ fn resolve_build_params(
 // Build timings //
 ///////////////////
 
-/// Merged candidate-list size statistics, accumulated inside the local join.
-///
-/// The join is `O(|C_new| * |C_total|)` per node, so the distribution of
-/// `|C_total|` sets its cost. The merged forward+reverse list is uncapped, so
-/// that distribution is driven by the reverse in-degree tail. Always on: three
-/// integer ops per node against a quadratic distance loop.
-#[derive(Default, Clone, Copy)]
-struct CandStats {
-    /// Merged list lengths summed over the nodes seen
-    sum: usize,
-    /// Nodes seen
-    count: usize,
-    /// Longest merged list seen
-    max: usize,
-    /// Candidate pairs whose distance was evaluated
-    pairs: u64,
-}
-
-impl CandStats {
-    /// Record one node's merged candidate list length.
-    ///
-    /// ### Params
-    ///
-    /// * `n_total` - Length of the merged new + old candidate list
-    #[inline(always)]
-    fn record(&mut self, n_total: usize) {
-        self.sum += n_total;
-        self.count += 1;
-        if n_total > self.max {
-            self.max = n_total;
-        }
-    }
-
-    /// Combine two thread-local accumulators.
-    ///
-    /// ### Params
-    ///
-    /// * `other` - Accumulator to fold in
-    ///
-    /// ### Returns
-    ///
-    /// The combined statistics.
-    fn merge(self, other: Self) -> Self {
-        Self {
-            sum: self.sum + other.sum,
-            count: self.count + other.count,
-            max: self.max.max(other.max),
-            pairs: self.pairs + other.pairs,
-        }
-    }
-}
-
 /// Per-phase wall-clock breakdown of a build, accumulated across iterations.
 ///
 /// Reported at `Detailed`. Phases are timed from the driving loop rather
@@ -318,6 +266,62 @@ impl BuildTimings {
                 self.cand_len_max,
                 self.pairs.separate_with_underscores()
             );
+        }
+    }
+}
+
+/// Merged candidate-list size statistics, accumulated inside the local join.
+///
+/// The join is `O(|C_new| * |C_total|)` per node, so the distribution of
+/// `|C_total|` sets its cost. The merged forward+reverse list is uncapped, so
+/// that distribution is driven by the reverse in-degree tail. Always on: three
+/// integer ops per node against a quadratic distance loop.
+#[derive(Default, Clone, Copy)]
+struct CandStats {
+    /// Merged list lengths summed over the nodes seen
+    sum: usize,
+    /// Nodes seen
+    count: usize,
+    /// Longest merged list seen
+    max: usize,
+    /// Candidate pairs whose distance was evaluated
+    pairs: u64,
+}
+
+///////////////
+// CandStats //
+///////////////
+
+impl CandStats {
+    /// Record one node's merged candidate list length.
+    ///
+    /// ### Params
+    ///
+    /// * `n_total` - Length of the merged new + old candidate list
+    #[inline(always)]
+    fn record(&mut self, n_total: usize) {
+        self.sum += n_total;
+        self.count += 1;
+        if n_total > self.max {
+            self.max = n_total;
+        }
+    }
+
+    /// Combine two thread-local accumulators.
+    ///
+    /// ### Params
+    ///
+    /// * `other` - Accumulator to fold in
+    ///
+    /// ### Returns
+    ///
+    /// The combined statistics.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            sum: self.sum + other.sum,
+            count: self.count + other.count,
+            max: self.max.max(other.max),
+            pairs: self.pairs + other.pairs,
         }
     }
 }

@@ -12,6 +12,10 @@ use crate::utils::tree_utils::*;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
+////////////
+// Consts //
+////////////
+
 /// Sequential Lloyd passes on a small node's two-way split (an in-place
 /// 2-means). `train_centroids` is avoided because it fans out over rayon
 /// internally, which is wasteful inside an already parallel recursion.

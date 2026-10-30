@@ -19,6 +19,18 @@ use crate::utils::tree_utils::*;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
+////////////
+// Consts //
+////////////
+
+/// Number of top-spread dimensions to randomly select from. Provides diversity
+/// across trees in the forest without picking completely arbitrary axes.
+const TOP_K_DIMS: usize = 3;
+
+/// Maximum sample size for spread estimation and approximate median
+/// computation. Keeps build cost per node O(1) rather than O(n).
+const SUBSAMPLE_SIZE: usize = 128;
+
 /////////////
 // Helpers //
 /////////////
@@ -58,13 +70,7 @@ impl<T> KdFlatNode<T> {
     }
 }
 
-/// Number of top-spread dimensions to randomly select from. Provides diversity
-/// across trees in the forest without picking completely arbitrary axes.
-const TOP_K_DIMS: usize = 3;
 
-/// Maximum sample size for spread estimation and approximate median
-/// computation. Keeps build cost per node O(1) rather than O(n).
-const SUBSAMPLE_SIZE: usize = 128;
 
 /// Per-tree build scratch, reused across every node of the tree.
 struct KdScratch<T> {

@@ -111,9 +111,9 @@ pub(crate) struct TreeParts<T> {
     split_data: Vec<T>,
 }
 
-/////////////////
+////////////////
 // AnnoyTrees //
-/////////////////
+////////////////
 
 /// The random projection forest of an Annoy index, without the vectors.
 ///
