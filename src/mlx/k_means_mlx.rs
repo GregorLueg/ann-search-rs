@@ -410,7 +410,7 @@ pub fn k_means_clusters_mlx(
     params: Option<KMeansTrainingParams>,
     seed: usize,
     verbose: bool,
-) -> Result<(faer::Mat<f32>, Vec<usize>), AnnSearchErrors> {
+) -> Result<(faer::Mat<f32>, Vec<u32>), AnnSearchErrors> {
     let metric = parse_ann_dist(dist).unwrap_or_else(|| {
         println!("Unknown string provided ({dist:?}). Defaulting to Squared Euclidean");
         Dist::default()
@@ -431,8 +431,6 @@ pub fn k_means_clusters_mlx(
     let assignments = assign_all_mlx(&data, dim, &centroids, n_centroids, &metric, &s)?;
     crate::mlx::clear_cache()?;
     let mat = faer::Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
-    // Public signature stays usize for external callers.
-    let assignments = assignments.into_iter().map(|a| a as usize).collect();
     Ok((mat, assignments))
 }
 

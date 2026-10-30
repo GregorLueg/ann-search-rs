@@ -2102,7 +2102,7 @@ pub fn k_means_clusters_gpu<T>(
     seed: usize,
     device: Device,
     verbose: bool,
-) -> Result<(Mat<T>, Vec<usize>), AnnSearchErrors>
+) -> Result<(Mat<T>, Vec<u32>), AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
@@ -2131,8 +2131,6 @@ where
 
     let centroid_mat = Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
 
-    // Public signature stays usize for external callers.
-    let assignments = assignments.into_iter().map(|a| a as usize).collect();
     Ok((centroid_mat, assignments))
 }
 
@@ -3293,10 +3291,10 @@ mod tests {
 
         // Every blob must land wholly inside one cluster, and no two blobs
         // may share one.
-        let mut blob_to_cluster = vec![usize::MAX; n_blobs];
+        let mut blob_to_cluster = vec![u32::MAX; n_blobs];
         for (point, &cluster) in assignments.iter().enumerate() {
             let blob = point / per_blob;
-            if blob_to_cluster[blob] == usize::MAX {
+            if blob_to_cluster[blob] == u32::MAX {
                 blob_to_cluster[blob] = cluster;
             }
             assert_eq!(
@@ -3305,7 +3303,7 @@ mod tests {
                 blob
             );
         }
-        let distinct: std::collections::HashSet<usize> = blob_to_cluster.iter().copied().collect();
+        let distinct: std::collections::HashSet<u32> = blob_to_cluster.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             n_blobs,
@@ -3394,7 +3392,7 @@ mod tests {
             .unwrap();
             let mut counts = vec![0usize; k];
             for &a in &assignments {
-                counts[a] += 1;
+                counts[a as usize] += 1;
             }
             *counts.iter().max().unwrap()
         };
