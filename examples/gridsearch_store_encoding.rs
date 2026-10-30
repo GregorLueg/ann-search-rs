@@ -10,8 +10,7 @@ use tempfile::TempDir;
 use thousands::*;
 
 /// Encodings compared against each other at identical index parameters.
-const ENCODINGS: [StoreEncoding; 3] =
-    [StoreEncoding::Full, StoreEncoding::F16, StoreEncoding::Bf16];
+const ENCODINGS: [StoreEncoding; 2] = [StoreEncoding::Full, StoreEncoding::F16];
 
 /// Over-fetch factors for the re-ranking stage.
 const RERANK_FACTORS: [usize; 3] = [5, 10, 20];

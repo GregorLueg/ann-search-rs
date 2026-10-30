@@ -6,7 +6,7 @@
 //! [0..8)    magic        b"ANNVEC\0\0"
 //! [8..12)   version      u32
 //! [12]      float type   u8    0 f32, 1 f64; the norms, and full-precision rows
-//! [13]      row encoding u8    0 full, 1 f16, 2 bf16
+//! [13]      row encoding u8    0 full, 1 f16
 //! [14..16)  reserved
 //! [16..24)  n            u64
 //! [24..32)  dim          u64
@@ -21,7 +21,8 @@
 //! it on load, which catches a store swapped in from a different dataset.
 
 use bytemuck::Pod;
-use half::{bf16, f16};
+use half::f16;
+use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -55,6 +56,13 @@ const HEADER_LEN: usize = 64;
 /// the alignment of every element type.
 const SECTION_ALIGN: usize = 64;
 
+/// Elements decoded per step when scoring an f16 row. Squared Euclidean and
+/// the dot product are sums over elements, so a row is decoded into a stack
+/// buffer of this size and scored chunk by chunk with the full-precision
+/// kernels. Kept small because the buffer is zeroed on every call, which
+/// dominates at low dim with a larger one.
+const F16_CHUNK: usize = 64;
+
 ///////////////////
 // StoreEncoding //
 ///////////////////
@@ -72,8 +80,6 @@ pub enum StoreEncoding {
     /// IEEE half precision. Five exponent bits: values past 65504 do not fit
     /// and the build is refused.
     F16,
-    /// bfloat16. The `f32` range at eight mantissa bits.
-    Bf16,
 }
 
 impl StoreEncoding {
@@ -81,12 +87,11 @@ impl StoreEncoding {
     ///
     /// ### Returns
     ///
-    /// 0 for full, 1 for f16, 2 for bf16.
+    /// 0 for full, 1 for f16.
     fn to_u8(self) -> u8 {
         match self {
             StoreEncoding::Full => 0,
             StoreEncoding::F16 => 1,
-            StoreEncoding::Bf16 => 2,
         }
     }
 
@@ -103,7 +108,6 @@ impl StoreEncoding {
         match b {
             0 => Some(StoreEncoding::Full),
             1 => Some(StoreEncoding::F16),
-            2 => Some(StoreEncoding::Bf16),
             _ => None,
         }
     }
@@ -116,7 +120,7 @@ impl StoreEncoding {
     fn elem_bytes<T>(self) -> usize {
         match self {
             StoreEncoding::Full => std::mem::size_of::<T>(),
-            StoreEncoding::F16 | StoreEncoding::Bf16 => 2,
+            StoreEncoding::F16 => 2,
         }
     }
 }
@@ -125,7 +129,7 @@ impl StoreEncoding {
 ///
 /// ### Params
 ///
-/// * `s` - One of `"full"`, `"f16"` or `"bf16"`, case-insensitive
+/// * `s` - One of `"full"` or `"f16"`, case-insensitive
 ///
 /// ### Returns
 ///
@@ -134,7 +138,6 @@ pub fn parse_store_encoding(s: &str) -> Option<StoreEncoding> {
     match s.to_lowercase().as_str() {
         "full" => Some(StoreEncoding::Full),
         "f16" => Some(StoreEncoding::F16),
-        "bf16" => Some(StoreEncoding::Bf16),
         _ => None,
     }
 }
@@ -203,53 +206,43 @@ fn fingerprint(n: usize, dim: usize, types: [u8; 2], norm_bytes: &[u8]) -> u64 {
     h
 }
 
-/// Round rows to a half-precision encoding.
+/// Round rows to f16.
 ///
 /// ### Params
 ///
 /// * `vectors_flat` - Rows at the index float type
-/// * `encoding` - [`StoreEncoding::F16`] or [`StoreEncoding::Bf16`]
 ///
 /// ### Returns
 ///
-/// The raw half bits, or `None` when a finite value overflows the encoding.
-fn encode_half<T: AnnSearchFloat>(vectors_flat: &[T], encoding: StoreEncoding) -> Option<Vec<u16>> {
+/// The raw f16 bits, or `None` when a finite value overflows the f16 range.
+fn encode_f16<T: AnnSearchFloat>(vectors_flat: &[T]) -> Option<Vec<u16>> {
     vectors_flat
         .par_iter()
         .map(|&x| {
             let x = x.to_f64().expect("float to f64 cannot fail");
-            let (bits, inf) = match encoding {
-                StoreEncoding::Bf16 => {
-                    let h = bf16::from_f64(x);
-                    (h.to_bits(), h.is_infinite())
-                }
-                _ => {
-                    let h = f16::from_f64(x);
-                    (h.to_bits(), h.is_infinite())
-                }
-            };
-            (!inf || x.is_infinite()).then_some(bits)
+            let h = f16::from_f64(x);
+            (!h.is_infinite() || x.is_infinite()).then_some(h.to_bits())
         })
         .collect()
 }
 
-/// Decode one half-precision value.
+/// Decode f16 bits into a buffer of the index float type.
+///
+/// Goes through `half`'s slice conversion, which picks F16C or the aarch64
+/// fp16 conversion at runtime. Only `f32` and `f64` reach a store (the
+/// float-type byte refuses anything else), so the element width settles which
+/// of the two it is.
 ///
 /// ### Params
 ///
-/// * `encoding` - [`StoreEncoding::F16`] or [`StoreEncoding::Bf16`]
-/// * `bits` - The raw bits
-///
-/// ### Returns
-///
-/// The value as `T`.
-#[inline(always)]
-fn decode_half<T: AnnSearchFloat>(encoding: StoreEncoding, bits: u16) -> T {
-    let x = match encoding {
-        StoreEncoding::Bf16 => bf16::from_bits(bits).to_f32(),
-        _ => f16::from_bits(bits).to_f32(),
-    };
-    T::from_f32(x).expect("f32 to float cannot fail")
+/// * `bits` - Raw f16 bits
+/// * `out` - Destination, same length as `bits`
+fn decode_f16_into<T: Pod>(bits: &[u16], out: &mut [T]) {
+    let src: &[f16] = bits.reinterpret_cast();
+    match std::mem::size_of::<T>() {
+        4 => src.convert_to_f32_slice(bytemuck::cast_slice_mut(out)),
+        _ => src.convert_to_f64_slice(bytemuck::cast_slice_mut(out)),
+    }
 }
 
 /// Resolve a path to a comparable absolute form.
@@ -405,24 +398,22 @@ where
         let float_type = float_type_of::<T>()
             .ok_or_else(|| invalid(&path, "element type has no store encoding"))?;
 
-        let half_rows =
-            match encoding {
-                StoreEncoding::Full => None,
-                _ => Some(encode_half(vectors_flat, encoding).ok_or_else(|| {
-                    invalid(&path, format!("values exceed the {encoding:?} range"))
-                })?),
-            };
+        let half_rows = match encoding {
+            StoreEncoding::Full => None,
+            StoreEncoding::F16 => Some(
+                encode_f16(vectors_flat)
+                    .ok_or_else(|| invalid(&path, "values exceed the f16 range"))?,
+            ),
+        };
         let half_norms: Option<Vec<T>> = half_rows.as_ref().map(|bits| {
             bits.par_chunks_exact(dim.max(1))
-                .map(|row| {
-                    row.iter()
-                        .map(|&b| {
-                            let x = decode_half::<T>(encoding, b);
-                            x * x
-                        })
-                        .sum::<T>()
-                        .sqrt()
-                })
+                .map_init(
+                    || vec![T::zero(); dim],
+                    |buf, row| {
+                        decode_f16_into(row, buf);
+                        T::calculate_l2_norm(buf)
+                    },
+                )
                 .collect()
         });
         let norms = half_norms.as_deref().unwrap_or(norms);
@@ -651,7 +642,7 @@ where
         &self.mmap[start..start + stride]
     }
 
-    /// One stored vector, decoded to `T` when the store is half precision.
+    /// One stored vector, decoded to `T` when the store is f16.
     ///
     /// ### Params
     ///
@@ -664,18 +655,40 @@ where
     pub fn row(&self, idx: usize) -> Cow<'_, [T]> {
         match self.encoding {
             StoreEncoding::Full => Cow::Borrowed(bytemuck::cast_slice(self.row_bytes(idx))),
-            enc => Cow::Owned(
-                bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
-                    .iter()
-                    .map(|&b| decode_half(enc, b))
-                    .collect(),
-            ),
+            StoreEncoding::F16 => {
+                let mut out = vec![T::zero(); self.dim];
+                decode_f16_into(bytemuck::cast_slice(self.row_bytes(idx)), &mut out);
+                Cow::Owned(out)
+            }
         }
     }
 
-    /// Squared Euclidean distance from a stored vector to a query.
+    /// Sum a full-precision kernel over an f16 row, chunk by chunk.
     ///
-    /// The half-precision arms decode element by element in scalar code.
+    /// ### Params
+    ///
+    /// * `idx` - Row in original data order
+    /// * `query` - Query vector, length `dim`
+    /// * `kernel` - Additive kernel over a decoded chunk and the matching
+    ///   query slice
+    ///
+    /// ### Returns
+    ///
+    /// The kernel summed over the whole row.
+    #[inline]
+    fn f16_reduce(&self, idx: usize, query: &[T], kernel: impl Fn(&[T], &[T]) -> T) -> T {
+        let bits: &[u16] = bytemuck::cast_slice(self.row_bytes(idx));
+        let mut buf = [T::zero(); F16_CHUNK];
+        let mut acc = T::zero();
+        for (b, q) in bits.chunks(F16_CHUNK).zip(query.chunks(F16_CHUNK)) {
+            let buf = &mut buf[..b.len()];
+            decode_f16_into(b, buf);
+            acc += kernel(buf, q);
+        }
+        acc
+    }
+
+    /// Squared Euclidean distance from a stored vector to a query.
     ///
     /// ### Params
     ///
@@ -691,20 +704,11 @@ where
             StoreEncoding::Full => {
                 T::euclidean_simd(bytemuck::cast_slice(self.row_bytes(idx)), query)
             }
-            enc => bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
-                .iter()
-                .zip(query)
-                .map(|(&b, &q)| {
-                    let d = decode_half::<T>(enc, b) - q;
-                    d * d
-                })
-                .sum(),
+            StoreEncoding::F16 => self.f16_reduce(idx, query, T::euclidean_simd),
         }
     }
 
     /// Cosine distance from a stored vector to a query.
-    ///
-    /// The half-precision arms decode element by element in scalar code.
     ///
     /// ### Params
     ///
@@ -719,11 +723,7 @@ where
     pub fn cosine_distance_to_query(&self, idx: usize, query: &[T], query_norm: T) -> T {
         let dot = match self.encoding {
             StoreEncoding::Full => T::dot_simd(bytemuck::cast_slice(self.row_bytes(idx)), query),
-            enc => bytemuck::cast_slice::<u8, u16>(self.row_bytes(idx))
-                .iter()
-                .zip(query)
-                .map(|(&b, &q)| decode_half::<T>(enc, b) * q)
-                .sum(),
+            StoreEncoding::F16 => self.f16_reduce(idx, query, T::dot_simd),
         };
         cosine_from_dot(dot, query_norm * self.norms()[idx])
     }
@@ -1017,7 +1017,7 @@ mod tests {
         let vectors: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
         let norms = vec![0.0f32; 8];
 
-        for (enc, tol) in [(StoreEncoding::F16, 1e-3), (StoreEncoding::Bf16, 1e-2)] {
+        for (enc, tol) in [(StoreEncoding::F16, 1e-3)] {
             let dir = TempDir::new().unwrap();
             let store = VectorStore::create(dir.path(), &vectors, &norms, 8, 8, enc).unwrap();
             let reopened = VectorStore::<f32>::open(dir.path()).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
         let query: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
         let qnorm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        for enc in [StoreEncoding::F16, StoreEncoding::Bf16] {
+        for enc in [StoreEncoding::F16] {
             let dir = TempDir::new().unwrap();
             let store = VectorStore::create(dir.path(), &vectors, &norms, 4, 8, enc).unwrap();
 
@@ -1085,23 +1085,66 @@ mod tests {
         );
         assert!(matches!(res, Err(AnnSearchErrors::StoreInvalid { .. })));
 
-        // bf16 has the f32 range
-        let ok = VectorStore::create(
+        // Nothing was written for the refused store
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Rows longer than one decode chunk, at both float types, score the same
+    /// as the decoded row through the plain kernels.
+    #[test]
+    fn test_f16_distances_across_chunks_and_float_types() {
+        let (n, dim) = (3, F16_CHUNK + 44);
+        let vectors: Vec<f64> = (0..n * dim).map(|i| (i as f64 * 0.13).sin()).collect();
+        let query: Vec<f64> = (0..dim).map(|i| (i as f64 * 0.07).cos()).collect();
+        let qnorm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::create(
             dir.path(),
-            &[1.0f32, 1.0e6],
-            &[0.0; 1],
-            1,
-            2,
-            StoreEncoding::Bf16,
-        );
-        assert!(ok.is_ok());
+            &vectors,
+            &vec![0.0; n],
+            n,
+            dim,
+            StoreEncoding::F16,
+        )
+        .unwrap();
+        for i in 0..n {
+            let row = store.row(i);
+            let eucl: f64 = row.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum();
+            let dot: f64 = row.iter().zip(&query).map(|(a, b)| a * b).sum();
+            assert!((store.euclidean_distance_to_query(i, &query) - eucl).abs() < 1e-9);
+            let cos = 1.0 - dot / (qnorm * store.norms()[i]);
+            assert!((store.cosine_distance_to_query(i, &query, qnorm) - cos).abs() < 1e-9);
+        }
+
+        let vectors32: Vec<f32> = vectors.iter().map(|&x| x as f32).collect();
+        let query32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::create(
+            dir.path(),
+            &vectors32,
+            &vec![0.0; n],
+            n,
+            dim,
+            StoreEncoding::F16,
+        )
+        .unwrap();
+        for i in 0..n {
+            let row = store.row(i);
+            let eucl: f32 = row
+                .iter()
+                .zip(&query32)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            assert!((store.euclidean_distance_to_query(i, &query32) - eucl).abs() < 1e-3);
+        }
     }
 
     #[test]
     fn test_parse_store_encoding() {
         assert_eq!(parse_store_encoding("full"), Some(StoreEncoding::Full));
         assert_eq!(parse_store_encoding("F16"), Some(StoreEncoding::F16));
-        assert_eq!(parse_store_encoding("bf16"), Some(StoreEncoding::Bf16));
+        assert_eq!(parse_store_encoding("bf16"), None);
         assert_eq!(parse_store_encoding("int8"), None);
     }
 }

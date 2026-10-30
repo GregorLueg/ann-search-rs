@@ -216,6 +216,10 @@ name = "gridsearch_store_encoding"
 required-features = ["binary"]
 
 [[example]]
+name = "bench_store_kernels"
+required-features = ["binary"]
+
+[[example]]
 name = "gridsearch_tq"
 required-features = ["binary"]
 
