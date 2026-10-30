@@ -1,7 +1,7 @@
 mod commons;
 
-use ann_search_rs::gpu::nndescent_gpu::KnnGraphGpu;
-use ann_search_rs::utils::nndescent_utils::SENTINEL_PID;
+use ann_search_rs::gpu::nndescent_gpu::NNDescentGpuKnnParams;
+use ann_search_rs::prelude::{KnnGraph, NNDescentKnnParams, KNN_GRAPH_EMPTY};
 use ann_search_rs::*;
 use clap::Parser;
 use commons::*;
@@ -48,22 +48,21 @@ const FILL_WARN_THRESHOLD: f64 = 0.99;
 /// ### Params
 ///
 /// * `label` - Label of the build being checked
-/// * `graph` - The GPU-built kNN graph
-fn check_graph(label: &str, graph: &KnnGraphGpu<f32>) {
+/// * `graph` - The kNN graph
+fn check_graph(label: &str, graph: &KnnGraph<f32>) {
     let filled = graph
-        .knn_graph
+        .indices
         .iter()
-        .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
+        .filter(|&&pid| pid != KNN_GRAPH_EMPTY)
         .count();
-    let expected = graph.n * graph.k;
+    let expected = graph.indices.len();
     let ratio = filled as f64 / expected as f64;
 
     println!(
-        "  checksum: {} / {} entries filled ({:.2}%), converged={}",
+        "  checksum: {} / {} entries filled ({:.2}%)",
         filled.separate_with_underscores(),
         expected.separate_with_underscores(),
         ratio * 100.0,
-        graph.converged
     );
 
     if ratio < FILL_WARN_THRESHOLD {
@@ -74,6 +73,77 @@ fn check_graph(label: &str, graph: &KnnGraphGpu<f32>) {
             label,
             ratio * 100.0
         );
+    }
+}
+
+/// Unpack a flat kNN graph into the nested rows the scoring helpers take.
+///
+/// ### Params
+///
+/// * `graph` - The kNN graph, built with distances
+///
+/// ### Returns
+///
+/// Tuple of (neighbour rows, distance rows).
+fn unpack(graph: &KnnGraph<f32>) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+    let dists = graph.distances.as_ref().expect("built with return_dist");
+    let ids = (0..graph.n)
+        .map(|i| graph.row(i).iter().map(|&p| p as usize).collect())
+        .collect();
+    let ds = dists.chunks_exact(graph.k).map(|r| r.to_vec()).collect();
+    (ids, ds)
+}
+
+/// Host size of a flat kNN graph in MB.
+///
+/// ### Params
+///
+/// * `graph` - The kNN graph
+///
+/// ### Returns
+///
+/// Size of the ids plus distances in MB.
+fn graph_mb(graph: &KnnGraph<f32>) -> f64 {
+    let bytes = graph.indices.len() * std::mem::size_of::<u32>()
+        + graph.distances.as_ref().map_or(0, |d| d.len()) * std::mem::size_of::<f32>();
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// Score a kNN graph against the ground truth into a result row.
+///
+/// The extraction column is zero: the graph comes back flat and final, there
+/// is no separate query step.
+///
+/// ### Params
+///
+/// * `method` - Row label
+/// * `build_ms` - Build time in ms
+/// * `graph` - The kNN graph, self-edge included
+/// * `true_neighbors` - Exhaustive ground-truth ids
+/// * `true_distances` - Exhaustive ground-truth distances
+/// * `k` - Neighbours scored per row
+///
+/// ### Returns
+///
+/// The benchmark row.
+fn score(
+    method: String,
+    build_ms: f64,
+    graph: &KnnGraph<f32>,
+    true_neighbors: &[Vec<usize>],
+    true_distances: &[Vec<f32>],
+    k: usize,
+) -> BenchmarkResultSize {
+    let (ids, dists) = unpack(graph);
+    BenchmarkResultSize {
+        method,
+        build_time_ms: build_ms,
+        query_time_ms: 0.0,
+        total_time_ms: build_ms,
+        recall_at_k: calculate_recall(true_neighbors, &ids, k),
+        mean_dist_rat: calculate_mean_distance_ratio(true_distances, &dists, k),
+        median_dist_rat: calculate_median_distance_ratio(true_distances, &dists, k),
+        index_size_mb: graph_mb(graph),
     }
 }
 
@@ -127,56 +197,40 @@ fn main() {
 
     println!("-----------------------------");
 
-    // CPU NNDescent baseline, scored through its own beam search so the row is
-    // directly comparable to the ground truth above.
-    println!("Building CPU NNDescent...");
+    // `include_self` puts the trivial self-edge first in every row, so the
+    // graphs are scored like for like against a ground truth that counts a
+    // point as its own nearest neighbour. Scoring takes the first `k` columns.
+
+    // CPU NN-Descent baseline through the graph-only build.
+    println!("Building CPU NNDescent kNN graph...");
+    let label = format!("CPU-NNDescent (k={})", cli.k);
+    let params = NNDescentKnnParams {
+        k: cli.k,
+        include_self: true,
+        ..Default::default()
+    };
     let start = Instant::now();
-    let cpu_nndescent_idx = build_nndescent_index(
-        data.as_ref(),
-        &cli.distance,
-        0.001,
-        0.0,
-        None,
-        None,
-        None,
-        None,
-        cli.seed as usize,
-        false,
-    )
-    .unwrap();
+    let cpu_graph =
+        build_knn_graph_nndescent(data.as_ref(), &cli.distance, Some(params), cli.seed as usize, false)
+            .unwrap();
     let cpu_build = start.elapsed().as_secs_f64() * 1000.0;
-    let cpu_size = cpu_nndescent_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
-    println!("Extracting CPU NNDescent kNN graph...");
-    let start = Instant::now();
-    let (cpu_neighbors, cpu_distances) =
-        query_nndescent_self(&cpu_nndescent_idx, cli.k, None, true, false).unwrap();
-    let cpu_extract = start.elapsed().as_secs_f64() * 1000.0;
-
-    results.push(BenchmarkResultSize {
-        method: format!("CPU-NNDescent (k={})", cli.k),
-        build_time_ms: cpu_build,
-        query_time_ms: cpu_extract,
-        total_time_ms: cpu_build + cpu_extract,
-        recall_at_k: calculate_recall(&true_neighbors, &cpu_neighbors, cli.k),
-        mean_dist_rat: calculate_mean_distance_ratio(
-            &true_distances,
-            cpu_distances.as_ref().unwrap(),
-            cli.k,
-        ),
-        median_dist_rat: calculate_median_distance_ratio(
-            &true_distances,
-            cpu_distances.as_ref().unwrap(),
-            cli.k,
-        ),
-        index_size_mb: cpu_size,
-    });
+    check_graph(&label, &cpu_graph);
+    results.push(score(
+        label,
+        cpu_build,
+        &cpu_graph,
+        &true_neighbors,
+        &true_distances,
+        cli.k,
+    ));
+    drop(cpu_graph);
 
     println!("-----------------------------");
 
-    // GPU kNN graph: build_k multiplier x refinement sweeps. This is the slim
-    // `build_knn_graph_gpu` path, so no CAGRA kernels run and there is no
-    // navigational graph to beam-search. The extracted graph is the product.
+    // GPU kNN graph: build_k multiplier x refinement sweeps, through the
+    // graph-only build. No CAGRA kernels run; a dataset past the per-binding
+    // limit is split into clusters, one that fits takes the unbatched path.
     for &bk_mult in BUILD_K_MULTIPLIERS {
         for &refine in REFINE_SWEEPS {
             let build_k = cli.k * bk_mult;
@@ -187,17 +241,23 @@ fn main() {
                 build_k, refine
             );
 
-            let start = Instant::now();
-            let graph = build_knn_graph_gpu::<f32>(
-                data.as_ref(),
-                &cli.distance,
-                Some(cli.k),
+            let params = NNDescentGpuKnnParams::new(
+                cli.k,
                 Some(build_k),
                 Some(MAX_ITERS),
                 None,
                 Some(DELTA),
                 None,
                 Some(refine),
+                true,
+                true,
+            );
+            let start = Instant::now();
+            let graph = build_knn_graph_nndescent_gpu::<f32>(
+                data.as_ref(),
+                &cli.distance,
+                Some(params),
+                None,
                 cli.seed as usize,
                 false,
                 device.clone().into(),
@@ -206,35 +266,14 @@ fn main() {
             let gpu_build = start.elapsed().as_secs_f64() * 1000.0;
 
             check_graph(&label, &graph);
-
-            // `include_self` puts the trivial self-edge back, so the row is
-            // scored like for like against a ground truth that counts a point
-            // as its own nearest neighbour.
-            println!("  Extracting kNN graph...");
-            let start = Instant::now();
-            let (gpu_neighbors, gpu_distances) =
-                extract_knn_graph_gpu(&graph, Some(cli.k), true, true).unwrap();
-            let gpu_extract = start.elapsed().as_secs_f64() * 1000.0;
-            let gpu_distances = gpu_distances.unwrap();
-
-            results.push(BenchmarkResultSize {
-                method: label,
-                build_time_ms: gpu_build,
-                query_time_ms: gpu_extract,
-                total_time_ms: gpu_build + gpu_extract,
-                recall_at_k: calculate_recall(&true_neighbors, &gpu_neighbors, cli.k),
-                mean_dist_rat: calculate_mean_distance_ratio(
-                    &true_distances,
-                    &gpu_distances,
-                    cli.k,
-                ),
-                median_dist_rat: calculate_median_distance_ratio(
-                    &true_distances,
-                    &gpu_distances,
-                    cli.k,
-                ),
-                index_size_mb: graph.memory_usage_bytes() as f64 / (1024.0 * 1024.0),
-            });
+            results.push(score(
+                label,
+                gpu_build,
+                &graph,
+                &true_neighbors,
+                &true_distances,
+                cli.k,
+            ));
 
             println!("-----------------------------");
         }
