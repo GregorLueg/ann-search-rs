@@ -557,7 +557,7 @@ mod tests {
                 .unwrap();
         assert_eq!((cent.nrows(), cent.ncols()), (k, dim));
         assert_eq!(assign.len(), n);
-        let assign_u32: Vec<u32> = assign.iter().map(|&a| a as u32).collect();
+        let assign_u32: Vec<u32> = assign.clone();
         let flat: Vec<f32> = (0..k)
             .flat_map(|i| (0..dim).map(move |j| (i, j)))
             .map(|(i, j)| cent[(i, j)])

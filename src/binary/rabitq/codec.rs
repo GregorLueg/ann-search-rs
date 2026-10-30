@@ -308,7 +308,7 @@ where
             ex_codes,
             factors,
             bin_factors,
-            cluster: assignments.iter().map(|&c| c as u32).collect(),
+            cluster: assignments.clone(),
             centroids_rotated,
             nlist,
             ex_bits,

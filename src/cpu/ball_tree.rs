@@ -558,7 +558,16 @@ where
         let p2 = &vectors_flat[p2_idx * dim..(p2_idx + 1) * dim];
 
         let (mut left, mut right) = (Vec::new(), Vec::new());
-        partition_by_nearest(vectors_flat, items, dim, p1, p2, &metric, &mut left, &mut right);
+        partition_by_nearest(
+            vectors_flat,
+            items,
+            dim,
+            p1,
+            p2,
+            &metric,
+            &mut left,
+            &mut right,
+        );
 
         if left.is_empty() || right.is_empty() {
             let mid = items.len() / 2;
@@ -704,6 +713,7 @@ where
     /// * `depth` - The current depth
     /// * `max_parallel_depth` - Maximum depth until which to execute parallel
     ///   threading
+    #[allow(clippy::too_many_arguments)]
     fn build_subtree(
         vectors_flat: &[T],
         dim: usize,

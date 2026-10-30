@@ -104,6 +104,106 @@ const NND_GEMM_MIN_DIM: usize = 96;
 /// setup, and the gather then buys nothing.
 const NND_GEMM_MIN_CANDIDATES: usize = 32;
 
+/////////////////////
+// kNN graph build //
+/////////////////////
+
+/// Parameters for [`NNDescent::knn_graph`], the build that returns only the
+/// kNN graph.
+#[derive(Clone, Copy, Debug)]
+pub struct NNDescentKnnParams {
+    /// Neighbours per node found by the descent, the self-edge not counted
+    pub k: usize,
+    /// Maximum iterations; `None` gives `log2(n).round().max(5)`
+    pub max_iter: Option<usize>,
+    /// Cap on sampled candidates per node per iteration; `None` gives
+    /// `k.min(60)`
+    pub max_candidates: Option<usize>,
+    /// Trees seeding the graph; `None` gives `5 + sqrt(n) / 20`, capped at 64
+    pub n_trees: Option<usize>,
+    /// Convergence threshold on the fraction of edges updated per iteration
+    pub delta: f64,
+    /// Prepend each point to its own row with distance zero, as UMAP expects
+    pub include_self: bool,
+    /// Keep the distances
+    pub return_dist: bool,
+}
+
+impl NNDescentKnnParams {
+    /// Create new parameters.
+    ///
+    /// ### Params
+    ///
+    /// * `k` - Neighbours per node, the self-edge not counted
+    /// * `max_iter` - Maximum iterations (`None` for the default)
+    /// * `max_candidates` - Candidate cap per node (`None` for the default)
+    /// * `n_trees` - Seeding trees (`None` for the default)
+    /// * `delta` - Convergence threshold
+    /// * `include_self` - Prepend the self-edge to every row
+    /// * `return_dist` - Keep the distances
+    ///
+    /// ### Returns
+    ///
+    /// The parameters.
+    pub fn new(
+        k: usize,
+        max_iter: Option<usize>,
+        max_candidates: Option<usize>,
+        n_trees: Option<usize>,
+        delta: f64,
+        include_self: bool,
+        return_dist: bool,
+    ) -> Self {
+        Self {
+            k,
+            max_iter,
+            max_candidates,
+            n_trees,
+            delta,
+            include_self,
+            return_dist,
+        }
+    }
+}
+
+impl Default for NNDescentKnnParams {
+    /// The same defaults as [`NNDescent::new`], with distances kept and no
+    /// self-edge.
+    fn default() -> Self {
+        Self::new(30, None, None, None, 0.001, false, true)
+    }
+}
+
+/// Resolve the optional build parameters shared by both NN-Descent builds.
+///
+/// ### Params
+///
+/// * `n` - Number of points
+/// * `k` - Neighbours per node (default 30)
+/// * `max_iter` - Maximum iterations (default `log2(n).round().max(5)`)
+/// * `max_candidates` - Candidate cap (default `k.min(60)`)
+/// * `n_trees` - Seeding trees (default `5 + sqrt(n) / 20`, capped at 64)
+///
+/// ### Returns
+///
+/// `(k, max_iter, max_candidates, n_trees)`
+fn resolve_build_params(
+    n: usize,
+    k: Option<usize>,
+    max_iter: Option<usize>,
+    max_candidates: Option<usize>,
+    n_trees: Option<usize>,
+) -> (usize, usize, usize, usize) {
+    // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
+    // trees well past where the old per-point query saturated.
+    let n_trees =
+        n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
+    let max_iter = max_iter.unwrap_or_else(|| (((n as f64).log2().round()) as usize).max(5));
+    let k = k.unwrap_or(30);
+    let max_candidates = max_candidates.unwrap_or(k.min(60));
+    (k, max_iter, max_candidates, n_trees)
+}
+
 ///////////////////
 // Build timings //
 ///////////////////
@@ -860,106 +960,6 @@ pub trait NNDescentQuery<T> {
         candidates: &mut BinaryHeap<Reverse<(OrderedFloat<T>, usize)>>,
         results: &mut BinaryHeap<(OrderedFloat<T>, usize)>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors>;
-}
-
-////////////////////
-// kNN graph build //
-////////////////////
-
-/// Parameters for [`NNDescent::knn_graph`], the build that returns only the
-/// kNN graph.
-#[derive(Clone, Copy, Debug)]
-pub struct NNDescentKnnParams {
-    /// Neighbours per node found by the descent, the self-edge not counted
-    pub k: usize,
-    /// Maximum iterations; `None` gives `log2(n).round().max(5)`
-    pub max_iter: Option<usize>,
-    /// Cap on sampled candidates per node per iteration; `None` gives
-    /// `k.min(60)`
-    pub max_candidates: Option<usize>,
-    /// Trees seeding the graph; `None` gives `5 + sqrt(n) / 20`, capped at 64
-    pub n_trees: Option<usize>,
-    /// Convergence threshold on the fraction of edges updated per iteration
-    pub delta: f64,
-    /// Prepend each point to its own row with distance zero, as UMAP expects
-    pub include_self: bool,
-    /// Keep the distances
-    pub return_dist: bool,
-}
-
-impl NNDescentKnnParams {
-    /// Create new parameters.
-    ///
-    /// ### Params
-    ///
-    /// * `k` - Neighbours per node, the self-edge not counted
-    /// * `max_iter` - Maximum iterations (`None` for the default)
-    /// * `max_candidates` - Candidate cap per node (`None` for the default)
-    /// * `n_trees` - Seeding trees (`None` for the default)
-    /// * `delta` - Convergence threshold
-    /// * `include_self` - Prepend the self-edge to every row
-    /// * `return_dist` - Keep the distances
-    ///
-    /// ### Returns
-    ///
-    /// The parameters.
-    pub fn new(
-        k: usize,
-        max_iter: Option<usize>,
-        max_candidates: Option<usize>,
-        n_trees: Option<usize>,
-        delta: f64,
-        include_self: bool,
-        return_dist: bool,
-    ) -> Self {
-        Self {
-            k,
-            max_iter,
-            max_candidates,
-            n_trees,
-            delta,
-            include_self,
-            return_dist,
-        }
-    }
-}
-
-impl Default for NNDescentKnnParams {
-    /// The same defaults as [`NNDescent::new`], with distances kept and no
-    /// self-edge.
-    fn default() -> Self {
-        Self::new(30, None, None, None, 0.001, false, true)
-    }
-}
-
-/// Resolve the optional build parameters shared by both NN-Descent builds.
-///
-/// ### Params
-///
-/// * `n` - Number of points
-/// * `k` - Neighbours per node (default 30)
-/// * `max_iter` - Maximum iterations (default `log2(n).round().max(5)`)
-/// * `max_candidates` - Candidate cap (default `k.min(60)`)
-/// * `n_trees` - Seeding trees (default `5 + sqrt(n) / 20`, capped at 64)
-///
-/// ### Returns
-///
-/// `(k, max_iter, max_candidates, n_trees)`
-fn resolve_build_params(
-    n: usize,
-    k: Option<usize>,
-    max_iter: Option<usize>,
-    max_candidates: Option<usize>,
-    n_trees: Option<usize>,
-) -> (usize, usize, usize, usize) {
-    // scanpy's (UMAP's) default. The leaf-join seeding keeps gaining from
-    // trees well past where the old per-point query saturated.
-    let n_trees =
-        n_trees.unwrap_or_else(|| (5 + ((n as f64).sqrt() / 20.0).round() as usize).min(64));
-    let max_iter = max_iter.unwrap_or_else(|| (((n as f64).log2().round()) as usize).max(5));
-    let k = k.unwrap_or(30);
-    let max_candidates = max_candidates.unwrap_or(k.min(60));
-    (k, max_iter, max_candidates, n_trees)
 }
 
 //////////
@@ -1892,7 +1892,10 @@ where
                 }
                 let j = slot.pid();
                 if fwd_i.binary_search(&j).is_ok()
-                    || cands.new_forward(j as usize).binary_search(&(i as u32)).is_ok()
+                    || cands
+                        .new_forward(j as usize)
+                        .binary_search(&(i as u32))
+                        .is_ok()
                 {
                     slot.mark_old();
                 }
@@ -3277,7 +3280,10 @@ mod tests {
                     .map(|&p| p as usize)
                     .collect();
                 assert_eq!(row, ids[i], "row {i} differs for {metric:?}");
-                assert_eq!(&gd[i * k..i * k + row.len()], &dists.as_ref().unwrap()[i][..]);
+                assert_eq!(
+                    &gd[i * k..i * k + row.len()],
+                    &dists.as_ref().unwrap()[i][..]
+                );
             }
         }
     }
@@ -3287,7 +3293,13 @@ mod tests {
         let (n, dim, k) = (500, 4, 5);
         let data = random_flat(n, dim, 5);
         let params = NNDescentKnnParams::new(k, None, None, None, 0.001, true, false);
-        let g = NNDescent::<f32>::knn_graph((&data[..], n, dim), Dist::SquaredEuclidean, params, 1, false);
+        let g = NNDescent::<f32>::knn_graph(
+            (&data[..], n, dim),
+            Dist::SquaredEuclidean,
+            params,
+            1,
+            false,
+        );
         assert_eq!(g.k, k + 1);
         assert!(g.distances.is_none());
         for i in 0..n {
@@ -3318,7 +3330,11 @@ mod tests {
             let probe: Vec<usize> = (0..n).step_by(20).collect();
             for &i in &probe {
                 let truth = brute_force(&data, dim, i, k, metric);
-                hits += g.row(i).iter().filter(|&&p| truth.contains(&(p as usize))).count();
+                hits += g
+                    .row(i)
+                    .iter()
+                    .filter(|&&p| truth.contains(&(p as usize)))
+                    .count();
             }
             let recall = hits as f64 / (probe.len() * k) as f64;
             assert!(recall > 0.95, "{metric:?} recall {recall}");

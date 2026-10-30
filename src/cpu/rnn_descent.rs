@@ -674,7 +674,7 @@ where
         // Flatten to compact ids-only storage.
         // `collect` reuses the Neighbour<T> allocation in place, so shrink to
         // release the surplus capacity.
-        index.graph = build_graph.into_iter().map(|n| n.pid() as u32).collect();
+        index.graph = build_graph.into_iter().map(|n| n.pid()).collect();
         index.graph.shrink_to_fit();
 
         Ok(index)
