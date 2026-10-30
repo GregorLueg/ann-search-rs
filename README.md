@@ -95,7 +95,26 @@ let (graph, _) = query_hnsw_self(&index, 15, 200, false, Verbosity::Quiet)?;
 Every build and query takes a `Verbosity`. `Quiet` prints nothing but
 warnings. `Normal` prints one line at the start and end of a build or query,
 plus a progress line every 100_000 queried samples. `Detailed` adds the timed
-build stages and per-iteration lines.
+build stages and per-iteration lines. NN-Descent on 200k x 32 at `Detailed`:
+
+```text
+Building NNDescent index ...
+ Built forest (27 trees) in 120.32ms
+ Seeded graph from forest in 182.89ms
+ Running NN-Descent iterations (max candidates 15, chunk size 25_890)
+  Iteration 1: 1_911_167 edge updates (rate 0.6371), 2 chunks
+  ...
+  Iteration 8: 1_770 edge updates (rate 0.0006), 1 chunks
+  Converged after 8 iterations
+ Descent phases: candidates 376.03ms, mark old 6.31ms, local join 443.79ms, radix sort 39.88ms, apply 67.87ms
+ Updates: 12_784_692 emitted, 3_552_642 accepted (27.79%)
+ Merged candidate list: mean 25.5, max 571, 247_653_776 pairs evaluated
+... built NNDescent index in 1.34s
+Querying NNDescent index (self) ...
+ Queried 100_000 / 200_000 samples
+ Queried 200_000 / 200_000 samples
+... queried NNDescent index (self) in 682.91ms
+```
 
 Callers that carry verbosity as an integer (R or Python bindings) can use
 `parse_annsearch_verbosity(0 | 1 | 2)`.
