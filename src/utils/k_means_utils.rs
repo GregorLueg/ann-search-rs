@@ -815,11 +815,11 @@ fn top2_scan<T: Float>(
     let mut second = [T::neg_infinity(); TOP2_LANES];
     let mut idx = [0u32; TOP2_LANES];
 
-    let mut d_chunks = dots.chunks_exact(TOP2_LANES);
-    let mut s_chunks = scale.chunks_exact(TOP2_LANES);
-    let mut o_chunks = offset.chunks_exact(TOP2_LANES);
+    let (d_chunks, d_rem) = dots.as_chunks::<TOP2_LANES>();
+    let (s_chunks, s_rem) = scale.as_chunks::<TOP2_LANES>();
+    let (o_chunks, o_rem) = offset.as_chunks::<TOP2_LANES>();
     let mut base = 0u32;
-    for ((d, s), o) in (&mut d_chunks).zip(&mut s_chunks).zip(&mut o_chunks) {
+    for ((d, s), o) in d_chunks.iter().zip(s_chunks).zip(o_chunks) {
         for j in 0..TOP2_LANES {
             let score = s[j] * d[j] + o[j];
             let gt = score > best[j];
@@ -853,11 +853,7 @@ fn top2_scan<T: Float>(
             }
         }
     }
-    let tail = d_chunks
-        .remainder()
-        .iter()
-        .zip(s_chunks.remainder())
-        .zip(o_chunks.remainder());
+    let tail = d_rem.iter().zip(s_rem).zip(o_rem);
     for (c, ((&d, &s), &o)) in tail.enumerate() {
         push(s * d + o, c0 + n_full + c, &mut b, &mut s2, &mut bi);
     }

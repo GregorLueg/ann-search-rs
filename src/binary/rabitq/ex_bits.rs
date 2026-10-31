@@ -345,7 +345,12 @@ pub fn ex_inner_product<T: AnnSearchFloat>(query: &[T], ex_code: &[u8], ex_bits:
 
     // One accumulator per lane so the adds do not form one serial chain.
     let mut acc = [T::zero(); CODE_GROUP];
-    for (q, bytes) in query.chunks_exact(CODE_GROUP).zip(ex_code.chunks_exact(w)) {
+    for (q, bytes) in query
+        .as_chunks::<{ CODE_GROUP }>()
+        .0
+        .iter()
+        .zip(ex_code.chunks_exact(w))
+    {
         let mut buf = [0u8; CODE_GROUP];
         buf[..w].copy_from_slice(bytes);
         let word = u64::from_le_bytes(buf);

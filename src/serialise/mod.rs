@@ -1483,11 +1483,11 @@ mod tests {
 
             let overwrite = |n: usize, seed: u64| {
                 let other = random_matrix(n, DIM, seed);
-                let flat: Vec<f32> = (0..n)
-                    .flat_map(|i| other.row(i).iter().cloned().collect::<Vec<_>>())
-                    .collect();
+                let flat: Vec<f32> = (0..n).flat_map(|i| other.row(i).iter().copied()).collect();
                 let norms: Vec<f32> = flat
-                    .chunks_exact(DIM)
+                    .as_chunks::<DIM>()
+                    .0
+                    .iter()
                     .map(|r| r.iter().map(|x| x * x).sum::<f32>().sqrt())
                     .collect();
                 VectorStore::create(saved.path(), &flat, &norms, n, DIM, StoreEncoding::Full)

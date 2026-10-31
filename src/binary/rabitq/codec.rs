@@ -28,8 +28,8 @@
 use rayon::prelude::*;
 
 use crate::binary::rabitq::ex_bits::{encode_ex_bits, ex_inner_product, excode_bytes, MAX_EX_BITS};
-use crate::binary::rabitq::rotator::RotatorKind;
 use crate::binary::rabitq::fastscan::build_sign_sums;
+use crate::binary::rabitq::rotator::RotatorKind;
 use crate::binary::rabitq::RaBitQEncoder;
 use crate::prelude::*;
 use crate::quantised::hnsw_quantised::build::GraphBuildParams;
@@ -324,7 +324,12 @@ where
 
         // Two accumulators so the adds do not form one serial chain.
         let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
-        for (row, &byte) in sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
+        for (row, &byte) in sign_lut
+            .as_chunks::<{ 2 * NIBBLE_VALUES }>()
+            .0
+            .iter()
+            .zip(sign)
+        {
             sign_lo += row[(byte & 0x0f) as usize];
             sign_hi += row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
         }
@@ -388,7 +393,13 @@ where
         let n_bytes = self.encoder.n_bytes;
         let sign = &self.sign_codes[node * n_bytes..(node + 1) * n_bytes];
         let (mut sign_lo, mut sign_hi) = (T::zero(), T::zero());
-        for (row, &byte) in query.sign_lut.chunks_exact(2 * NIBBLE_VALUES).zip(sign) {
+        for (row, &byte) in query
+            .sign_lut
+            .as_chunks::<{ 2 * NIBBLE_VALUES }>()
+            .0
+            .iter()
+            .zip(sign)
+        {
             sign_lo += row[(byte & 0x0f) as usize];
             sign_hi += row[NIBBLE_VALUES + (byte >> NIBBLE) as usize];
         }

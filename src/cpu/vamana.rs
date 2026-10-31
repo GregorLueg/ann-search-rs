@@ -752,7 +752,7 @@ where
             // dominant cost and the rows are random reads out of a store far
             // larger than L2, so the loads overlap instead of serialising. The
             // first chunk holding an occluder still short-circuits the rest.
-            let occluded = selected.chunks_exact(4).any(|chunk| {
+            let occluded = selected.as_chunks::<4>().0.iter().any(|chunk| {
                 let ids = [
                     chunk[0] as usize,
                     chunk[1] as usize,

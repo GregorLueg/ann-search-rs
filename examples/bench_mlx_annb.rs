@@ -42,7 +42,9 @@ struct Args {
 fn read_bin(path: &Path) -> (Vec<u32>, usize, usize) {
     let bytes = std::fs::read(path).expect("readable dataset file");
     let words: Vec<u32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let (rows, cols) = (words[0] as usize, words[1] as usize);

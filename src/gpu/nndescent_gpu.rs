@@ -3795,7 +3795,7 @@ mod kernel_tests {
             let expected: Vec<f32> = (0..dim).map(|j| (row * 100 + j) as f32).collect();
 
             println!("Row {row}: got {:?}", &result[..dim]);
-            println!("         exp {:?}", &expected);
+            println!("         exp {:?}", expected);
 
             for j in 0..dim {
                 if (result[j] - expected[j]).abs() > 1e-6 {

@@ -278,7 +278,12 @@ const NIBBLE_VALUES: usize = 16;
 /// The table, `rotated.len() / 4 * 16` entries
 pub fn build_sign_sums<T: AnnSearchFloat>(rotated: &[T]) -> Vec<T> {
     let mut lut = vec![T::zero(); rotated.len() / 4 * NIBBLE_VALUES];
-    for (i, row) in lut.chunks_exact_mut(NIBBLE_VALUES).enumerate() {
+    for (i, row) in lut
+        .as_chunks_mut::<NIBBLE_VALUES>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         let q = &rotated[i * 4..(i + 1) * 4];
         // Each entry extends the one with its highest bit cleared.
         for v in 1..NIBBLE_VALUES {
@@ -318,8 +323,10 @@ pub fn blocked_sign_ip<T: AnnSearchFloat>(
     // Two accumulators so the adds do not form one serial chain.
     let (mut lo, mut hi) = (T::zero(), T::zero());
     for (group, row) in groups
-        .chunks_exact(BLOCK)
-        .zip(sums.chunks_exact(2 * NIBBLE_VALUES))
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .zip(sums.as_chunks::<{ 2 * NIBBLE_VALUES }>().0.iter())
     {
         let byte = lane_byte(group, lane, BLOCKED_ARCH);
         lo += row[(byte & 0x0F) as usize];
