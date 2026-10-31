@@ -28,14 +28,20 @@ fn main() {
     // CPU Exhaustive (ground truth for external queries)
     println!("Building CPU exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying CPU exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -53,7 +59,7 @@ fn main() {
     println!("Self-querying CPU exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -73,15 +79,21 @@ fn main() {
     println!("Building MLX exhaustive index (MLX)...");
 
     let start = Instant::now();
-    let mlx_exhaustive_idx = build_exhaustive_index_mlx(data.as_ref(), &cli.distance).unwrap();
+    let mlx_exhaustive_idx =
+        build_exhaustive_index_mlx(data.as_ref(), &cli.distance, Verbosity::Quiet).unwrap();
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = mlx_exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying MLX exhaustive index (MLX)...");
     let start = Instant::now();
-    let (mlx_neighbors, mlx_distances) =
-        query_exhaustive_index_mlx(query_data.as_ref(), &mlx_exhaustive_idx, cli.k, true, false)
-            .unwrap();
+    let (mlx_neighbors, mlx_distances) = query_exhaustive_index_mlx(
+        query_data.as_ref(),
+        &mlx_exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall = calculate_recall(&true_neighbors, &mlx_neighbors, cli.k);
@@ -110,7 +122,8 @@ fn main() {
     println!("Self-querying MLX exhaustive index (MLX)...");
     let start = Instant::now();
     let (mlx_neighbors_self, mlx_distances_self) =
-        query_exhaustive_index_mlx_self(&mlx_exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_index_mlx_self(&mlx_exhaustive_idx, cli.k, true, Verbosity::Quiet)
+            .unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_self = calculate_recall(&true_neighbors_self, &mlx_neighbors_self, cli.k);
@@ -154,7 +167,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -189,7 +202,7 @@ fn main() {
                 Some(nprobe),
                 None,
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -223,9 +236,15 @@ fn main() {
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
 
         let start = Instant::now();
-        let (knn_neighbors_self, knn_distances_self) =
-            query_ivf_index_mlx_self(&ivf_mlx_idx, cli.k, Some(nprobe_self), None, true, false)
-                .unwrap();
+        let (knn_neighbors_self, knn_distances_self) = query_ivf_index_mlx_self(
+            &ivf_mlx_idx,
+            cli.k,
+            Some(nprobe_self),
+            None,
+            true,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &knn_neighbors_self, cli.k);

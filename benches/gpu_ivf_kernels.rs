@@ -5,6 +5,7 @@
 //! Run with: cargo bench --bench gpu_ivf_kernels --features gpu
 
 use ann_search_rs::gpu::k_means_gpu::KMeansGpuParams;
+use ann_search_rs::Verbosity;
 use cubecl::benchmark::{Benchmark, TimingMethod};
 use cubecl::future;
 use cubecl::prelude::*;
@@ -68,7 +69,7 @@ impl Benchmark for IvfBuildBench {
             Some(self.nlist),
             default_k_means_params(),
             42,
-            false,
+            Verbosity::Quiet,
             self.device.clone(),
         )
         .map_err(|e| e.to_string())?;
@@ -116,7 +117,13 @@ impl Benchmark for IvfQueryBench {
         });
         let result = self
             .index
-            .query_batch(mat.as_ref(), self.k, Some(self.nprobe), None, false)
+            .query_batch(
+                mat.as_ref(),
+                self.k,
+                Some(self.nprobe),
+                None,
+                Verbosity::Quiet,
+            )
             .unwrap();
         Ok(result)
     }
@@ -150,7 +157,7 @@ impl Benchmark for IvfKnnBench {
     fn execute(&self, _input: Self::Input) -> Result<Self::Output, String> {
         let result = self
             .index
-            .generate_knn(self.k, Some(self.nprobe), None, true, false)
+            .generate_knn(self.k, Some(self.nprobe), None, true, Verbosity::Quiet)
             .unwrap();
         Ok(result)
     }
@@ -549,7 +556,7 @@ fn run_ivf_suite(device: &Device) {
                 Some(nlist),
                 default_k_means_params(),
                 42,
-                false,
+                Verbosity::Quiet,
                 device.clone(),
             )
             .unwrap(),

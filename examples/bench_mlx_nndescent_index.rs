@@ -57,9 +57,10 @@ fn main() {
     let seed = cli.seed as usize;
 
     let start = Instant::now();
-    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let (truth_q, _) = query_exhaustive_index(queries.as_ref(), &cpu, k, false, false).unwrap();
-    let (truth_self, _) = query_exhaustive_self(&cpu, k, false, false).unwrap();
+    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
+    let (truth_q, _) =
+        query_exhaustive_index(queries.as_ref(), &cpu, k, false, Verbosity::Quiet).unwrap();
+    let (truth_self, _) = query_exhaustive_self(&cpu, k, false, Verbosity::Quiet).unwrap();
     println!(
         "CPU exhaustive (ground truth): {:.1} ms",
         start.elapsed().as_secs_f64() * 1e3
@@ -78,19 +79,26 @@ fn main() {
             None,
             None,
             seed,
-            false,
+            Verbosity::Quiet,
             true,
             WgpuDevice::default().clone().into(),
         )
         .unwrap()
     });
     let (w_q_cold, w_q_warm, w_q) = time_cold_warm(|| {
-        query_nndescent_index_gpu(queries.as_ref(), &mut wgpu, k, None, false, false)
-            .unwrap()
-            .0
+        query_nndescent_index_gpu(
+            queries.as_ref(),
+            &mut wgpu,
+            k,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     let (w_s_cold, w_s_warm, w_s) = time_cold_warm(|| {
-        query_nndescent_index_gpu_self(&mut wgpu, k, None, false)
+        query_nndescent_index_gpu_self(&mut wgpu, k, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
@@ -107,17 +115,17 @@ fn main() {
             None,
             None,
             seed,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap()
     });
     let (m_q_cold, m_q_warm, m_q) = time_cold_warm(|| {
-        query_nndescent_index_mlx(queries.as_ref(), &mlx, k, None, false, false)
+        query_nndescent_index_mlx(queries.as_ref(), &mlx, k, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
     let (m_s_cold, m_s_warm, m_s) = time_cold_warm(|| {
-        query_nndescent_index_mlx_self(&mlx, k, None, false)
+        query_nndescent_index_mlx_self(&mlx, k, None, false, Verbosity::Quiet)
             .unwrap()
             .0
     });

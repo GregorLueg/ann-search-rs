@@ -3,15 +3,12 @@
 use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::sample_vectors;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 /// Exhaustive PQ index
 ///
@@ -118,7 +115,7 @@ where
     /// * `n_pq_centroids` - Number of centroids to use for the product
     ///   quantisation. If not provided, it uses the default `256`
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -130,8 +127,9 @@ where
         max_iters: Option<usize>,
         n_pq_centroids: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-PQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -160,7 +158,7 @@ where
             &Dist::SquaredEuclidean,
             max_iters,
             seed,
-            verbose,
+            verbosity,
         )?;
 
         let mut quantised_codes = vec![0u8; n * m];
@@ -173,6 +171,8 @@ where
                 let codes = codebook.encode(vec);
                 chunk.copy_from_slice(&codes);
             });
+
+        log.finish();
 
         Ok(Self {
             quantised_codes,
@@ -266,15 +266,20 @@ where
     ///
     /// * `k` - Number of neighbours per vector
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)` where each row corresponds
     /// to a vector in the index
-    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<T> {
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Exhaustive-PQ index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -284,20 +289,12 @@ where
                 // Reconstruct by decoding PQ codes
                 let reconstructed = self.codebook.decode(codes);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(&reconstructed, k)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -366,7 +363,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -379,9 +376,16 @@ mod tests {
     #[test]
     fn test_build_cosine() {
         let data = create_simple_dataset();
-        let index =
-            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false)
-                .unwrap();
+        let index = ExhaustivePqIndex::build(
+            data.as_ref(),
+            8,
+            Dist::Cosine,
+            Some(10),
+            Some(4),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.metric, Dist::Cosine);
     }
@@ -396,7 +400,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -417,7 +421,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -437,7 +441,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -452,9 +456,16 @@ mod tests {
     #[test]
     fn test_query_cosine() {
         let data = create_simple_dataset();
-        let index =
-            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(10), Some(4), 42, false)
-                .unwrap();
+        let index = ExhaustivePqIndex::build(
+            data.as_ref(),
+            8,
+            Dist::Cosine,
+            Some(10),
+            Some(4),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32).map(|x| if x < 16 { 1.0 } else { 0.0 }).collect();
         let (indices, distances) = index.query(&query, 3).unwrap();
@@ -473,7 +484,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -496,7 +507,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -520,7 +531,7 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -539,7 +550,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -560,7 +571,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -583,7 +594,7 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -605,7 +616,7 @@ mod tests {
             Some(10),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -624,11 +635,11 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(3, true, false).unwrap();
+        let (knn_indices, knn_distances) = index.generate_knn(3, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(knn_indices.len(), 10);
         assert!(knn_distances.is_some());
@@ -653,11 +664,11 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) = index.generate_knn(3, false, false).unwrap();
+        let (knn_indices, knn_distances) = index.generate_knn(3, false, Verbosity::Quiet).unwrap();
 
         assert_eq!(knn_indices.len(), 10);
         assert!(knn_distances.is_none());
@@ -679,7 +690,7 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(index_4.codebook.m(), 4);
@@ -693,7 +704,7 @@ mod tests {
             Some(5),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(index_16.codebook.m(), 16);
@@ -720,9 +731,16 @@ mod tests {
             }
         });
 
-        let index =
-            ExhaustivePqIndex::build(data.as_ref(), 8, Dist::Cosine, Some(50), Some(6), 42, false)
-                .unwrap();
+        let index = ExhaustivePqIndex::build(
+            data.as_ref(),
+            8,
+            Dist::Cosine,
+            Some(50),
+            Some(6),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..32)
             .map(|j| if j % 6 == 2 { 1.0 } else { 0.03 })

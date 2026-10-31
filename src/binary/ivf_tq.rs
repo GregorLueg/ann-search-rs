@@ -27,8 +27,6 @@ use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::*;
 
 use crate::binary::turboquant::dists::{prepare_scalar_scoring, VectorDistanceTurboQuant};
@@ -41,6 +39,8 @@ use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 /// One cluster's blocked SIMD layout (2-bit / 4-bit only).
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
@@ -80,9 +80,9 @@ pub struct IvfTurboQuant<T> {
     /// Distance metric.
     metric: Dist,
     /// CSR cell boundaries, length `nlist + 1`.
-    cluster_offsets: Vec<usize>,
+    cluster_offsets: Vec<u32>,
     /// CSR slot to original vector index, length `n`.
-    vector_indices: Vec<usize>,
+    vector_indices: Vec<u32>,
     /// Per-cluster blocked codes for 2/4-bit, one entry per cell. `None` for
     /// 3-bit, which scores through the scalar path instead.
     blocked: Option<Vec<ClusterBlocked>>,
@@ -94,12 +94,13 @@ pub struct IvfTurboQuant<T> {
     n: usize,
     /// Optional on-disk original vectors for exact re-ranking.
     #[cfg_attr(feature = "serialise", serde(skip))]
-    vector_store: Option<MmapVectorStore<T>>,
-    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    vector_store: Option<VectorStore<T>>,
+    /// Fingerprint of `vector_store`, checked when it is re-opened after a
+    /// load. Only
     /// read by the `serialise` feature; the field is kept unconditionally so
     /// the constructors stay free of `cfg`.
     #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
-    store_meta: Option<StoreMeta>,
+    store_fingerprint: Option<u64>,
 }
 
 //////////////////////////////
@@ -162,7 +163,7 @@ where
     /// * `k_means_params` - Optional k-means training parameters
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `seed` - Random seed for clustering and the rotation
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -175,8 +176,9 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         bits: usize,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-TurboQuant index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -208,10 +210,6 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!("  Building IVF-TurboQuant index with {} cells.", nlist);
-        }
-
         let cluster_norms = if metric == Dist::Cosine {
             vec![T::one(); n]
         } else {
@@ -222,6 +220,7 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
+        let start = Instant::now();
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -230,8 +229,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // normalise centroids for Cosine so routing dots are cosine similarities.
         if metric == Dist::Cosine {
@@ -271,11 +278,15 @@ where
 
         // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
         let norms_f32_csr: Vec<f32> = (0..n)
-            .map(|s| quantiser.storage.norms[vector_indices[s]].to_f32().unwrap())
+            .map(|s| {
+                quantiser.storage.norms[vector_indices[s] as usize]
+                    .to_f32()
+                    .unwrap()
+            })
             .collect();
         let corrections_f32_csr: Vec<f32> = (0..n)
             .map(|s| {
-                quantiser.storage.corrections[vector_indices[s]]
+                quantiser.storage.corrections[vector_indices[s] as usize]
                     .to_f32()
                     .unwrap()
             })
@@ -289,14 +300,14 @@ where
             let bytes_per_vec = quantiser.storage.bytes_per_vec;
             let mut per_cluster = Vec::with_capacity(nlist);
             for c in 0..nlist {
-                let off = cluster_offsets[c];
-                let end = cluster_offsets[c + 1];
+                let off = cluster_offsets[c] as usize;
+                let end = cluster_offsets[c + 1] as usize;
                 let csize = end - off;
 
                 // Gather this cell's bit-plane codes in CSR slot order.
                 let mut packed = vec![0u8; csize * bytes_per_vec];
                 for (local, s) in (off..end).enumerate() {
-                    let src = quantiser.storage.vector_packed(vector_indices[s]);
+                    let src = quantiser.storage.vector_packed(vector_indices[s] as usize);
                     packed[local * bytes_per_vec..(local + 1) * bytes_per_vec].copy_from_slice(src);
                 }
 
@@ -328,6 +339,8 @@ where
             Some(per_cluster)
         };
 
+        log.finish();
+
         Ok(Self {
             quantiser,
             centroids,
@@ -343,7 +356,7 @@ where
             corrections_f32_csr,
             n,
             vector_store: None,
-            store_meta: None,
+            store_fingerprint: None,
         })
     }
 
@@ -358,8 +371,9 @@ where
     /// * `k_means_params` - Optional k-means training parameters
     /// * `bits` - Bits per coordinate (2, 3, or 4)
     /// * `seed` - Random seed for clustering and the rotation
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Directory for the persisted vectors
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -372,8 +386,9 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         bits: usize,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         // One walk of the caller's matrix, shared by the index and the store.
         let (vectors_flat, n, dim) = data.into_row_major();
@@ -384,7 +399,7 @@ where
             k_means_params,
             bits,
             seed,
-            verbose,
+            verbosity,
         )?;
 
         let norms: Vec<T> = vectors_flat
@@ -392,12 +407,10 @@ where
             .map(compute_l2_norm)
             .collect();
 
-        std::fs::create_dir_all(&save_path)?;
-        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
-
-        MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
-        index.vector_store = Some(MmapVectorStore::new(vectors_path, norms_path, dim, n)?);
-        index.store_meta = Some(StoreMeta { dim, n });
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
+        index.store_fingerprint = Some(vector_store.fingerprint());
+        index.vector_store = Some(vector_store);
 
         Ok(index)
     }
@@ -476,8 +489,8 @@ where
             // Scalar bit-plane scan over the probed cells' vectors.
             let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
             for &c in &probed {
-                for s in self.cluster_offsets[c]..self.cluster_offsets[c + 1] {
-                    let orig = self.vector_indices[s];
+                for s in self.cluster_offsets[c] as usize..self.cluster_offsets[c + 1] as usize {
+                    let orig = self.vector_indices[s] as usize;
                     let dist = self.turboquant_dist(&eq, &q_rot_f32, &levels_f32, orig);
                     if heap.len() < k {
                         heap.push((OrderedFloat(dist), orig));
@@ -503,8 +516,8 @@ where
 
         let mut heaps = vec![TopK::new(k.max(1))];
         for &c in &probed {
-            let off = self.cluster_offsets[c];
-            let end = self.cluster_offsets[c + 1];
+            let off = self.cluster_offsets[c] as usize;
+            let end = self.cluster_offsets[c + 1] as usize;
             let csize = end - off;
             if csize == 0 {
                 continue;
@@ -528,7 +541,7 @@ where
         let (csr_idx, dists_f32) = heaps.pop().unwrap().into_sorted(qn, self.metric);
         let indices = csr_idx
             .iter()
-            .map(|&s| self.vector_indices[s as usize])
+            .map(|&s| self.vector_indices[s as usize] as usize)
             .collect();
         let distances = dists_f32.iter().map(|&d| T::from_f32(d).unwrap()).collect();
         Ok((indices, distances))
@@ -574,7 +587,7 @@ where
     /// `(indices, distances)` of the re-ranked data.
     fn rerank_candidates(
         &self,
-        vector_store: &MmapVectorStore<T>,
+        vector_store: &VectorStore<T>,
         query_vec: &[T],
         candidates: &[usize],
         k: usize,
@@ -686,7 +699,7 @@ where
     /// * `rerank` - Whether to re-rank with exact distances
     /// * `rerank_factor` - Candidate multiplier when re-ranking (defaults to 20)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -700,7 +713,7 @@ where
         rerank: bool,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let (queries_flat, nq, query_dim) = queries.into_row_major();
 
@@ -729,19 +742,7 @@ where
             k_eff
         };
 
-        let counter = Arc::new(AtomicUsize::new(0));
-        let report = |counter: &Arc<AtomicUsize>, added: usize| {
-            if verbose {
-                let count = counter.fetch_add(added, Ordering::Relaxed) + added;
-                if count % 100_000 < added {
-                    println!(
-                        "  Processed {} / {} queries.",
-                        count.separate_with_underscores(),
-                        nq.separate_with_underscores()
-                    );
-                }
-            }
-        };
+        let progress = QueryProgress::new("IVF-TurboQuant index", nq, false, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = if self.bits == 3 {
             // No fused kernel for 3-bit: score each query independently.
@@ -755,7 +756,7 @@ where
                     } else {
                         self.query(qvec, k, Some(nprobe))?
                     };
-                    report(&counter, 1);
+                    progress.tick_n(1);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?
@@ -804,8 +805,8 @@ where
                     let mut heaps: Vec<TopK> =
                         (0..batch_nq).map(|_| TopK::new(k_search.max(1))).collect();
                     for &c in &probed {
-                        let off = self.cluster_offsets[c];
-                        let end = self.cluster_offsets[c + 1];
+                        let off = self.cluster_offsets[c] as usize;
+                        let end = self.cluster_offsets[c + 1] as usize;
                         let csize = end - off;
                         if csize == 0 {
                             continue;
@@ -831,7 +832,7 @@ where
                         let (csr_idx, dists_f32) = heap.into_sorted(qnorms[qi], self.metric);
                         let cands: Vec<usize> = csr_idx
                             .iter()
-                            .map(|&s| self.vector_indices[s as usize])
+                            .map(|&s| self.vector_indices[s as usize] as usize)
                             .collect();
                         if let Some(vs) = vector_store {
                             out.push(self.rerank_candidates(vs, qrows[qi], &cands, k));
@@ -841,7 +842,7 @@ where
                             out.push((cands, dists));
                         }
                     }
-                    report(&counter, batch_nq);
+                    progress.tick_n(batch_nq);
                     Ok(out)
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
@@ -849,6 +850,7 @@ where
             nested.into_iter().flatten().collect()
         };
 
+        progress.finish();
         Ok(pack_knn_results(results, return_dist))
     }
 
@@ -863,7 +865,7 @@ where
     /// * `nprobe` - Number of cells to probe (defaults to `sqrt(nlist)`)
     /// * `rerank_factor` - Candidate multiplier (defaults to 20)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -874,34 +876,26 @@ where
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let vector_store = self
             .vector_store
             .as_ref()
             .ok_or(AnnSearchErrors::VectorStoreNotAvailable)?;
 
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-TurboQuant index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                let vec = vector_store.load_vector(i);
+                let vec = vector_store.row(i);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
-                self.query_reranking(vec, k, nprobe, rerank_factor)
+                self.query_reranking(&vec, k, nprobe, rerank_factor)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -926,8 +920,8 @@ where
             + self.quantiser.memory_usage_bytes()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>()
-            + self.vector_indices.capacity() * std::mem::size_of::<usize>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<u32>()
+            + self.vector_indices.capacity() * std::mem::size_of::<u32>()
             + self.norms_f32_csr.capacity() * std::mem::size_of::<f32>()
             + self.corrections_f32_csr.capacity() * std::mem::size_of::<f32>()
             + blocked
@@ -948,7 +942,7 @@ use crate::utils::staging::StagedFiles;
 #[cfg(feature = "serialise")]
 impl<T> IndexIo for IvfTurboQuant<T>
 where
-    T: AnnSearchFloat,
+    T: AnnSearchFloat + Pod,
 {
     type Elem = T;
 
@@ -962,10 +956,7 @@ where
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
-        if let Some(meta) = self.store_meta {
-            meta.check(self.n, self.dim)?;
-        }
-        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.vector_store = VectorStore::open_for(dir, self.store_fingerprint, self.n, self.dim)?;
 
         Ok(())
     }
@@ -1036,7 +1027,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(index.n_vectors(), 200);
@@ -1056,7 +1047,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         );
         assert!(matches!(
             res,
@@ -1074,7 +1065,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(index.nlist, 10);
@@ -1090,7 +1081,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (indices, distances) = index.query(&row(&data, 3), 10, Some(16)).unwrap();
@@ -1111,7 +1102,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (indices, _) = index.query(&row(&data, 0), 100, Some(8)).unwrap();
@@ -1128,7 +1119,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (i_row, _) = index.query_row(data.as_ref().row(5), 10, Some(12)).unwrap();
@@ -1153,8 +1144,9 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1175,9 +1167,16 @@ mod tests {
     #[test]
     fn test_3bit_query_returns_k_sorted() {
         let data = test_data(120, 128);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(8), params(), 3, 42, false)
-                .unwrap();
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(8),
+            params(),
+            3,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let (indices, distances) = index.query(&row(&data, 1), 8, Some(8)).unwrap();
         assert_eq!(indices.len(), 8);
         for w in distances.windows(2) {
@@ -1195,7 +1194,7 @@ mod tests {
             params(),
             2,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (indices, _) = index.query(&row(&data, 0), 10, Some(12)).unwrap();
@@ -1205,9 +1204,16 @@ mod tests {
     #[test]
     fn test_query_reranking_without_store_errors() {
         let data = test_data(60, 64);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(8), params(), 4, 42, false)
-                .unwrap();
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(8),
+            params(),
+            4,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let res = index.query_reranking(&row(&data, 0), 5, Some(8), Some(5));
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
@@ -1222,10 +1228,10 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
-        let res = index.generate_knn(5, Some(8), Some(5), false, false);
+        let res = index.generate_knn(5, Some(8), Some(5), false, Verbosity::Quiet);
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
 
@@ -1241,7 +1247,7 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (indices, distances) = index.query(&row(&data, 0), 20, Some(1)).unwrap();
@@ -1263,13 +1269,14 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
             dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
         let (knn, dists) = index
-            .generate_knn(k, Some(12), Some(20), true, false)
+            .generate_knn(k, Some(12), Some(20), true, Verbosity::Quiet)
             .unwrap();
         assert_eq!(knn.len(), n);
         assert!(dists.is_some());
@@ -1295,12 +1302,20 @@ mod tests {
             params(),
             4,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
         let (batch_idx, batch_dist) = index
-            .query_batch(queries.as_ref(), k, Some(nlist), false, None, true, false)
+            .query_batch(
+                queries.as_ref(),
+                k,
+                Some(nlist),
+                false,
+                None,
+                true,
+                Verbosity::Quiet,
+            )
             .unwrap();
         let batch_dist = batch_dist.unwrap();
 
@@ -1322,10 +1337,25 @@ mod tests {
     fn test_query_batch_rerank_without_store_errors() {
         let data = test_data(60, 64);
         let queries = test_data(4, 64);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(8), params(), 4, 42, false)
-                .unwrap();
-        let res = index.query_batch(queries.as_ref(), 5, Some(8), true, Some(5), false, false);
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(8),
+            params(),
+            4,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let res = index.query_batch(
+            queries.as_ref(),
+            5,
+            Some(8),
+            true,
+            Some(5),
+            false,
+            Verbosity::Quiet,
+        );
         assert!(matches!(res, Err(AnnSearchErrors::VectorStoreNotAvailable)));
     }
 
@@ -1333,10 +1363,25 @@ mod tests {
     fn test_query_batch_dimension_mismatch() {
         let data = test_data(60, 64);
         let queries = test_data(4, 32);
-        let index =
-            IvfTurboQuant::build(data.as_ref(), Dist::Cosine, Some(8), params(), 4, 42, false)
-                .unwrap();
-        let res = index.query_batch(queries.as_ref(), 5, Some(8), false, None, false, false);
+        let index = IvfTurboQuant::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(8),
+            params(),
+            4,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let res = index.query_batch(
+            queries.as_ref(),
+            5,
+            Some(8),
+            false,
+            None,
+            false,
+            Verbosity::Quiet,
+        );
         assert!(matches!(
             res,
             Err(AnnSearchErrors::DimensionMismatch {

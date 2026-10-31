@@ -17,10 +17,6 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Ordering, Reverse};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering::Relaxed},
-    Arc,
-};
 use std::time::Instant;
 use thousands::*;
 
@@ -30,6 +26,7 @@ use crate::utils::dist::{cosine_distance_static, cosine_from_dot, euclidean_dist
 use crate::utils::graph_utils::SearchState;
 use crate::utils::nndescent_utils::{ApplySortedUpdates, SENTINEL_PID};
 use crate::utils::parallelism::StripedLocks;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ///////////
@@ -362,7 +359,7 @@ pub struct NsgIndex<T> {
     /// Global entry point selected by the build
     pub navigating_node: u32,
     /// Original ids (identity by default)
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -602,7 +599,9 @@ where
     /// Build an NSG index by first constructing an internal NN-Descent kNN
     /// graph, then refining it via MRNG pruning and DFS connectivity fix.
     ///
-    /// The kNN graph is discarded once the NSG is built.
+    /// The descent runs graph-only (no forest or query graph), and the
+    /// vectors move into the NSG rather than being copied. The kNN graph is
+    /// discarded once the NSG is built.
     ///
     /// ### Params
     ///
@@ -610,7 +609,8 @@ where
     /// * `metric` - Distance metric
     /// * `params` - Build parameters (see [`NsgBuildParams`])
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   kNN graph and each refinement step
     ///
     /// ### Returns
     ///
@@ -620,33 +620,46 @@ where
         metric: Dist,
         params: NsgBuildParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
-        if verbose {
-            println!("Building internal NN-Descent graph (k={})...", params.knn_k);
-        }
+        let log = BuildLog::new("NSG index", verbosity);
 
-        let nnd_start = Instant::now();
-        let nnd = NNDescent::<T>::new(
-            data,
-            metric,
-            Some(params.knn_k),
-            None,
-            None,
-            None,
-            T::from_f64(0.001).unwrap(),
-            T::zero(),
-            seed,
-            verbose,
-        )?;
-        if verbose {
+        let start = Instant::now();
+        let knn_params =
+            NNDescentKnnParams::new(params.knn_k, None, None, None, 0.001, false, true);
+        let nnd =
+            NNDescent::<T>::build_graph_only(data, metric, knn_params, seed, Verbosity::Quiet);
+        if verbosity.detailed_verbosity() {
             println!(
-                "NSG timing: NN-Descent build = {:.1} ms",
-                nnd_start.elapsed().as_secs_f64() * 1000.0
+                " Built NNDescent kNN graph (k = {}) in {:.2?}",
+                params.knn_k,
+                start.elapsed()
             );
         }
 
-        Self::build_from_nndescent(&nnd, params, seed, verbose)
+        let NNDescent {
+            vectors_flat,
+            n,
+            dim,
+            k,
+            norms,
+            graph,
+            ..
+        } = nnd;
+        let index = Self::refine_knn(
+            vectors_flat,
+            n,
+            dim,
+            norms,
+            metric,
+            &graph,
+            k,
+            params,
+            seed,
+            verbosity,
+        );
+        log.finish();
+        Ok(index)
     }
 
     /// Build an NSG index reusing an already-built NN-Descent index as the
@@ -658,7 +671,8 @@ where
     /// * `nnd` - Reference to a pre-built NN-Descent index
     /// * `params` - Build parameters
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds each
+    ///   refinement step
     ///
     /// ### Returns
     ///
@@ -667,26 +681,19 @@ where
         nnd: &NNDescent<T>,
         params: NsgBuildParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
-        // NN-Descent stores u32 ids; NSG's build walks usize. One transient
-        // copy against a build that dwarfs it.
-        let knn_graph: Vec<(usize, T)> = nnd
-            .graph()
-            .iter()
-            .map(|&(pid, d)| (pid as usize, d))
-            .collect();
         Self::build_from_knn(
             nnd.vectors_flat.to_owned(),
             nnd.n,
             nnd.dim,
             nnd.norms.to_owned(),
             nnd.metric(),
-            &knn_graph,
+            nnd.graph(),
             nnd.k,
             params,
             seed,
-            verbose,
+            verbosity,
         )
     }
 
@@ -698,7 +705,8 @@ where
     ///   [`KnnGraphGpu`](crate::gpu::nndescent_gpu::KnnGraphGpu)
     /// * `params` - Build parameters
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds each
+    ///   refinement step
     ///
     /// ### Returns
     ///
@@ -708,7 +716,7 @@ where
         knn_gpu: &crate::gpu::nndescent_gpu::KnnGraphGpu<T>,
         params: NsgBuildParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         Self::build_from_knn(
             knn_gpu.vectors_flat.to_owned(),
@@ -720,7 +728,7 @@ where
             knn_gpu.k,
             params,
             seed,
-            verbose,
+            verbosity,
         )
     }
 
@@ -738,7 +746,8 @@ where
     /// * `knn_k` - Neighbours per node in `knn_graph`
     /// * `params` - Build parameters
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds each
+    ///   refinement step
     ///
     /// ### Returns
     ///
@@ -750,17 +759,59 @@ where
         dim: usize,
         norms: Vec<T>,
         metric: Dist,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         params: NsgBuildParams,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("NSG index", verbosity);
+        let index = Self::refine_knn(
+            vectors_flat,
+            n,
+            dim,
+            norms,
+            metric,
+            knn_graph,
+            knn_k,
+            params,
+            seed,
+            verbosity,
+        );
+        log.finish();
+        Ok(index)
+    }
+
+    /// Refine a flat kNN graph into an NSG: navigating node, MRNG prune,
+    /// reverse insert, kNN top-up, connectivity fix.
+    ///
+    /// ### Params
+    ///
+    /// See [`Self::build_from_knn`]; `verbosity` only prints the `Detailed`
+    /// step lines, the caller owns start and end.
+    ///
+    /// ### Returns
+    ///
+    /// The built index.
+    #[allow(clippy::too_many_arguments)]
+    fn refine_knn(
+        vectors_flat: Vec<T>,
+        n: usize,
+        dim: usize,
+        norms: Vec<T>,
+        metric: Dist,
+        knn_graph: &[(u32, T)],
+        knn_k: usize,
+        params: NsgBuildParams,
+        seed: usize,
+        verbosity: Verbosity,
+    ) -> Self {
         assert_eq!(
             knn_graph.len(),
             n * knn_k,
             "knn_graph length must equal n * knn_k"
         );
+        let detailed = verbosity.detailed_verbosity();
 
         let mut index = Self {
             vectors_flat,
@@ -774,29 +825,21 @@ where
             l_build: params.l_build,
             c: params.c,
             navigating_node: 0,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         // Step 1: pick the navigating node
         let t_nav = Instant::now();
         let np = index.pick_navigating_node(knn_graph, knn_k, params.l_build, seed);
         index.navigating_node = np as u32;
-        if verbose {
-            println!(
-                "Navigating node: {} ({} candidates from centroid search)",
-                np, params.l_build
-            );
-            println!(
-                "NSG timing: step 1 (nav node) = {:.1} ms",
-                t_nav.elapsed().as_secs_f64() * 1000.0
-            );
+        if detailed {
+            println!(" Picked navigating node {} in {:.2?}", np, t_nav.elapsed());
         }
 
         // Step 2a: parallel forward MRNG prune per node.
         let threads = rayon::current_num_threads();
         let build_graph: NsgConstructionGraph<T> = NsgConstructionGraph::new(n, params.r, threads);
         let mut forward: Vec<Vec<(u32, T)>> = vec![Vec::new(); n];
-        let progress = Arc::new(AtomicUsize::new(0));
         let t_mrng = Instant::now();
         forward.par_iter_mut().enumerate().for_each(|(v, out)| {
             let neighbours = Self::with_build_state(|state_cell| {
@@ -819,24 +862,10 @@ where
                 build_graph.set_neighbours(v, &neighbours);
             }
             *out = neighbours;
-
-            if verbose {
-                let count = progress.fetch_add(1, Relaxed) + 1;
-                if count.is_multiple_of(100_000) {
-                    println!(
-                        "  MRNG pruned {} / {} nodes",
-                        count.separate_with_underscores(),
-                        n.separate_with_underscores()
-                    );
-                }
-            }
         });
 
-        if verbose {
-            println!(
-                "NSG timing: step 2a (MRNG prune) = {:.1} ms",
-                t_mrng.elapsed().as_secs_f64() * 1000.0
-            );
+        if detailed {
+            println!(" MRNG prune in {:.2?}", t_mrng.elapsed());
         }
 
         // Step 2b: parallel InterInsert (reverse edges).
@@ -887,11 +916,8 @@ where
             }
         });
         drop(forward);
-        if verbose {
-            println!(
-                "NSG timing: step 2b (InterInsert) = {:.1} ms",
-                t_inter.elapsed().as_secs_f64() * 1000.0
-            );
+        if detailed {
+            println!(" Reverse-edge insert in {:.2?}", t_inter.elapsed());
         }
 
         // Step 2c: kNN top-up. MRNG occlusion leaves very sparse rows on
@@ -911,6 +937,7 @@ where
                 }
                 let base = v * knn_k;
                 for &(nbr, dist) in &knn_graph[base..base + knn_k] {
+                    let nbr = nbr as usize;
                     if slot.len() >= params.r {
                         break;
                     }
@@ -925,20 +952,18 @@ where
                 }
             }
         });
-        if verbose {
-            println!(
-                "NSG timing: step 2c (kNN top-up) = {:.1} ms",
-                t_topup.elapsed().as_secs_f64() * 1000.0
-            );
+        if detailed {
+            println!(" kNN top-up in {:.2?}", t_topup.elapsed());
         }
 
         // Step 3: DFS connectivity
         let t_dfs = Instant::now();
-        index.dfs_connectivity_fix(&build_graph, verbose);
-        if verbose {
+        let patched = index.dfs_connectivity_fix(&build_graph);
+        if detailed {
             println!(
-                "NSG timing: step 3 (DFS fix) = {:.1} ms",
-                t_dfs.elapsed().as_secs_f64() * 1000.0
+                " Connectivity fix ({} nodes patched) in {:.2?}",
+                patched.separate_with_underscores(),
+                t_dfs.elapsed()
             );
         }
 
@@ -947,14 +972,11 @@ where
         let (flat, stride) = build_graph.into_flat();
         index.graph = flat;
         index.max_degree = stride;
-        if verbose {
-            println!(
-                "NSG timing: step 4 (flatten) = {:.1} ms",
-                t_flat.elapsed().as_secs_f64() * 1000.0
-            );
+        if detailed {
+            println!(" Flattened graph in {:.2?}", t_flat.elapsed());
         }
 
-        Ok(index)
+        index
     }
 
     /////////////////////
@@ -979,7 +1001,7 @@ where
     /// Index of the data point nearest to the centroid.
     fn pick_navigating_node(
         &self,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         seed: usize,
@@ -1027,6 +1049,7 @@ where
 
                 let base = current_id * knn_k;
                 for &(nbr, _) in &knn_graph[base..base + knn_k] {
+                    let nbr = nbr as usize;
                     if nbr == SENTINEL_PID || nbr >= self.n {
                         continue;
                     }
@@ -1091,7 +1114,7 @@ where
         &self,
         v: usize,
         np: usize,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         c: usize,
@@ -1122,7 +1145,7 @@ where
         &self,
         v: usize,
         np: usize,
-        knn_graph: &[(usize, T)],
+        knn_graph: &[(u32, T)],
         knn_k: usize,
         l_build: usize,
         c: usize,
@@ -1150,6 +1173,7 @@ where
         // Seed with np's kNN neighbours as extra beam entries.
         let np_base = np * knn_k;
         for &(nbr, _) in &knn_graph[np_base..np_base + knn_k] {
+            let nbr = nbr as usize;
             if nbr == SENTINEL_PID || nbr >= self.n || state.is_visited(nbr) {
                 continue;
             }
@@ -1176,6 +1200,7 @@ where
 
             let base = current_id * knn_k;
             for &(nbr, _) in &knn_graph[base..base + knn_k] {
+                let nbr = nbr as usize;
                 if nbr == SENTINEL_PID || nbr >= self.n {
                     continue;
                 }
@@ -1208,6 +1233,7 @@ where
         // Union in v's kNN neighbours to guarantee NNG ⊂ NSG.
         let vk_base = v * knn_k;
         for &(nbr, _) in &knn_graph[vk_base..vk_base + knn_k] {
+            let nbr = nbr as usize;
             if nbr == SENTINEL_PID || nbr >= self.n || nbr == v {
                 continue;
             }
@@ -1308,13 +1334,16 @@ where
     /// ### Params
     ///
     /// * `build_graph` - Partial NSG under construction
-    /// * `verbose` - Print progress
-    fn dfs_connectivity_fix(&self, build_graph: &NsgConstructionGraph<T>, verbose: bool) {
+    ///
+    /// ### Returns
+    ///
+    /// Number of unreachable nodes that were patched in.
+    fn dfs_connectivity_fix(&self, build_graph: &NsgConstructionGraph<T>) -> usize {
         let mut reachable = vec![false; self.n];
-        let mut stack: Vec<usize> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
         let np = self.navigating_node as usize;
         reachable[np] = true;
-        stack.push(np);
+        stack.push(self.navigating_node);
 
         let mut patch_count = 0usize;
         let mut cursor = 0usize;
@@ -1324,12 +1353,12 @@ where
             // edges. Persistent reachable[] means restarts don't retraverse.
             while let Some(node) = stack.pop() {
                 // SAFETY: sequential phase.
-                let nbrs = unsafe { build_graph.get_neighbours_slice(node) };
+                let nbrs = unsafe { build_graph.get_neighbours_slice(node as usize) };
                 for &(nbr, _) in nbrs {
                     let n_idx = nbr as usize;
                     if !reachable[n_idx] {
                         reachable[n_idx] = true;
-                        stack.push(n_idx);
+                        stack.push(nbr);
                     }
                 }
             }
@@ -1354,16 +1383,11 @@ where
             // Mark u reachable and restart DFS from u so its outgoing
             // subtree flood-fills in the next iteration.
             reachable[u] = true;
-            stack.push(u);
+            stack.push(u as u32);
             patch_count += 1;
         }
 
-        if verbose && patch_count > 0 {
-            println!(
-                "DFS: patched {} unreachable nodes",
-                patch_count.separate_with_underscores()
-            );
-        }
+        patch_count
     }
 
     /// Beam-search the partial NSG for the closest reachable node to `u`.
@@ -1635,7 +1659,7 @@ where
     /// * `k` - Number of neighbours per row
     /// * `ef_search` - Optional beam width override
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print progress every 100_000 samples
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -1645,9 +1669,9 @@ where
         k: usize,
         ef_search: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("NSG index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -1656,16 +1680,7 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 // Self-kNN: the node itself is the ideal entry seed. Its
                 // adjacency already holds its nearest kNN entries, so the
@@ -1677,6 +1692,7 @@ where
                 })
             })
             .collect::<Vec<_>>();
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -1723,7 +1739,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1769,7 +1785,7 @@ mod tests {
 
     fn build_default(mat: &Mat<f32>, metric: Dist) -> NsgIndex<f32> {
         let params = NsgBuildParams::new(16, 40, 100, 20);
-        NsgIndex::<f32>::build(mat.as_ref(), metric, params, 42, false).unwrap()
+        NsgIndex::<f32>::build(mat.as_ref(), metric, params, 42, Verbosity::Quiet).unwrap()
     }
 
     #[test]
@@ -1871,8 +1887,14 @@ mod tests {
         let dim = 8;
         let mat = linear_matrix(n, dim);
         let params = NsgBuildParams::new(16, 60, 200, 32);
-        let idx = NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 42, false)
-            .unwrap();
+        let idx = NsgIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            params,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let mut reachable = vec![false; idx.n];
         let mut stack = Vec::new();
@@ -1904,8 +1926,14 @@ mod tests {
         let dim = 4;
         let mat = linear_matrix(n, dim);
         let params = NsgBuildParams::new(16, 60, 200, 32);
-        let idx = NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 42, false)
-            .unwrap();
+        let idx = NsgIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            params,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.0_f32; dim];
         let (indices, _) = idx.query(&query, 5, Some(80)).unwrap();
@@ -1931,8 +1959,14 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         let params = NsgBuildParams::new(24, 80, 300, 48);
-        let idx = NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 42, false)
-            .unwrap();
+        let idx = NsgIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            params,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let recall = idx.validate_index(5, 42, Some(50)).unwrap();
         assert!(recall > 0.9, "Recall too low: {}", recall);
@@ -1944,10 +1978,22 @@ mod tests {
         let dim = 4;
         let mat = linear_matrix(n, dim);
         let params = NsgBuildParams::new(16, 40, 150, 24);
-        let a =
-            NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false).unwrap();
-        let b =
-            NsgIndex::<f32>::build(mat.as_ref(), Dist::SquaredEuclidean, params, 7, false).unwrap();
+        let a = NsgIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            params,
+            7,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let b = NsgIndex::<f32>::build(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            params,
+            7,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         assert_eq!(a.navigating_node, b.navigating_node);
         assert_eq!(a.graph, b.graph);
     }

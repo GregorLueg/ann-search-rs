@@ -33,15 +33,35 @@ the [CHANGELOG](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.
 
 Distances: squared Euclidean, cosine, and Manhattan on a subset of the indices.
 
+Exhaustive and IVF RaBitQ can do without the on-disk store: with `ex_bits`
+(`1..=8`) every vector keeps a wider code, and candidates the one-bit estimate
+cannot rule out are re-scored on that instead. With a store,
+`rerank_factor: None` reads exact distances only for candidates whose error
+bound still overlaps the current k-th distance; `Some(f)` keeps the fixed
+`k * f` shortlist.
+
 Every index has a `query_*_self` path for the full self-kNN graph, and most take
 a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
 re-entering, NN-Descent hands back the graph it built anyway.
+
+If all you want is the kNN graph (UMAP, Leiden, anything single cell),
+`build_knn_graph_nndescent` and `build_knn_graph_nndescent_gpu` skip the index
+entirely: matrix in, flat `u32` graph out, nothing kept.
+
+```rust
+use ann_search_rs::build_knn_graph_nndescent;
+use ann_search_rs::prelude::{NNDescentKnnParams, Verbosity};
+
+let params = NNDescentKnnParams { k: 15, include_self: true, ..Default::default() };
+let graph = build_knn_graph_nndescent(data.as_ref(), "euclidean", Some(params), 42, Verbosity::Quiet)?;
+let row = graph.row(0); // k + 1 ids, the point itself first
+```
 
 ## Installation
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.11", features = ["quantised", "binary"] }
+ann-search-rs = { version = "0.12", features = ["quantised", "binary"] }
 ```
 
 Optional features:
@@ -58,7 +78,7 @@ Optional features:
 ## Usage
 
 ```rust
-use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self};
+use ann_search_rs::{build_hnsw_index, query_hnsw_index, query_hnsw_self, Verbosity};
 use faer::Mat;
 
 let data = Mat::from_fn(10_000, 32, |_, _| rand::random::<f32>());
@@ -68,15 +88,15 @@ let index = build_hnsw_index(
     100,         // ef_construction
     "euclidean", // or "cosine", "manhattan"
     42,          // seed
-    false,       // verbose
-);
+    Verbosity::Normal,
+)?;
 
 // Cross-set query: k = 15, ef_search = 200, return distances
 let query = Mat::from_fn(100, 32, |_, _| rand::random::<f32>());
-let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, false)?;
+let (indices, dists) = query_hnsw_index(query.as_ref(), &index, 15, 200, true, Verbosity::Quiet)?;
 
 // Self-kNN graph, indices only
-let (graph, _) = query_hnsw_self(&index, 15, 200, false, false)?;
+let (graph, _) = query_hnsw_self(&index, 15, 200, false, Verbosity::Quiet)?;
 ```
 
 Every index follows the same `build_*` / `query_*` / `query_*_self` pattern.
@@ -84,11 +104,37 @@ Inputs can be a faer matrix, an `ndarray` view (with the feature) or a flat
 row-major slice with its shape. Rows are samples, columns are features, always:
 
 ```rust
-let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, false);
+let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean", 42, Verbosity::Quiet)?;
 ```
 
 The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
-Quickest way to see how one behaves on your kind of data.
+Quickest way to see how one behaves on your kind of data. Moreover, every build
+and query takes a `Verbosity`. `Quiet` prints nothing but warnings. `Normal`
+prints one line at the start and end of a build or query, plus a progress line
+every 100_000 queried samples. `Detailed` adds the timed build stages and
+per-iteration lines. NN-Descent on 200k x 32 at `Detailed`:
+
+```text
+Building NNDescent index ...
+ Built forest (27 trees) in 120.32ms
+ Seeded graph from forest in 182.89ms
+ Running NN-Descent iterations (max candidates 15, chunk size 25_890)
+  Iteration 1: 1_911_167 edge updates (rate 0.6371), 2 chunks
+  ...
+  Iteration 8: 1_770 edge updates (rate 0.0006), 1 chunks
+  Converged after 8 iterations
+ Descent phases: candidates 376.03ms, mark old 6.31ms, local join 443.79ms, radix sort 39.88ms, apply 67.87ms
+ Updates: 12_784_692 emitted, 3_552_642 accepted (27.79%)
+ Merged candidate list: mean 25.5, max 571, 247_653_776 pairs evaluated
+... built NNDescent index in 1.34s
+Querying NNDescent index (self) ...
+ Queried 100_000 / 200_000 samples
+ Queried 200_000 / 200_000 samples
+... queried NNDescent index (self) in 682.91ms
+```
+
+Callers that carry verbosity as an integer (R or Python bindings) can use
+`parse_annsearch_verbosity(0 | 1 | 2)`.
 
 ## Benchmarks
 
@@ -130,7 +176,9 @@ runtime, so a smaller GPU gets smaller staging tiles.
 Beyond the indices, `build_knn_graph_gpu` returns a raw kNN graph for anything
 that fits the device's per-binding limit, and `build_clustered_knn_graph_gpu`
 splits larger datasets into overlapping k-means clusters first. Either can feed
-`build_nsg_from_gpu_knn`.
+`build_nsg_from_gpu_knn`, which is the way to sweep NSG parameters over one
+graph. `build_nsg_index_gpu` does both in one call, matrix in, NSG out, and
+moves the vectors into the NSG instead of copying them.
 
 ## MLX (experimental)
 
@@ -145,7 +193,7 @@ brew install mlx-c
 ```
 
 ```toml
-ann-search-rs = { version = "0.11", features = ["mlx"] }
+ann-search-rs = { version = "0.12", features = ["mlx"] }
 ```
 
 If mlx-c lives somewhere other than `/opt/homebrew`, set `MLX_C_PREFIX`. If it

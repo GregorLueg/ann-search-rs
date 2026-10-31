@@ -17,7 +17,9 @@ use std::time::Instant;
 use crate::cpu::exhaustive::{GEMM_RERANK_DEN, GEMM_RERANK_NUM};
 use crate::mlx::ffi::*;
 use crate::prelude::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::DimensionValidation;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -409,11 +411,17 @@ impl ExhaustiveIndexMlx {
     ///
     /// * `data` - The data for which to generate the index. Samples x features
     /// * `metric` - Distance metric. Manhattan is not supported.
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
     /// Initialised exhaustive index, database resident on the device
-    pub fn new(data: impl AnnMatrix<f32>, metric: Dist) -> Result<Self, AnnSearchErrors> {
+    pub fn new(
+        data: impl AnnMatrix<f32>,
+        metric: Dist,
+        verbosity: Verbosity,
+    ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("Exhaustive-MLX index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -433,6 +441,8 @@ impl ExhaustiveIndexMlx {
         let db_t = db.transpose(&stream)?;
         eval_all(&[&db_t, &add_term], false)?;
 
+        log.finish();
+
         Ok(Self {
             vectors_flat,
             dim,
@@ -451,7 +461,8 @@ impl ExhaustiveIndexMlx {
     ///
     /// * `query_mat` - The samples x features matrix to query
     /// * `k` - Number of neighbours to return, clamped to the index size
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the queue versus wait time split
     ///
     /// ### Returns
     ///
@@ -460,14 +471,17 @@ impl ExhaustiveIndexMlx {
         &self,
         query_mat: impl AnnMatrix<f32>,
         k: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnResult<f32> {
         let (mut queries, n_query, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
         if self.metric == Dist::Cosine {
             normalise_rows(&mut queries, dim_query);
         }
-        self.query_prepared(&queries, n_query, k, verbose)
+        let progress = QueryProgress::new("Exhaustive-MLX index", n_query, false, verbosity);
+        let out = self.query_prepared(&queries, n_query, k, &progress, verbosity)?;
+        progress.finish();
+        Ok(out)
     }
 
     /// Generate the kNN graph of the indexed vectors against themselves.
@@ -476,13 +490,22 @@ impl ExhaustiveIndexMlx {
     ///
     /// * `k` - Number of neighbours per vector, self included
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the queue versus wait time split
     ///
     /// ### Returns
     ///
     /// Tuple of `(knn_indices, optional distances)`, one row per vector
-    pub fn generate_knn(&self, k: usize, return_dist: bool, verbose: bool) -> KnnOptionResult<f32> {
-        let (indices, distances) = self.query_prepared(&self.vectors_flat, self.n, k, verbose)?;
+    pub fn generate_knn(
+        &self,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<f32> {
+        let progress = QueryProgress::new("Exhaustive-MLX index", self.n, true, verbosity);
+        let (indices, distances) =
+            self.query_prepared(&self.vectors_flat, self.n, k, &progress, verbosity)?;
+        progress.finish();
         Ok((indices, return_dist.then_some(distances)))
     }
 
@@ -518,7 +541,8 @@ impl ExhaustiveIndexMlx {
     /// * `queries` - Row-major queries, unit-normalised for Cosine
     /// * `n_query` - Number of queries
     /// * `k` - Number of neighbours, clamped to the index size
-    /// * `verbose` - Print the queue versus wait time split
+    /// * `progress` - Progress the queries are counted against
+    /// * `verbosity` - Prints the queue versus wait time split at `Detailed`
     ///
     /// ### Returns
     ///
@@ -528,7 +552,8 @@ impl ExhaustiveIndexMlx {
         queries: &[f32],
         n_query: usize,
         k: usize,
-        verbose: bool,
+        progress: &QueryProgress,
+        verbosity: Verbosity,
     ) -> KnnResult<f32> {
         let k = k.min(self.n);
         if k == 0 {
@@ -586,19 +611,20 @@ impl ExhaustiveIndexMlx {
                     exact.into_iter().take(k).map(|(d, j)| (j, d)).unzip()
                 })
                 .collect();
+            progress.tick_n(rows.len());
             for (ir, dr) in rows {
                 all_indices.push(ir);
                 all_distances.push(dr);
             }
         }
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "MLX exhaustive: {} queries in tiles of {}, queue {:.1} ms, wait+copy {:.1} ms",
-                n_query,
-                tile,
-                (t1 - t0).as_secs_f64() * 1e3,
-                t1.elapsed().as_secs_f64() * 1e3
+                " {} queries in tiles of {}: queue {:.2?}, wait + copy {:.2?}",
+                n_query.separate_with_underscores(),
+                tile.separate_with_underscores(),
+                t1 - t0,
+                t1.elapsed()
             );
         }
 
@@ -657,12 +683,16 @@ mod tests {
         let data = random_mat(n, dim, 42);
         let queries = random_mat(50, dim, 7);
 
-        let mlx = ExhaustiveIndexMlx::new(data.as_ref(), metric).unwrap();
-        let cpu = ExhaustiveIndex::new(data.as_ref(), metric);
+        let mlx = ExhaustiveIndexMlx::new(data.as_ref(), metric, Verbosity::Quiet).unwrap();
+        let cpu = ExhaustiveIndex::new(data.as_ref(), metric, Verbosity::Quiet);
 
-        let (mlx_idx, mlx_dist) = mlx.query_batch(queries.as_ref(), k, false).unwrap();
+        let (mlx_idx, mlx_dist) = mlx
+            .query_batch(queries.as_ref(), k, Verbosity::Quiet)
+            .unwrap();
         let (q_flat, nq, _) = queries.as_ref().into_row_major();
-        let cpu_res = cpu.query_batch(&q_flat, nq, k, None, false).unwrap();
+        let cpu_res = cpu
+            .query_batch(&q_flat, nq, k, None, Verbosity::Quiet)
+            .unwrap();
 
         let mut hits = 0;
         for (i, (cpu_idx, cpu_dist)) in cpu_res.iter().enumerate() {
@@ -698,8 +728,10 @@ mod tests {
     #[test]
     fn test_mlx_exhaustive_self_query_finds_self() {
         let data = random_mat(500, 16, 3);
-        let index = ExhaustiveIndexMlx::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
-        let (idx, dist) = index.generate_knn(1, true, false).unwrap();
+        let index =
+            ExhaustiveIndexMlx::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
+        let (idx, dist) = index.generate_knn(1, true, Verbosity::Quiet).unwrap();
         let dist = dist.unwrap();
         for (i, row) in idx.iter().enumerate() {
             assert_eq!(row[0], i);
@@ -710,18 +742,22 @@ mod tests {
     #[test]
     fn test_mlx_exhaustive_k_larger_than_n_clamps() {
         let data = random_mat(8, 4, 1);
-        let index = ExhaustiveIndexMlx::new(data.as_ref(), Dist::SquaredEuclidean).unwrap();
-        let (idx, _) = index.query_batch(data.as_ref(), 20, false).unwrap();
+        let index =
+            ExhaustiveIndexMlx::new(data.as_ref(), Dist::SquaredEuclidean, Verbosity::Quiet)
+                .unwrap();
+        let (idx, _) = index
+            .query_batch(data.as_ref(), 20, Verbosity::Quiet)
+            .unwrap();
         assert!(idx.iter().all(|row| row.len() == 8));
     }
 
     #[test]
     fn test_mlx_exhaustive_rejects_manhattan_and_bad_dim() {
         let data = random_mat(8, 4, 1);
-        assert!(ExhaustiveIndexMlx::new(data.as_ref(), Dist::Manhattan).is_err());
-        let index = ExhaustiveIndexMlx::new(data.as_ref(), Dist::Cosine).unwrap();
+        assert!(ExhaustiveIndexMlx::new(data.as_ref(), Dist::Manhattan, Verbosity::Quiet).is_err());
+        let index = ExhaustiveIndexMlx::new(data.as_ref(), Dist::Cosine, Verbosity::Quiet).unwrap();
         assert!(index
-            .query_batch(random_mat(2, 5, 2).as_ref(), 3, false)
+            .query_batch(random_mat(2, 5, 2).as_ref(), 3, Verbosity::Quiet)
             .is_err());
     }
 }

@@ -18,6 +18,7 @@ use ann_search_rs::gpu::topk_gpu::{
 };
 use ann_search_rs::gpu::*;
 use ann_search_rs::utils::dist::Dist;
+use ann_search_rs::Verbosity;
 use cubecl_utils_rs::prelude::*;
 
 /// Shared config so all benchmarks use identical data
@@ -472,7 +473,7 @@ impl Benchmark for FullPipelineBench {
             self.cfg.dim,
             &self.cfg.metric,
             self.device.clone(),
-            false,
+            Verbosity::Quiet,
         )
         .map_err(|e| e.to_string())?;
 

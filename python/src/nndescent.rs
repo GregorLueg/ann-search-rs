@@ -6,6 +6,7 @@
 //! makes the cast infallible.
 
 use ann_search_rs::cpu::nndescent::NNDescent;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{
     build_nndescent_index, extract_nndescent_knn, query_nndescent_index, query_nndescent_self,
 };
@@ -32,7 +33,8 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     /// * `max_candidates` - Candidate pool per node, or `None`.
     /// * `n_trees` - Random projection trees used to seed the graph, or `None`.
     /// * `seed` - Fixes the initialisation and sampling.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -41,7 +43,7 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, delta, diversify_prob, k = None, max_iter = None,
-        max_candidates = None, n_trees = None, seed = 42, verbose = false
+        max_candidates = None, n_trees = None, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -55,7 +57,7 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
         max_candidates: Option<usize>,
         n_trees: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         if !delta.is_finite() || !diversify_prob.is_finite() {
             return Err(PyValueError::new_err(
@@ -77,7 +79,7 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
                 max_candidates,
                 n_trees,
                 seed,
-                verbose,
+                parse_annsearch_verbosity(verbose),
             )
         })
     }
@@ -91,12 +93,13 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     /// * `ef_search` - Candidate list size, or `None` for the library's
     ///   heuristic. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, ef_search = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, ef_search = None, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -104,14 +107,28 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
         k: usize,
         ef_search: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             NnDescentInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_nndescent_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_nndescent_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             NnDescentInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_nndescent_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_nndescent_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -126,19 +143,20 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
     /// * `k` - Neighbours per point, capped by the build-time `k`.
     /// * `ef_search` - Candidate list size, or `None` for the heuristic.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, ef_search = None, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, ef_search = None, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         ef_search: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             NnDescentInner::F32(idx) => self_arm!(py, k, || query_nndescent_self(
@@ -146,14 +164,14 @@ ann_handle!(PyNnDescent, NnDescentInner, NNDescent, "NnDescent", {
                 k,
                 ef_search,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
             NnDescentInner::F64(idx) => self_arm!(py, k, || query_nndescent_self(
                 idx,
                 k,
                 ef_search,
                 return_distance,
-                verbose
+                parse_annsearch_verbosity(verbose)
             )),
         }
     }

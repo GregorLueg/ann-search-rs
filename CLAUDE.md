@@ -111,13 +111,15 @@ Saving is a *directory*, not a file: `index.bin` plus any aux files (currently o
 
 Every index follows the same pattern in `src/lib.rs`:
 
-- `build_<name>_index(mat: impl AnnMatrix<T>, ..., dist_metric: &str, ...) -> <Result<>>Index<T>`
-- `query_<name>_index(query_mat, &index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for cross-set queries.
-- `query_<name>_self(&index, k, ..., return_dist, verbose) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
+- `build_<name>_index(mat: impl AnnMatrix<T>, ..., dist_metric: &str, ..., verbosity) -> <Result<>>Index<T>`
+- `query_<name>_index(query_mat, &index, k, ..., return_dist, verbosity) -> KnnOptionResult<T>` for cross-set queries.
+- `query_<name>_self(&index, k, ..., return_dist, verbosity) -> KnnOptionResult<T>` for the full self-kNN graph. These use index-specific fast paths (IVF exploits Voronoi cells, HNSW walks the graph without re-entering).
 
-NSG is the exception: it builds from an existing kNN graph, so alongside `build_nsg_index` there are `build_nsg_from_knn_index` and `build_nsg_from_gpu_knn`.
+NSG is the exception: it builds from an existing kNN graph, so alongside `build_nsg_index` (CPU kNN) and `build_nsg_index_gpu` (GPU kNN) there are `build_nsg_from_knn_index` and `build_nsg_from_gpu_knn`. The two matrix-in builders run the descent graph-only and move the vectors into the NSG.
 
 `build_knn_graph_gpu` and `build_clustered_knn_graph_gpu` are also exceptions: they return a bare `KnnGraphGpu` handoff with no query functions, for feeding NSG or unpacking raw kNN.
+
+`build_knn_graph_nndescent` and `build_knn_graph_nndescent_gpu` are the matrix-in, graph-out paths: they return a flat `KnnGraph<T>` (`n * k` `u32` ids, optional distances, `KNN_GRAPH_EMPTY` padding) and keep nothing else.
 
 `KnnOptionResult<T> = Result<(Vec<Vec<usize>>, Option<Vec<Vec<T>>>), AnnSearchErrors>`. Distances are optional so callers can skip storing them when they only need indices.
 
@@ -132,7 +134,7 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 
 ### Parallelism & SIMD
 
-- Queries fan out over samples using two shared helpers in `lib.rs`: `query_parallel` and `query_parallel_with_flags` (the latter tracks LSH miss rate). Both drive `rayon::into_par_iter` and centralise the verbose-progress counter. New algorithms should reuse these rather than rolling their own par-iters.
+- Queries fan out over samples using two shared helpers in `lib.rs`: `query_parallel` and `query_parallel_with_flags` (the latter tracks LSH miss rate). Both drive `rayon::into_par_iter` and take the printed index name for the shared `QueryProgress`. New algorithms should reuse these rather than rolling their own par-iters.
 - Distance calculations in `utils/dist.rs` dispatch on a `OnceLock`-cached `SimdLevel`, probed once per process. The 128-bit arm and the whole aarch64 path use the `wide` crate (`f32x4`/`f64x2`); the 256- and 512-bit arms are hand-written `std::arch` intrinsics behind `#[target_feature(enable = "avx2,fma")]` / `"avx512f"`. **This split is not a style choice.** `wide` picks its vector width from `#[cfg(target_feature = "avx")]`, a compile-time cfg, so on a crate built for the x86-64 baseline its `f32x8` is a pair of `f32x4` and every operation is two SSE ops. A `wide`-based kernel therefore cannot be runtime-dispatched: it silently emits SSE2 no matter which arm selects it, and no test can see the difference because the answers are identical. New wide-vector kernels go in `std::arch`.
 - `#[inline(always)]` and `#[target_feature]` cannot coexist (E0658), so the dispatched kernels are real calls. A helper carrying an identical `enable = "..."` string still inlines into them; one with fewer features does too. One with more does not, and rustc warns.
 - Set `ANN_SEARCH_SIMD` to `scalar`, `sse`, `avx2` or `avx512` to force a level. It only ever downgrades, since naming a level the CPU lacks would run an illegal instruction. `cargo run --example bench_dist_kernels --release` prices the kernels at whichever level is forced; `.github/workflows/simd-check.yml` runs it at three levels on demand, and gates every SIMD PR on the x86_64 build actually emitting `ymm`, `zmm` and `vfmadd`.
@@ -165,6 +167,7 @@ Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non
 
 - British English throughout (`quantised`, `binarised`, `neighbours`, `optimised`). Match it in new code, docs, and comments.
 - `#![warn(missing_docs)]` is on at the crate root. Every `pub` item needs a doc comment. The existing style uses `### Params` / `### Returns` / `### Note` markdown sections.
+- Printing goes through `utils/verbosity.rs`: `BuildLog` for the `Building <name> ...` / `... built <name> in` pair, `QueryProgress` for `Querying <name> ...`, the 100k progress lines and the end line. Stage lines are `Detailed`, one leading space and timed (`" Trained k-means (...) in {:.2?}"`); per-iteration lines get two spaces. A sub-component a parent calls (k-means in IVF, NN-Descent in NSG, Vamana in QG) gets `Verbosity::Quiet` and the parent prints one timed stage line, so indentation never depends on nesting. Stage helpers without start/end lines of their own (`nndescent_core`, the HNSW graph builder, PQ training, forest init) take the parent's verbosity. Counts use `separate_with_underscores()`, durations `{:.2?}`. Warnings (`[WARNING] ...`) print at every level.
 - The `#![allow(clippy::needless_range_loop)]` at the crate root is deliberate. Indexed loops are what you want in numeric kernels here, so don't rewrite them to iterators to appease clippy.
 - Matrix inputs are always `data: impl AnnMatrix<T>`, never a named `<T, M>` parameter. Partial turbofish does not exist for functions, so a named `M` breaks every turbofished call site (`build_clustered_knn_graph_gpu::<f32>`, the four `k_means_clusters_gpu::<f32>` in `gpu/k_means_gpu.rs`) with E0107. Argument-position `impl Trait` does not count towards the explicit generic argument list, so it keeps them all compiling.
 - The `lib.rs` shims must **flatten**, not forward: `Index::build(mat.into_row_major(), ...)`. `FlattenData<T>` implements `AnnMatrix` by identity, so this collapses the index constructors to one instantiation. Forwarding the input type instead re-monomorphises every constructor body per input type, and rustc does not run LLVM's `MergeFunctions` to dedupe them.

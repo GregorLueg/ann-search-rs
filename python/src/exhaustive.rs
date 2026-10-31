@@ -4,6 +4,7 @@
 //! measured against. No search-time knobs.
 
 use ann_search_rs::cpu::exhaustive::ExhaustiveIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::prelude::AnnSearchErrors;
 use ann_search_rs::{build_exhaustive_index, query_exhaustive_index, query_exhaustive_self};
 use pyo3::prelude::*;
@@ -23,18 +24,25 @@ ann_handle!(
         ///
         /// * `x` - Samples by features, C-contiguous float32 or float64.
         /// * `metric` - Already validated by the Python layer.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// The built handle. Infallible in the library, hence the `Ok` wrapper.
         #[staticmethod]
-        #[pyo3(signature = (x, *, metric))]
-        fn build(py: Python<'_>, x: &Bound<'_, PyAny>, metric: String) -> PyResult<Self> {
+        #[pyo3(signature = (x, *, metric, verbose = 0))]
+        fn build(
+            py: Python<'_>,
+            x: &Bound<'_, PyAny>,
+            metric: String,
+            verbose: usize,
+        ) -> PyResult<Self> {
             build_dispatch!(py, x, ExhaustiveInner, |data, n, dim| Ok::<
                 _,
                 AnnSearchErrors,
             >(
-                build_exhaustive_index((data, n, dim), &metric)
+                build_exhaustive_index((data, n, dim), &metric, parse_annsearch_verbosity(verbose))
             ))
         }
 
@@ -45,29 +53,42 @@ ann_handle!(
         /// * `q` - Queries by features, matching the index's float type.
         /// * `k` - Neighbours per query.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`, exact. See [`QueryOut`].
-        #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
         fn query<'py>(
             &self,
             py: Python<'py>,
             q: &Bound<'py, PyAny>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveInner::F32(idx) => {
                     query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                        query_exhaustive_index((data, n, dim), idx, k, return_distance, verbose)
+                        query_exhaustive_index(
+                            (data, n, dim),
+                            idx,
+                            k,
+                            return_distance,
+                            parse_annsearch_verbosity(verbose),
+                        )
                     })
                 }
                 ExhaustiveInner::F64(idx) => {
                     query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                        query_exhaustive_index((data, n, dim), idx, k, return_distance, verbose)
+                        query_exhaustive_index(
+                            (data, n, dim),
+                            idx,
+                            k,
+                            return_distance,
+                            parse_annsearch_verbosity(verbose),
+                        )
                     })
                 }
             }
@@ -81,18 +102,19 @@ ann_handle!(
         ///
         /// * `k` - Neighbours per point.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-        #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
         fn query_self<'py>(
             &self,
             py: Python<'py>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveInner::F32(idx) => {
@@ -100,7 +122,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
                 ExhaustiveInner::F64(idx) => {
@@ -108,7 +130,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
             }

@@ -6,6 +6,7 @@
 //! memory in a way the CPU IVF is not.
 
 use ann_search_rs::gpu::ivf_gpu::IvfIndexGpu;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_ivf_index_gpu, query_ivf_index_gpu, query_ivf_index_gpu_self};
 use pyo3::prelude::*;
 
@@ -27,7 +28,8 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     /// * `quantise_to_f16` - Hold the training buffer at fp16 on the device.
     ///   Needs `shader-f16` on the adapter.
     /// * `seed` - Fixes the k-means initialisation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -35,7 +37,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
-        quantise_to_f16 = false, seed = 42, verbose = false
+        quantise_to_f16 = false, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -47,7 +49,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
         kmeans_balanced: bool,
         quantise_to_f16: bool,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let a = f32_array!(x);
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -61,7 +63,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
                         kmp,
                         &metric,
                         seed,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                         default_device(),
                     )
                 })
@@ -81,13 +83,14 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     /// * `nquery` - Queries to stage on the device per batch, or `None` for the
     ///   library's own chunking. Lower it if the upload does not fit.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
     #[pyo3(signature = (
-        q, k, *, nprobe = None, nquery = None, return_distance = true, verbose = false
+        q, k, *, nprobe = None, nquery = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
@@ -98,7 +101,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let a = f32_array!(q);
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -113,7 +116,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
                         nprobe,
                         nquery,
                         return_distance,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                     )
                 })
             })
@@ -132,13 +135,14 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     /// * `nquery` - Points to stage per batch, or `None` for the library's own
     ///   chunking.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
     #[pyo3(signature = (
-        k, *, nprobe = None, nquery = None, return_distance = true, verbose = false
+        k, *, nprobe = None, nquery = None, return_distance = true, verbose = 0
     ))]
     fn query_self<'py>(
         &self,
@@ -147,13 +151,20 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let idx = &self.inner;
         let (ids, dists) = py
             .detach(|| {
                 crate::pool::run(|| {
-                    query_ivf_index_gpu_self(idx, k, nprobe, nquery, return_distance, verbose)
+                    query_ivf_index_gpu_self(
+                        idx,
+                        k,
+                        nprobe,
+                        nquery,
+                        return_distance,
+                        parse_annsearch_verbosity(verbose),
+                    )
                 })
             })
             .map_err(crate::error::AnnErr)?;

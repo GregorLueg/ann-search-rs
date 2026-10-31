@@ -21,6 +21,7 @@ mod commons;
 
 use std::time::Instant;
 
+use ann_search_rs::Verbosity;
 use ann_search_rs::{
     build_exhaustive_index, build_vamana_index, query_exhaustive_index, query_vamana_index,
 };
@@ -197,13 +198,13 @@ fn probe_set(flat: &[f32], n: usize, dim: usize, cli: &Cli) -> (Vec<f32>, usize,
     }
 
     let start = Instant::now();
-    let exhaustive = build_exhaustive_index((flat, n, dim), &cli.distance);
+    let exhaustive = build_exhaustive_index((flat, n, dim), &cli.distance, Verbosity::Quiet);
     let (truth, _) = query_exhaustive_index(
         (&queries[..], probes.len(), dim),
         &exhaustive,
         cli.k,
         false,
-        false,
+        Verbosity::Quiet,
     )
     .expect("exhaustive query failed");
     println!(
@@ -247,7 +248,9 @@ fn main() {
             cli.alpha_pass2,
             &cli.distance,
             cli.seed as usize,
-        );
+            Verbosity::Quiet,
+        )
+        .unwrap();
         println!("Build {}: {:.2?}", run + 1, start.elapsed());
 
         index = Some(built);
@@ -288,7 +291,7 @@ fn main() {
             cli.k,
             Some(ef),
             false,
-            false,
+            Verbosity::Quiet,
         )
         .expect("vamana query failed");
 
@@ -302,7 +305,7 @@ fn main() {
                 cli.k,
                 Some(ef),
                 false,
-                false,
+                Verbosity::Quiet,
             )
             .expect("vamana query failed");
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;

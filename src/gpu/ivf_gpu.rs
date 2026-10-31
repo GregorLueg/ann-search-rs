@@ -16,6 +16,8 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 ////////////
 // Consts //
@@ -77,31 +79,31 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
     vectors_flat: &[T],
     dim: usize,
     n: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     nlist: usize,
-) -> (Vec<T>, Vec<usize>, Vec<usize>) {
+) -> (Vec<T>, Vec<u32>, Vec<u32>) {
     // Count vectors per cluster
-    let mut counts = vec![0usize; nlist];
+    let mut counts = vec![0u32; nlist];
     for &cluster in assignments {
-        counts[cluster] += 1;
+        counts[cluster as usize] += 1;
     }
 
     // Build offsets
-    let mut offsets = vec![0usize; nlist + 1];
+    let mut offsets = vec![0u32; nlist + 1];
     for i in 0..nlist {
         offsets[i + 1] = offsets[i] + counts[i];
     }
 
     let mut vectors_reorg = vec![T::zero(); n * dim];
-    let mut indices_reorg = vec![0usize; n];
+    let mut indices_reorg = vec![0u32; n];
     let mut write_pos = offsets.clone();
 
     for vec_idx in 0..n {
-        let cluster = assignments[vec_idx];
-        let pos = write_pos[cluster];
+        let cluster = assignments[vec_idx] as usize;
+        let pos = write_pos[cluster] as usize;
         write_pos[cluster] += 1;
 
-        indices_reorg[pos] = vec_idx;
+        indices_reorg[pos] = vec_idx as u32;
 
         let src_start = vec_idx * dim;
         let dst_start = pos * dim;
@@ -144,9 +146,9 @@ pub struct IvfIndexGpu<T: AnnSearchFloat + CubeclFloat> {
     /// `generate_knn` without a GPU readback
     vectors_cpu: Vec<T>,
     /// Maps reorganised position -> original index
-    original_indices: Vec<usize>,
+    original_indices: Vec<u32>,
     /// CSR-style offsets into `vectors_gpu` per cluster; length `nlist + 1`
-    cluster_offsets: Vec<usize>,
+    cluster_offsets: Vec<u32>,
     /// Centroids kept on the GPU
     centroids_gpu: GpuTensor<T>,
     /// Dimensionality of the index
@@ -212,7 +214,8 @@ where
     /// * `k_means_params` - Optional k-means training parameters, see
     ///   [KMeansGpuParams]. If not provided, will default to sensible defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   k-means and the assignment
     /// * `device` - GPU device
     ///
     /// ### Note
@@ -233,12 +236,13 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansGpuParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         device: Device,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
+        let log = BuildLog::new("IVF-GPU index", verbosity);
 
         let (vectors_flat, n, dim) = data.into_row_major();
 
@@ -250,14 +254,11 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("  Generating IVF index with {} Voronoi cells.", nlist);
-        }
-
         // Hoisted above the k-means so training, assignment and the index
         // upload all share one device context and its buffer pool.
         let client = device.client();
 
+        let start = Instant::now();
         let centroids = train_centroids_gpu::<T>(
             &training_data,
             dim,
@@ -267,17 +268,36 @@ where
             k_means_params,
             seed,
             &client,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
+        let start = Instant::now();
         let assignments =
             assign_all_gpu::<T>(&vectors_flat, dim, n, &centroids, nlist, &metric, &client)?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let (vectors_by_cluster, original_indices, cluster_offsets) =
             reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist);
 
         let sorted_size_prefix = {
-            let mut sizes: Vec<usize> = cluster_offsets.windows(2).map(|w| w[1] - w[0]).collect();
+            let mut sizes: Vec<usize> = cluster_offsets
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as usize)
+                .collect();
             sizes.sort_unstable();
             let mut prefix = Vec::with_capacity(sizes.len() + 1);
             prefix.push(0usize);
@@ -288,10 +308,6 @@ where
             }
             prefix
         };
-
-        if verbose {
-            println!("  Uploading all vectors to GPU");
-        }
 
         // Pad vectors and centroids for GPU
         let mut vectors_padded = if dim_padded != dim {
@@ -322,9 +338,7 @@ where
         let centroids_gpu =
             GpuTensor::<T>::from_slice(&centroids_padded, vec![nlist, dim_padded], &client)?;
 
-        if verbose {
-            println!("  Index ready");
-        }
+        log.finish();
 
         Ok(Self {
             vectors_gpu,
@@ -352,7 +366,9 @@ where
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search, already resolved
     /// * `nquery` - Queries per GPU batch
-    /// * `verbose` - Controls the verbosity of the function
+    /// * `client` - CubeCL compute client
+    /// * `progress` - Progress the queries are counted against
+    /// * `verbosity` - Prints the batching at `Detailed`
     ///
     /// ### Returns
     ///
@@ -371,18 +387,19 @@ where
         nprobe: usize,
         nquery: usize,
         client: &Client,
-        verbose: bool,
+        progress: &QueryProgress,
+        verbosity: Verbosity,
     ) -> KnnResult<T> {
-        if verbose {
-            println!(
-                "Using nquery batch size: {}",
-                nquery.separate_with_underscores()
-            );
-        }
-
         let k = k.min(self.n);
 
         let n_batches = n_queries.div_ceil(nquery);
+        if verbosity.detailed_verbosity() {
+            println!(
+                " {} batches of up to {} queries",
+                n_batches.separate_with_underscores(),
+                nquery.separate_with_underscores()
+            );
+        }
 
         let mut scratch = self
             .scratch
@@ -390,26 +407,16 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if n_batches == 1 {
-            return self.query_batch_internal(
-                queries_flat,
-                n_queries,
-                k,
-                nprobe,
-                client,
-                &mut scratch,
-            );
+            let out =
+                self.query_batch_internal(queries_flat, n_queries, k, nprobe, client, &mut scratch);
+            progress.tick_n(n_queries);
+            return out;
         }
 
         let mut all_indices = Vec::with_capacity(n_queries);
         let mut all_distances = Vec::with_capacity(n_queries);
 
         for batch_idx in 0..n_batches {
-            if verbose
-                && (batch_idx == 0 || (batch_idx + 1) % 100 == 0 || batch_idx + 1 == n_batches)
-            {
-                println!("  Query batch {}/{}", batch_idx + 1, n_batches,);
-            }
-
             let batch_start = batch_idx * nquery;
             let batch_end = (batch_start + nquery).min(n_queries);
             let batch_size = batch_end - batch_start;
@@ -428,6 +435,7 @@ where
 
             all_indices.extend(batch_indices);
             all_distances.extend(batch_dists);
+            progress.tick_n(batch_size);
         }
 
         Ok((all_indices, all_distances))
@@ -442,7 +450,8 @@ where
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
     /// * `nquery` - Queries per GPU batch. Defaults to what keeps the candidate
     ///   buffer near `TARGET_BUFFER_MB`.
-    /// * `verbose` - Controls verbosity of the function.
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the batching
     ///
     /// ### Returns
     ///
@@ -453,10 +462,11 @@ where
         k: usize,
         nprobe: Option<usize>,
         nquery: Option<usize>,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnResult<T> {
         let (queries_flat, n_queries, dim_query) = query_mat.into_row_major();
         self.check_dim(dim_query)?;
+        let progress = QueryProgress::new("IVF-GPU index", n_queries, false, verbosity);
 
         let client: Client = self.device.client();
 
@@ -480,10 +490,12 @@ where
             nprobe,
             batch_size,
             &client,
-            verbose,
+            &progress,
+            verbosity,
         )?;
 
         client.memory_cleanup()?;
+        progress.finish();
         Ok((indices, dist))
     }
 
@@ -499,7 +511,8 @@ where
     /// * `nprobe` - Number of clusters to search (defaults to √nlist)
     /// * `nquery` - Queries per GPU batch. Defaults to what keeps the candidate
     ///   buffer near `TARGET_BUFFER_MB`.
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - `Normal` prints start, progress and end, `Detailed`
+    ///   adds the batching
     ///
     /// ### Returns
     ///
@@ -511,18 +524,15 @@ where
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let client: Client = self.device.client();
+        let progress = QueryProgress::new("IVF-GPU index", self.n, true, verbosity);
 
         let nprobe = self.resolve_nprobe(nprobe);
 
         let batch_size = nquery.unwrap_or_else(|| {
-            let safe = self.calculate_safe_batch_size(nprobe, &GpuLimits::from_client(&client));
-            if verbose {
-                println!("  Auto-tuned batch size to {} (based on density)", safe);
-            }
-            safe
+            self.calculate_safe_batch_size(nprobe, &GpuLimits::from_client(&client))
         });
 
         let (indices_reorg, dist_reorg) = self.query_internal(
@@ -532,14 +542,11 @@ where
             nprobe,
             batch_size,
             &client,
-            verbose,
+            &progress,
+            verbosity,
         )?;
 
         client.memory_cleanup()?;
-
-        if verbose {
-            println!("  Reordering results...");
-        }
 
         let mut indices = vec![Vec::new(); self.n];
         let mut dist = if return_dist {
@@ -549,11 +556,13 @@ where
         };
 
         for (reorg_idx, orig_idx) in self.original_indices.iter().enumerate() {
-            indices[*orig_idx] = indices_reorg[reorg_idx].clone();
+            indices[*orig_idx as usize] = indices_reorg[reorg_idx].clone();
             if return_dist {
-                dist[*orig_idx] = dist_reorg[reorg_idx].clone();
+                dist[*orig_idx as usize] = dist_reorg[reorg_idx].clone();
             }
         }
+
+        progress.finish();
 
         if return_dist {
             Ok((indices, Some(dist)))
@@ -569,8 +578,8 @@ where
     /// `(RAM bytes, VRAM bytes)`
     pub fn memory_usage_bytes(&self) -> (usize, usize) {
         let ram = std::mem::size_of_val(self)
-            + self.original_indices.capacity() * std::mem::size_of::<usize>()
-            + self.cluster_offsets.capacity() * std::mem::size_of::<usize>();
+            + self.original_indices.capacity() * std::mem::size_of::<u32>()
+            + self.cluster_offsets.capacity() * std::mem::size_of::<u32>();
 
         let scratch_vram = self
             .scratch
@@ -592,7 +601,8 @@ where
     /// * `n_queries` - Number of queries in this batch
     /// * `k` - Number of neighbours per query
     /// * `nprobe` - Number of clusters to search
-    /// * `verbose` - Controls verbosity
+    /// * `client` - CubeCL compute client
+    /// * `scratch` - Candidate buffers reused across batches
     ///
     /// ### Returns
     ///
@@ -736,7 +746,8 @@ where
                         for &c in row {
                             let c = c as usize;
                             chosen.push(c);
-                            reachable += self.cluster_offsets[c + 1] - self.cluster_offsets[c];
+                            reachable +=
+                                (self.cluster_offsets[c + 1] - self.cluster_offsets[c]) as usize;
                             if chosen.len() >= nprobe && reachable >= k {
                                 break;
                             }
@@ -793,14 +804,14 @@ where
         for q_idx in 0..n_queries {
             for &c in &probe_lists[q_idx] {
                 let start = self.cluster_offsets[c];
-                let count = self.cluster_offsets[c + 1] - start;
+                let count = (self.cluster_offsets[c + 1] - start) as usize;
 
                 if count > 0 {
                     let slot = cursor[c] as usize;
                     cursor[c] += 1;
 
                     task_q_idx[slot] = q_idx as u32;
-                    task_db_start[slot] = start as u32;
+                    task_db_start[slot] = start;
                     task_write_offset[slot] = cpu_write_pointers[q_idx];
                     task_db_count[slot] = count as u32;
 
@@ -851,7 +862,7 @@ where
                 let t0 = cluster_task_start[c] as usize;
                 let t1 = cursor[c] as usize;
                 let c_start = self.cluster_offsets[c];
-                let c_count = self.cluster_offsets[c + 1] - c_start;
+                let c_count = (self.cluster_offsets[c + 1] - c_start) as usize;
                 let mut t = t0;
                 while t < t1 {
                     let n_t = wg_y.min(t1 - t);
@@ -861,7 +872,7 @@ where
                         tiles.extend_from_slice(&[
                             t as u32,
                             n_t as u32,
-                            c_start as u32,
+                            c_start,
                             off as u32,
                             n_db as u32,
                         ]);
@@ -996,7 +1007,7 @@ where
                 let d = final_dists[start + i];
                 if d < T::from_f32(f32::MAX).unwrap() {
                     let reorg_idx = final_indices[start + i] as usize;
-                    row_idx.push(self.original_indices[reorg_idx]);
+                    row_idx.push(self.original_indices[reorg_idx] as usize);
                     // Cosine can round a self-distance to just under zero.
                     row_dist.push(if d < T::zero() { T::zero() } else { d });
                 }
@@ -1116,7 +1127,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1141,7 +1152,7 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1149,7 +1160,7 @@ mod tests {
         let query = Mat::from_fn(3, 4, |i, j| if i == j { 1.0_f32 } else { 0.0_f32 });
 
         let (indices, distances) = index
-            .query_batch(query.as_ref(), 5, Some(3), None, false)
+            .query_batch(query.as_ref(), 5, Some(3), None, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(indices.len(), 3);
@@ -1171,14 +1182,14 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
 
         let query = Mat::from_fn(2, 4, |_, _| 1.0_f32);
         let (indices, distances) = index
-            .query_batch(query.as_ref(), 3, Some(2), None, false)
+            .query_batch(query.as_ref(), 3, Some(2), None, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(indices.len(), 2);
@@ -1201,14 +1212,14 @@ mod tests {
             Some(20),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
 
         let query = Mat::from_fn(1, 4, |_, _| 0.0_f32);
         let (indices, distances) = index
-            .query_batch(query.as_ref(), 10, Some(1), None, false)
+            .query_batch(query.as_ref(), 10, Some(1), None, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1237,7 +1248,7 @@ mod tests {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1247,7 +1258,7 @@ mod tests {
         let query = Mat::from_fn(3, 6, |i, j| if i == j { 1.0_f32 } else { 0.1_f32 });
 
         let (indices, distances) = index
-            .query_batch(query.as_ref(), 3, Some(5), None, false)
+            .query_batch(query.as_ref(), 3, Some(5), None, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(indices.len(), 3);
@@ -1255,7 +1266,9 @@ mod tests {
         assert_eq!(distances.len(), 3);
 
         // Self-query path feeds `query_internal` the padded dim directly.
-        let (knn, _) = index.generate_knn(3, Some(5), None, false, false).unwrap();
+        let (knn, _) = index
+            .generate_knn(3, Some(5), None, false, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(knn.len(), 50);
     }
 
@@ -1276,7 +1289,7 @@ mod tests {
             Some(4),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1284,7 +1297,7 @@ mod tests {
         let mut sizes: Vec<usize> = index
             .cluster_offsets
             .windows(2)
-            .map(|w| w[1] - w[0])
+            .map(|w| (w[1] - w[0]) as usize)
             .collect();
         sizes.sort_unstable();
 
@@ -1306,7 +1319,7 @@ mod tests {
         let vectors: Vec<f32> = vec![
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
-        let assignments = vec![0, 1, 0, 1];
+        let assignments = vec![0u32, 1, 0, 1];
 
         let (reorg, indices, offsets) = reorganise_by_cluster(&vectors, 4, 4, &assignments, 2);
 
@@ -1352,12 +1365,14 @@ mod tests_wpgu {
             Some(5),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
 
-        let (indices, distances) = index.generate_knn(4, Some(3), None, true, false).unwrap();
+        let (indices, distances) = index
+            .generate_knn(4, Some(3), None, true, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), 30);
         assert!(distances.is_some());
@@ -1405,14 +1420,16 @@ mod tests_wpgu {
             Some(40),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
 
         // Any panic below (OOB, wrong indices) indicates the reducer
         // regression is back.
-        let (indices, distances) = index.generate_knn(k, Some(6), None, true, false).unwrap();
+        let (indices, distances) = index
+            .generate_knn(k, Some(6), None, true, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), n);
         let distances = distances.unwrap();

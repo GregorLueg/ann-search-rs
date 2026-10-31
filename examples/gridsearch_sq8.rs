@@ -27,15 +27,21 @@ fn main() {
     // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -53,7 +59,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -73,7 +79,7 @@ fn main() {
     println!("Building exhaustive SQ8 index...");
     let start = Instant::now();
     let exhaustive_sq8_idx =
-        build_exhaustive_sq8_index(data.as_ref(), &cli.distance, None, false).unwrap();
+        build_exhaustive_sq8_index(data.as_ref(), &cli.distance, None, Verbosity::Quiet).unwrap();
     let build_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
 
     let index_size_mb_sq8 = exhaustive_sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
@@ -85,7 +91,7 @@ fn main() {
         &exhaustive_sq8_idx,
         cli.k,
         false,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     let query_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
@@ -115,7 +121,7 @@ fn main() {
     println!("Self-querying exhaustive SQ8 index...");
     let start = Instant::now();
     let (sq8_neighbors_self, _) =
-        query_exhaustive_sq8_self(&exhaustive_sq8_idx, cli.k, false, false).unwrap();
+        query_exhaustive_sq8_self(&exhaustive_sq8_idx, cli.k, false, Verbosity::Quiet).unwrap();
     let self_query_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
 
     let recall_sq8_self = calculate_recall(&true_neighbors_self, &sq8_neighbors_self, cli.k);
@@ -157,7 +163,7 @@ fn main() {
             &cli.distance,
             cli.seed as usize,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -190,7 +196,7 @@ fn main() {
                 cli.k,
                 Some(*nprobe),
                 false,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -221,8 +227,14 @@ fn main() {
         let nprobe_self = (nlist as f32 * 2.0).sqrt() as usize;
         println!("Self-querying IVF-SQ8 index (nprobe={})...", nprobe_self);
         let start = Instant::now();
-        let (approx_neighbors_self, _) =
-            query_ivf_sq8_self(&ivf_sq8_idx, cli.k, Some(nprobe_self), false, false).unwrap();
+        let (approx_neighbors_self, _) = query_ivf_sq8_self(
+            &ivf_sq8_idx,
+            cli.k,
+            Some(nprobe_self),
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

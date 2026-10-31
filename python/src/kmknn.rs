@@ -5,6 +5,7 @@
 //! supported.
 
 use ann_search_rs::cpu::kmknn::KmknnIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_kmknn_index, query_kmknn_index, query_kmknn_self};
 use pyo3::prelude::*;
 
@@ -23,7 +24,8 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
     /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate default.
     /// * `kmeans_balanced` - Reseed starved centroids each iteration.
     /// * `seed` - Fixes the k-means initialisation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -31,7 +33,7 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
-        seed = 42, verbose = false
+        seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -42,7 +44,7 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
         build_dispatch!(py, x, KmknnInner, |data, n, dim| build_kmknn_index(
@@ -51,7 +53,7 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
             nlist,
             kmp,
             seed,
-            verbose
+            parse_annsearch_verbosity(verbose)
         ))
     }
 
@@ -62,26 +64,39 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
     /// * `q` - Queries by features, matching the index's float type.
     /// * `k` - Neighbours per query.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, exact. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         q: &Bound<'py, PyAny>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             KmknnInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_kmknn_index((data, n, dim), idx, k, return_distance, verbose)
+                query_kmknn_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             KmknnInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_kmknn_index((data, n, dim), idx, k, return_distance, verbose)
+                query_kmknn_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -95,25 +110,36 @@ ann_handle!(PyKmknn, KmknnInner, KmknnIndex, "Kmknn", {
     ///
     /// * `k` - Neighbours per point.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             KmknnInner::F32(idx) => {
-                self_arm!(py, k, || query_kmknn_self(idx, k, return_distance, verbose))
+                self_arm!(py, k, || query_kmknn_self(
+                    idx,
+                    k,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose)
+                ))
             }
             KmknnInner::F64(idx) => {
-                self_arm!(py, k, || query_kmknn_self(idx, k, return_distance, verbose))
+                self_arm!(py, k, || query_kmknn_self(
+                    idx,
+                    k,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose)
+                ))
             }
         }
     }

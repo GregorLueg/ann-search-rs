@@ -7,6 +7,7 @@
 
 use ann_search_rs::mlx::cagra_mlx::CagraMlxSearchParams;
 use ann_search_rs::mlx::nndescent_index_mlx::NNDescentIndexMlx;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{
     build_nndescent_index_mlx, query_nndescent_index_mlx, query_nndescent_index_mlx_self,
 };
@@ -63,7 +64,8 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
     /// * `rho` - Local-join sampling rate, or `None` for 1.0.
     /// * `refine_knn` - Two-hop refinement sweeps after the main loop.
     /// * `seed` - Fixes the seed graph.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -71,7 +73,7 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, k = None, build_k = None, max_iters = None, n_trees = None, delta = None,
-        rho = None, refine_knn = None, seed = 42, verbose = false
+        rho = None, refine_knn = None, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -86,7 +88,7 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
         rho: Option<f32>,
         refine_knn: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let a = f32_array(x)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -102,7 +104,7 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
                 rho,
                 refine_knn,
                 seed,
-                verbose,
+                parse_annsearch_verbosity(verbose),
             )
         })
         .map_err(crate::error::AnnErr)?;
@@ -120,14 +122,15 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
     /// * `n_entry_points` - Graph entry points, or `None`.
     /// * `expand_per_iter` - Beam entries expanded per iteration, or `None`.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
     #[pyo3(signature = (
         q, k, *, beam_width = None, max_beam_iters = None, n_entry_points = None,
-        expand_per_iter = None, return_distance = true, verbose = false
+        expand_per_iter = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
@@ -140,14 +143,21 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
         n_entry_points: Option<usize>,
         expand_per_iter: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let a = f32_array(q)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
         let params = cagra_params(beam_width, max_beam_iters, n_entry_points, expand_per_iter);
         let idx = &self.inner;
         let (ids, dists) = detach(py, || {
-            query_nndescent_index_mlx((data, n, dim), idx, k, params, return_distance, verbose)
+            query_nndescent_index_mlx(
+                (data, n, dim),
+                idx,
+                k,
+                params,
+                return_distance,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         crate::dispatch::pack(py, ids, dists, k)
@@ -163,15 +173,15 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
     /// * `n_entry_points` - Graph entry points, or `None`.
     /// * `expand_per_iter` - Beam entries expanded per iteration, or `None`.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Accepted and ignored; the library's self-query takes no
-    ///   verbosity flag. Present so the estimator can pass it uniformly.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
     #[pyo3(signature = (
         k, *, beam_width = None, max_beam_iters = None, n_entry_points = None,
-        expand_per_iter = None, return_distance = true, verbose = false
+        expand_per_iter = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query_self<'py>(
@@ -183,13 +193,18 @@ mlx_handle!(PyCagraMlx, NNDescentIndexMlx, "CagraMlx", {
         n_entry_points: Option<usize>,
         expand_per_iter: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
-        let _ = verbose;
         let params = cagra_params(beam_width, max_beam_iters, n_entry_points, expand_per_iter);
         let idx = &self.inner;
         let (ids, dists) = detach(py, || {
-            query_nndescent_index_mlx_self(idx, k, params, return_distance)
+            query_nndescent_index_mlx_self(
+                idx,
+                k,
+                params,
+                return_distance,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         crate::dispatch::pack(py, ids, dists, k)

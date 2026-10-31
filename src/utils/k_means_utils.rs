@@ -13,10 +13,13 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 use std::iter::Sum;
 use std::num::NonZero;
+use std::time::Instant;
+use thousands::*;
 
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
+use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
 
 ////////////
@@ -902,8 +905,8 @@ fn gemm_assign_full<T>(
     centroid_norms: &[T], // ||c||^2 for Euclidean; ||c|| for Cosine
     k: usize,
     metric: &Dist,
-    prior: Option<&[usize]>,
-    assignments: &mut [usize],
+    prior: Option<&[u32]>,
+    assignments: &mut [u32],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
 ) where
@@ -975,7 +978,7 @@ fn gemm_assign_full<T>(
 
                 for i in 0..tile_n {
                     let (best, second, best_c) = top2[i];
-                    assign_block[i] = best_c;
+                    assign_block[i] = best_c as u32;
                     match metric {
                         Dist::SquaredEuclidean => {
                             upper_block[i] = (norm_block[i] - best).max(T::zero()).sqrt();
@@ -1045,8 +1048,8 @@ fn gemm_assign_pruned<T>(
     dim: usize,
     centroids: &[T],
     k: usize,
-    prior: &[usize],
-    assignments: &mut [usize],
+    prior: &[u32],
+    assignments: &mut [u32],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
 ) -> bool
@@ -1111,7 +1114,7 @@ where
                     x_part_sq,
                 );
                 for (i, &(best, second, best_c)) in state.iter().enumerate() {
-                    assign_block[i] = best_c;
+                    assign_block[i] = best_c as u32;
                     upper_block[i] = best.sqrt();
                     lower_block[i] = second.sqrt();
                 }
@@ -1142,7 +1145,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn prune_tile<T>(
     data_block: &[T],
-    prior_block: &[usize],
+    prior_block: &[u32],
     centroids: &[T],
     cent_part_sq: &[T],
     dim: usize,
@@ -1165,7 +1168,7 @@ where
     x_part_sq.clear();
     for i in 0..tile_n {
         let x = row(i);
-        let p = prior_block[i];
+        let p = prior_block[i] as usize;
         state.push((T::euclidean_simd(x, cent(p)), T::infinity(), p));
         x_part_sq.push(T::dot_simd(&x[..d_part], &x[..d_part]));
     }
@@ -1179,7 +1182,7 @@ where
             let col = dots.col_as_slice(i);
             let (mut best, mut second, mut best_c) = state[i];
             let xp = x_part_sq[i];
-            let p = prior_block[i];
+            let p = prior_block[i] as usize;
             for c in 0..kb {
                 let gc = c0 + c;
                 if gc == p {
@@ -1321,13 +1324,13 @@ fn gemm_reassign_dirty<T>(
     k: usize,
     metric: &Dist,
     dirty: &[usize],
-    assignments: &mut [usize],
+    assignments: &mut [u32],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
     // scratch spaces
     gathered_data: &mut Vec<T>,
     gathered_norms: &mut Vec<T>,
-    tmp_assign: &mut [usize],
+    tmp_assign: &mut [u32],
     tmp_upper: &mut [T],
     tmp_lower: &mut [T],
 ) where
@@ -1357,7 +1360,7 @@ fn gemm_reassign_dirty<T>(
                             second_score = score;
                         }
                     }
-                    assignments[i] = best_c;
+                    assignments[i] = best_c as u32;
                     upper_bounds[i] = (data_norms_sq[i] - best_score).max(T::zero()).sqrt();
                     lower_bounds[i] = (data_norms_sq[i] - second_score).max(T::zero()).sqrt();
                 }
@@ -1386,7 +1389,7 @@ fn gemm_reassign_dirty<T>(
                     } else {
                         T::zero()
                     };
-                    assignments[i] = best_c;
+                    assignments[i] = best_c as u32;
                     upper_bounds[i] = T::one() - best_score * inv_xn;
                     lower_bounds[i] = T::one() - second_score * inv_xn;
                 }
@@ -1405,7 +1408,7 @@ fn gemm_reassign_dirty<T>(
         gathered_data.extend_from_slice(&data[i * dim..(i + 1) * dim]);
         gathered_norms.push(data_norms_sq[i]);
     }
-    let prior: Vec<usize> = dirty.iter().map(|&i| assignments[i]).collect();
+    let prior: Vec<u32> = dirty.iter().map(|&i| assignments[i]).collect();
 
     gemm_assign_full(
         gathered_data,
@@ -1479,7 +1482,7 @@ pub fn adjust_centers<T>(
     k: usize,
     data: &[T],
     n: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     counts: &[usize],
     seed: usize,
 ) -> usize
@@ -1505,7 +1508,7 @@ where
         let mut donor = None;
         for _ in 0..n {
             cursor = (cursor + BALANCE_DONOR_STRIDE) % n;
-            let owner = assignments[cursor];
+            let owner = assignments[cursor] as usize;
             if owner != c && (counts[owner] as f64) > average {
                 donor = Some(cursor);
                 break;
@@ -1549,7 +1552,7 @@ fn update_centroids<T>(
     data: &[T],
     dim: usize,
     n: usize,
-    assignments: &[usize],
+    assignments: &[u32],
     centroids: &mut [T],
     centroid_norms: &mut [T],
     k: usize,
@@ -1573,9 +1576,9 @@ fn update_centroids<T>(
             let data_chunk = &data[start_idx * dim..(start_idx + assignment_chunk.len()) * dim];
 
             for (i, &cluster) in assignment_chunk.iter().enumerate() {
-                local_counts[cluster] += 1;
+                local_counts[cluster as usize] += 1;
                 let vec = &data_chunk[i * dim..(i + 1) * dim];
-                let offset = cluster * dim;
+                let offset = cluster as usize * dim;
                 T::add_assign_simd(&mut local_sums[offset..offset + dim], vec);
             }
             (local_sums, local_counts)
@@ -1792,7 +1795,7 @@ where
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd<T>(
     data: &[T],
@@ -1805,11 +1808,11 @@ fn hamerly_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField + FromPrimitive,
 {
-    let mut assignments = vec![0usize; n];
+    let mut assignments = vec![0u32; n];
     let mut upper = vec![T::infinity(); n];
     let mut lower = vec![T::zero(); n];
     let mut old_centroids = vec![T::zero(); k * dim];
@@ -1818,7 +1821,7 @@ fn hamerly_lloyd<T>(
 
     let mut ws_gathered_data = Vec::with_capacity(n * dim);
     let mut ws_gathered_norms = Vec::with_capacity(n);
-    let mut ws_tmp_assign = vec![0usize; n];
+    let mut ws_tmp_assign = vec![0u32; n];
     let mut ws_tmp_upper = vec![T::zero(); n];
     let mut ws_tmp_lower = vec![T::zero(); n];
 
@@ -1856,8 +1859,8 @@ fn hamerly_lloyd<T>(
         let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
 
         if max_delta <= T::from_f64(1e-5).unwrap() {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -1867,6 +1870,7 @@ fn hamerly_lloyd<T>(
             .zip(lower.par_iter_mut())
             .zip(assignments.par_iter())
             .for_each(|((u, l), &a)| {
+                let a = a as usize;
                 *u += deltas[a];
                 let other_max = if a == max_delta_idx {
                     second_max_delta
@@ -1884,7 +1888,7 @@ fn hamerly_lloyd<T>(
             let centroid_norms_sq: &[T] = centroid_norms_sq;
             // par_extend keeps index order, same as the serial scan
             dirty.par_extend(upper.par_iter_mut().enumerate().filter_map(|(i, u)| {
-                let a = assignments[i];
+                let a = assignments[i] as usize;
                 let m = if s[a] > lower[i] { s[a] } else { lower[i] };
                 if *u > m {
                     *u = exact_point_centroid_dist(
@@ -1905,8 +1909,8 @@ fn hamerly_lloyd<T>(
         }
 
         if dirty.is_empty() {
-            if verbose {
-                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {} (bounds tight)", iter + 1);
             }
             break;
         }
@@ -1930,12 +1934,12 @@ fn hamerly_lloyd<T>(
             &mut ws_tmp_lower,
         );
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                "  Iteration {}: {} / {} points reassessed, {:.1}% pruned",
                 iter + 1,
-                dirty.len(),
-                n,
+                dirty.len().separate_with_underscores(),
+                n.separate_with_underscores(),
                 (1.0 - dirty.len() as f64 / n as f64) * 100.0,
             );
         }
@@ -1965,7 +1969,7 @@ fn hamerly_lloyd<T>(
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn gemm_lloyd<T>(
     data: &[T],
@@ -1979,12 +1983,12 @@ fn gemm_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + faer_traits::ComplexField,
 {
-    let mut assignments = vec![0usize; n];
-    let mut prev_assignments = vec![usize::MAX; n];
+    let mut assignments = vec![0u32; n];
+    let mut prev_assignments = vec![u32::MAX; n];
     let mut upper = vec![T::zero(); n];
     let mut lower = vec![T::zero(); n];
 
@@ -2012,8 +2016,8 @@ fn gemm_lloyd<T>(
         let change_floor: usize = (n / 10_000).max(1);
 
         if changed <= change_floor {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2033,11 +2037,11 @@ fn gemm_lloyd<T>(
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} complete ({} assignments changed)",
+                "  Iteration {}: {} assignments changed",
                 iter + 1,
-                changed
+                changed.separate_with_underscores()
             );
         }
     }
@@ -2073,7 +2077,7 @@ fn gemm_lloyd<T>(
 /// * `max_iters` - Maximum iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print iteration progress
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn parallel_lloyd<T>(
     data: &[T],
@@ -2087,11 +2091,11 @@ fn parallel_lloyd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
-    let mut prev_assignments: Vec<usize> = vec![usize::MAX; n];
+    let mut prev_assignments: Vec<u32> = vec![u32::MAX; n];
     let num_threads = rayon::current_num_threads();
     let chunk_size = (n + num_threads - 1) / num_threads.max(1);
     // Reseeds performed by the previous iteration. This path tests convergence
@@ -2123,8 +2127,8 @@ fn parallel_lloyd<T>(
         let change_floor: usize = (n / 10_000).max(1);
 
         if changed <= change_floor && last_adjusted == 0 {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2140,9 +2144,9 @@ fn parallel_lloyd<T>(
                 let data_chunk = &data[start_idx * dim..(start_idx + assignment_chunk.len()) * dim];
 
                 for (i, &cluster) in assignment_chunk.iter().enumerate() {
-                    local_counts[cluster] += 1;
+                    local_counts[cluster as usize] += 1;
                     let vec = &data_chunk[i * dim..(i + 1) * dim];
-                    let cluster_offset = cluster * dim;
+                    let cluster_offset = cluster as usize * dim;
 
                     T::add_assign_simd(&mut local_sums[cluster_offset..cluster_offset + dim], vec);
                 }
@@ -2196,11 +2200,11 @@ fn parallel_lloyd<T>(
 
         std::mem::swap(&mut prev_assignments, &mut assignments);
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} complete ({} assignments changed)",
+                "  Iteration {}: {} assignments changed",
                 iter + 1,
-                changed
+                changed.separate_with_underscores()
             );
         }
     }
@@ -2270,7 +2274,7 @@ fn simd_assign_full_with_bounds<T>(
     dim: usize,
     centroids: &[T],
     k: usize,
-    assignments: &mut [usize],
+    assignments: &mut [u32],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
 ) where
@@ -2285,7 +2289,7 @@ fn simd_assign_full_with_bounds<T>(
             let vec = &data[i * dim..(i + 1) * dim];
             let (best_c, best_dist, second_dist) =
                 assign_one_with_bounds_simd(vec, centroids, dim, k);
-            *assign = best_c;
+            *assign = best_c as u32;
             *upper = best_dist;
             *lower = second_dist;
         });
@@ -2314,7 +2318,7 @@ fn simd_reassign_dirty<T>(
     centroids: &[T],
     k: usize,
     dirty: &[usize],
-    assignments: &mut [usize],
+    assignments: &mut [u32],
     upper_bounds: &mut [T],
     lower_bounds: &mut [T],
 ) where
@@ -2329,7 +2333,7 @@ fn simd_reassign_dirty<T>(
         .collect();
 
     for (&i, (best_c, best_dist, second_dist)) in dirty.iter().zip(updates) {
-        assignments[i] = best_c;
+        assignments[i] = best_c as u32;
         upper_bounds[i] = best_dist;
         lower_bounds[i] = second_dist;
     }
@@ -2397,7 +2401,7 @@ where
 /// * `max_iters` - Maximum number of Lloyd's iterations
 /// * `balanced` - Reseed starved centroids each iteration via [`adjust_centers`]
 /// * `seed` - Seeds the donor walk when `balanced` is set
-/// * `verbose` - Print convergence diagnostics
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 #[allow(clippy::too_many_arguments)]
 fn hamerly_lloyd_simd<T>(
     data: &[T],
@@ -2409,11 +2413,11 @@ fn hamerly_lloyd_simd<T>(
     max_iters: usize,
     balanced: bool,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) where
     T: Float + Send + Sync + SimdDistance + FromPrimitive,
 {
-    let mut assignments = vec![0usize; n];
+    let mut assignments = vec![0u32; n];
     let mut upper = vec![T::infinity(); n];
     let mut lower = vec![T::zero(); n];
     let mut old_centroids = vec![T::zero(); k * dim];
@@ -2449,8 +2453,8 @@ fn hamerly_lloyd_simd<T>(
         let (max_delta, second_max_delta, max_delta_idx) = top_two_deltas(&deltas);
 
         if max_delta <= T::from_f64(1e-5).unwrap() {
-            if verbose {
-                println!("    Converged at iteration {}", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {}", iter + 1);
             }
             break;
         }
@@ -2462,6 +2466,7 @@ fn hamerly_lloyd_simd<T>(
             .zip(lower.par_iter_mut())
             .zip(assignments.par_iter())
             .for_each(|((u, l), &a)| {
+                let a = a as usize;
                 *u = *u + deltas[a];
                 let other_max = if a == max_delta_idx {
                     second_max_delta
@@ -2481,6 +2486,7 @@ fn hamerly_lloyd_simd<T>(
             .zip(assignments.par_iter())
             .enumerate()
             .filter_map(|(i, ((u, &l), &a))| {
+                let a = a as usize;
                 let s_a = s[a];
                 let m = if s_a > l { s_a } else { l };
                 if *u <= m {
@@ -2498,8 +2504,8 @@ fn hamerly_lloyd_simd<T>(
             .collect();
 
         if dirty.is_empty() {
-            if verbose {
-                println!("    Converged at iteration {} (bounds tight)", iter + 1);
+            if verbosity.detailed_verbosity() {
+                println!("  Converged at iteration {} (bounds tight)", iter + 1);
             }
             break;
         }
@@ -2515,12 +2521,12 @@ fn hamerly_lloyd_simd<T>(
             &mut lower,
         );
 
-        if verbose && (iter + 1) % 10 == 0 {
+        if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
             println!(
-                "    Iteration {} ({} / {} points reassessed, {:.1}% pruned)",
+                "  Iteration {}: {} / {} points reassessed, {:.1}% pruned",
                 iter + 1,
-                dirty.len(),
-                n,
+                dirty.len().separate_with_underscores(),
+                n.separate_with_underscores(),
                 (1.0 - dirty.len() as f64 / n as f64) * 100.0,
             );
         }
@@ -2552,7 +2558,7 @@ fn gemm_assign<T>(
     centroids: &[T],
     k: usize,
     metric: &Dist,
-) -> Vec<usize>
+) -> Vec<u32>
 where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
@@ -2585,7 +2591,7 @@ where
         }
     };
 
-    let mut assignments = vec![0usize; n];
+    let mut assignments = vec![0u32; n];
     let mut upper = vec![T::zero(); n];
     let mut lower = vec![T::zero(); n];
 
@@ -2632,7 +2638,7 @@ fn direct_assign<T>(
     centroid_norms: &[T],
     k: usize,
     metric: &Dist,
-) -> Vec<usize>
+) -> Vec<u32>
 where
     T: Float + Send + Sync + SimdDistance,
 {
@@ -2675,7 +2681,7 @@ where
                         best = c;
                     }
                 }
-                best
+                best as u32
             })
             .collect(),
         Dist::Cosine => (0..n)
@@ -2692,7 +2698,7 @@ where
                         best = c;
                     }
                 }
-                best
+                best as u32
             })
             .collect(),
         Dist::Manhattan => {
@@ -2727,7 +2733,7 @@ pub fn assign_all_parallel<T>(
     centroid_norms: &[T],
     k: usize,
     metric: &Dist,
-) -> Vec<usize>
+) -> Vec<u32>
 where
     T: Float + Send + Sync + SimdDistance + ComplexField,
 {
@@ -2864,8 +2870,8 @@ pub fn invert_assignments_csr(
     n: usize,
     m: usize,
     k: usize,
-) -> (Vec<u32>, Vec<usize>) {
-    let mut offsets = vec![0usize; k + 1];
+) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; k + 1];
     for &c in &assignments[..n * m] {
         offsets[c as usize + 1] += 1;
     }
@@ -2878,7 +2884,7 @@ pub fn invert_assignments_csr(
     for i in 0..n {
         for j in 0..m {
             let c = assignments[i * m + j] as usize;
-            members[cursor[c]] = i as u32;
+            members[cursor[c] as usize] = i as u32;
             cursor[c] += 1;
         }
     }
@@ -3053,7 +3059,7 @@ pub fn assign_secondary_soar<T>(
     centroids: &[T],
     centroid_norms: &[T],
     k: usize,
-    primary: &[usize],
+    primary: &[u32],
     rule: &SoarRule,
     metric: &Dist,
 ) -> Vec<u32>
@@ -3061,7 +3067,7 @@ where
     T: AnnSearchFloat,
 {
     if k < 2 {
-        return primary.iter().map(|&c| c as u32).collect();
+        return primary.to_vec();
     }
 
     let cosine = matches!(metric, Dist::Cosine);
@@ -3082,7 +3088,7 @@ where
 
             let mut out: Vec<u32> = (0..n)
                 .map(|i| {
-                    if top[i * 2] as usize != primary[i] {
+                    if top[i * 2] != primary[i] {
                         top[i * 2]
                     } else {
                         top[i * 2 + 1]
@@ -3091,7 +3097,7 @@ where
                 .collect();
 
             out.par_iter_mut().enumerate().for_each(|(i, slot)| {
-                if *slot as usize == primary[i] {
+                if *slot == primary[i] {
                     *slot = nearest_excluding(
                         &data[i * dim..(i + 1) * dim],
                         if cosine { data_norms[i] } else { T::one() },
@@ -3099,7 +3105,7 @@ where
                         centroid_norms,
                         dim,
                         k,
-                        primary[i],
+                        primary[i] as usize,
                         metric,
                     );
                 }
@@ -3117,7 +3123,7 @@ where
                 .par_chunks_mut(dim)
                 .enumerate()
                 .for_each(|(i, out)| {
-                    let c1 = primary[i];
+                    let c1 = primary[i] as usize;
                     let vec = &data[i * dim..(i + 1) * dim];
                     let cent = &centroids[c1 * dim..(c1 + 1) * dim];
                     let (inv_v, inv_c) = if cosine {
@@ -3150,12 +3156,12 @@ where
                 metric,
             );
 
-            let mut out: Vec<u32> = assigned.into_iter().map(|c| c as u32).collect();
+            let mut out = assigned;
             // The shift moves away from `c_1`, so collisions thin out as `mu`
             // grows, but at small `mu` they are common. Repair against the
             // shifted point, which is what the rule actually ranks.
             out.par_iter_mut().enumerate().for_each(|(i, slot)| {
-                if *slot as usize == primary[i] {
+                if *slot == primary[i] {
                     *slot = nearest_excluding(
                         &shifted[i * dim..(i + 1) * dim],
                         shifted_norms[i],
@@ -3163,7 +3169,7 @@ where
                         centroid_norms,
                         dim,
                         k,
-                        primary[i],
+                        primary[i] as usize,
                         metric,
                     );
                 }
@@ -3179,7 +3185,7 @@ where
             out.par_iter_mut().enumerate().for_each_init(
                 || vec![T::zero(); dim],
                 |r1_hat, (i, slot)| {
-                    let c1 = primary[i];
+                    let c1 = primary[i] as usize;
                     let vec = &data[i * dim..(i + 1) * dim];
                     let cent1 = &centroids[c1 * dim..(c1 + 1) * dim];
                     let (inv_v, inv_c1) = if cosine {
@@ -3262,7 +3268,8 @@ where
 ///   control over the maximum iterations, initialisation, path and size
 ///   balancing. If not provided, will default to sensible heuristics.
 /// * `seed` - Seed for reproducibility
-/// * `verbose` - Controls verbosity of the function
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+///   initialisation, the Lloyd path and per-iteration lines
 ///
 /// ### Returns
 ///
@@ -3283,7 +3290,7 @@ pub fn train_centroids<T>(
     metric: &Dist,
     params_k_means: Option<KMeansTrainingParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<Vec<T>, AnnSearchErrors>
 where
     T: AnnSearchFloat,
@@ -3318,19 +3325,19 @@ where
         }
     };
 
+    let start = Instant::now();
+    if verbosity.normal_verbosity() {
+        println!(
+            "Training k-means ({} centroids) ...",
+            n_centroids.separate_with_underscores()
+        );
+    }
+
     let init_method = resolve_init(params.init, n_centroids);
 
     let mut centroids = match init_method {
-        KMeansInit::Random => {
-            if verbose {
-                println!("  Initialising centroids via fast random selection");
-            }
-            fast_random_init(data, dim, n, n_centroids, seed)
-        }
+        KMeansInit::Random => fast_random_init(data, dim, n, n_centroids, seed),
         KMeansInit::KMeansParallel => {
-            if verbose {
-                println!("  Initialising centroids via k-means||");
-            }
             let init_norms: Vec<T> = match metric {
                 Dist::SquaredEuclidean => (0..n)
                     .into_par_iter()
@@ -3344,6 +3351,17 @@ where
             kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
         }
     };
+
+    if verbosity.detailed_verbosity() {
+        let how = match init_method {
+            KMeansInit::Random => "random selection",
+            KMeansInit::KMeansParallel => "k-means||",
+        };
+        println!(
+            " Initialised centroids via {how} in {:.2?}",
+            start.elapsed()
+        );
+    }
 
     let mut centroid_norms: Vec<T> = match metric {
         Dist::SquaredEuclidean => (0..n_centroids)
@@ -3360,17 +3378,20 @@ where
         }
     };
 
-    if verbose {
-        println!("  Running Lloyd's iterations");
-    }
-
     let lloyd_path = resolve_path(params.path, dim, metric);
+
+    if verbosity.detailed_verbosity() {
+        let how = match lloyd_path {
+            LloydPath::HamerlyGemm => "Hamerly's bounds + GEMM assignment",
+            LloydPath::HamerlySimd => "Hamerly's bounds + SIMD assignment",
+            LloydPath::GemmLloyd => "GEMM assignment",
+            LloydPath::ParallelLloyd => "direct SIMD assignment",
+        };
+        println!(" Running Lloyd's iterations ({how})");
+    }
 
     match lloyd_path {
         LloydPath::HamerlyGemm => {
-            if verbose {
-                println!("    (Hamerly's bounds + GEMM assignment)");
-            }
             hamerly_lloyd(
                 data,
                 &data_norms,
@@ -3382,13 +3403,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::HamerlySimd => {
-            if verbose {
-                println!("    (Hamerly's bounds + SIMD assignment)");
-            }
             hamerly_lloyd_simd(
                 data,
                 dim,
@@ -3399,13 +3417,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::GemmLloyd => {
-            if verbose {
-                println!("    (GEMM assignment, no Hamerly)");
-            }
             gemm_lloyd(
                 data,
                 &data_norms,
@@ -3418,13 +3433,10 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
         LloydPath::ParallelLloyd => {
-            if verbose {
-                println!("    (direct SIMD assignment)");
-            }
             parallel_lloyd(
                 data,
                 &data_norms,
@@ -3437,9 +3449,13 @@ where
                 params.iters,
                 params.balanced,
                 seed,
-                verbose,
+                verbosity,
             );
         }
+    }
+
+    if verbosity.normal_verbosity() {
+        println!("... trained k-means in {:.2?}", start.elapsed());
     }
 
     Ok(centroids)
@@ -3460,14 +3476,10 @@ where
 /// ### Returns
 ///
 /// Tuple of (all_indices, offsets) for CSR access
-pub fn build_csr_layout(
-    assignments: Vec<usize>,
-    n: usize,
-    nlist: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut offsets = vec![0usize; nlist + 1];
+pub fn build_csr_layout(assignments: Vec<u32>, n: usize, nlist: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; nlist + 1];
     for &cluster in &assignments {
-        offsets[cluster + 1] += 1;
+        offsets[cluster as usize + 1] += 1;
     }
 
     // Prefix sum to find starting positions
@@ -3475,13 +3487,13 @@ pub fn build_csr_layout(
         offsets[i] += offsets[i - 1];
     }
 
-    let mut all_indices = vec![0usize; n];
+    let mut all_indices = vec![0u32; n];
     let mut current_pos = offsets.clone();
 
     for (vec_idx, &cluster) in assignments.iter().enumerate() {
-        let pos = current_pos[cluster];
-        all_indices[pos] = vec_idx;
-        current_pos[cluster] += 1;
+        let pos = current_pos[cluster as usize];
+        all_indices[pos as usize] = vec_idx as u32;
+        current_pos[cluster as usize] += 1;
     }
 
     (all_indices, offsets)
@@ -3518,7 +3530,7 @@ pub fn build_csr_layout(
 /// Cell ids in ascending-distance order, capped at `nlist`
 pub fn select_probed_clusters<T>(
     cluster_dists: &mut [(T, usize)],
-    offsets: &[usize],
+    offsets: &[u32],
     nprobe: usize,
     k: usize,
 ) -> Vec<usize>
@@ -3541,7 +3553,7 @@ where
     let mut reachable = 0usize;
     for &(_, c) in cluster_dists[..split].iter() {
         chosen.push(c);
-        reachable += offsets[c + 1] - offsets[c];
+        reachable += (offsets[c + 1] - offsets[c]) as usize;
     }
 
     if chosen.len() >= nprobe && reachable >= k {
@@ -3552,7 +3564,7 @@ where
     cluster_dists[split..].sort_unstable_by(asc);
     for &(_, c) in cluster_dists[split..].iter() {
         chosen.push(c);
-        reachable += offsets[c + 1] - offsets[c];
+        reachable += (offsets[c + 1] - offsets[c]) as usize;
         if chosen.len() >= nprobe && reachable >= k {
             break;
         }
@@ -3606,10 +3618,10 @@ where
 ///
 /// * `assignments` - Cluster assignment for each vector
 /// * `nlist` - Number of clusters
-pub fn print_cluster_summary(assignments: &[usize], nlist: usize) {
+pub fn print_cluster_summary(assignments: &[u32], nlist: usize) {
     let mut counts = vec![0usize; nlist];
     for &cluster in assignments {
-        counts[cluster] += 1;
+        counts[cluster as usize] += 1;
     }
 
     counts.sort_unstable();
@@ -3683,7 +3695,7 @@ mod tests {
         // weight is 1 and the new centroid is the midpoint of the old one and
         // the donor.
         let data: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let mut assignments = vec![0usize; 10];
+        let mut assignments = vec![0u32; 10];
         assignments[9] = 1;
         let counts = vec![9usize, 1];
         let mut centroids = vec![4.0_f32, 100.0];
@@ -3751,7 +3763,7 @@ mod tests {
                 &Dist::SquaredEuclidean,
                 Some(params),
                 7,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let norms: Vec<f32> = (0..k)
@@ -3772,7 +3784,7 @@ mod tests {
             );
             let mut counts = vec![0usize; k];
             for &a in &assignments {
-                counts[a] += 1;
+                counts[a as usize] += 1;
             }
             *counts.iter().max().unwrap()
         };
@@ -3850,7 +3862,7 @@ mod tests {
         assert_eq!(effective, k, "m must have been clamped to k");
 
         let (members, offsets) = invert_assignments_csr(&assignments, n, effective, k);
-        assert_eq!(offsets[k], n * effective);
+        assert_eq!(offsets[k] as usize, n * effective);
         assert_eq!(members.len(), n * effective);
     }
 
@@ -3864,9 +3876,9 @@ mod tests {
         // Cluster 2: vector 3
         assert_eq!(offsets, vec![0, 3, 5, 6]);
 
-        let cluster_0: Vec<_> = indices[offsets[0]..offsets[1]].to_vec();
-        let cluster_1: Vec<_> = indices[offsets[1]..offsets[2]].to_vec();
-        let cluster_2: Vec<_> = indices[offsets[2]..offsets[3]].to_vec();
+        let cluster_0: Vec<_> = indices[offsets[0] as usize..offsets[1] as usize].to_vec();
+        let cluster_1: Vec<_> = indices[offsets[1] as usize..offsets[2] as usize].to_vec();
+        let cluster_2: Vec<_> = indices[offsets[2] as usize..offsets[3] as usize].to_vec();
 
         assert_eq!(cluster_0.len(), 3);
         assert!(cluster_0.contains(&0) && cluster_0.contains(&2) && cluster_0.contains(&5));
@@ -4065,8 +4077,17 @@ mod tests {
     fn test_train_centroids_small() {
         let data = vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1];
 
-        let centroids =
-            train_centroids(&data, 2, 4, 2, &Dist::SquaredEuclidean, None, 42, false).unwrap();
+        let centroids = train_centroids(
+            &data,
+            2,
+            4,
+            2,
+            &Dist::SquaredEuclidean,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(centroids.len(), 4);
 
@@ -4160,7 +4181,7 @@ mod tests {
         ];
         let centroids = vec![0.0_f64, 0.0, 10.0, 10.0];
 
-        let mut assignments = vec![0usize; 4];
+        let mut assignments = vec![0u32; 4];
         let mut upper = vec![0.0_f64; 4];
         let mut lower = vec![0.0_f64; 4];
 
@@ -4195,7 +4216,7 @@ mod tests {
         ];
         let centroids = vec![0.0_f64, 0.0, 10.0, 10.0];
 
-        let mut assignments = vec![99usize; 4];
+        let mut assignments = vec![99u32; 4];
         let mut upper = vec![-1.0_f64; 4];
         let mut lower = vec![-1.0_f64; 4];
 
@@ -4257,7 +4278,7 @@ mod tests {
             20,
             false,
             0,
-            false,
+            Verbosity::Quiet,
         );
 
         let cent0 = (centroids[0], centroids[1]);
@@ -4301,7 +4322,7 @@ mod tests {
                 Some(LloydPath::HamerlySimd),
             )),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -4347,7 +4368,7 @@ mod tests {
         k: usize,
         dim: usize,
         wrong_every: usize,
-    ) -> (Vec<usize>, Vec<usize>) {
+    ) -> (Vec<u32>, Vec<u32>) {
         let (data, cents) = random_points(n, k, dim, 7);
         let dn: Vec<f32> = data
             .chunks_exact(dim)
@@ -4372,12 +4393,12 @@ mod tests {
             &mut u_full,
             &mut l_full,
         );
-        let prior: Vec<usize> = a_full
+        let prior: Vec<u32> = a_full
             .iter()
             .enumerate()
             .map(|(i, &a)| {
                 if wrong_every > 0 && i % wrong_every == 0 {
-                    (a + 1 + i) % k
+                    (a + 1 + i as u32) % k as u32
                 } else {
                     a
                 }
@@ -4398,10 +4419,10 @@ mod tests {
         };
         for i in 0..n {
             assert!(
-                dist(i, a[i]) <= dist(i, a_full[i]) * (1.0 + 1e-5),
+                dist(i, a[i] as usize) <= dist(i, a_full[i] as usize) * (1.0 + 1e-5),
                 "point {i}"
             );
-            assert_relative_eq!(u[i], dist(i, a[i]), max_relative = 1e-5);
+            assert_relative_eq!(u[i], dist(i, a[i] as usize), max_relative = 1e-5);
             assert!(l[i] <= l_full[i] * (1.0 + 1e-4) + 1e-4, "point {i}");
         }
         (a, prior)
@@ -4434,7 +4455,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(11);
         let data: Vec<f32> = (0..n * dim).map(|_| rng.random()).collect();
         let cents: Vec<f32> = (0..k * dim).map(|_| rng.random()).collect();
-        let prior: Vec<usize> = (0..n).map(|i| (i * 7919) % k).collect();
+        let prior: Vec<u32> = (0..n).map(|i| ((i * 7919) % k) as u32).collect();
         let (mut a, mut u, mut l) = (vec![0; n], vec![0.0; n], vec![0.0; n]);
         assert!(!gemm_assign_pruned(
             &data, dim, &cents, k, &prior, &mut a, &mut u, &mut l
@@ -4475,7 +4496,7 @@ mod tests {
                     Some(path),
                 )),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap()
         };

@@ -53,8 +53,8 @@ fn main() {
     let k = cli.k;
 
     let start = Instant::now();
-    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance);
-    let (truth, _) = query_exhaustive_self(&cpu, k, false, false).unwrap();
+    let cpu = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
+    let (truth, _) = query_exhaustive_self(&cpu, k, false, Verbosity::Quiet).unwrap();
     println!(
         "CPU exhaustive (ground truth): {:.1} ms",
         start.elapsed().as_secs_f64() * 1e3
@@ -74,7 +74,7 @@ fn main() {
             None,
             None,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
             Default::default(),
         )
         .unwrap()
@@ -94,7 +94,7 @@ fn main() {
             None,
             None,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap()
         .extract_knn(None, true, false)

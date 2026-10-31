@@ -6,6 +6,7 @@
 //! values are widened back on every comparison and the query runs slower than
 //! the `f32` one, not faster.
 
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::prelude::DimensionValidation;
 use ann_search_rs::quantised::exhaustive_bf16::ExhaustiveIndexBf16;
 use ann_search_rs::{
@@ -30,21 +31,26 @@ ann_handle!(
         /// * `x` - Samples by features, C-contiguous float32 or float64.
         /// * `metric` - Already validated by the Python layer. Manhattan is not
         ///   supported and the library rejects it.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// The built handle, or an unsupported-metric error.
         #[staticmethod]
-        #[pyo3(signature = (x, *, metric, verbose = false))]
+        #[pyo3(signature = (x, *, metric, verbose = 0))]
         fn build(
             py: Python<'_>,
             x: &Bound<'_, PyAny>,
             metric: String,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<Self> {
             build_dispatch!(py, x, ExhaustiveBf16Inner, |data, n, dim| {
-                build_exhaustive_bf16_index((data, n, dim), &metric, verbose)
+                build_exhaustive_bf16_index(
+                    (data, n, dim),
+                    &metric,
+                    parse_annsearch_verbosity(verbose),
+                )
             })
         }
 
@@ -55,20 +61,21 @@ ann_handle!(
         /// * `q` - Queries by features, matching the index's float type.
         /// * `k` - Neighbours per query.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`. Distances carry the codec's rounding. See
         /// [`QueryOut`].
-        #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
         fn query<'py>(
             &self,
             py: Python<'py>,
             q: &Bound<'py, PyAny>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveBf16Inner::F32(idx) => {
@@ -78,7 +85,7 @@ ann_handle!(
                             idx,
                             k,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -89,7 +96,7 @@ ann_handle!(
                             idx,
                             k,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -102,18 +109,19 @@ ann_handle!(
         ///
         /// * `k` - Neighbours per point.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-        #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+        #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
         fn query_self<'py>(
             &self,
             py: Python<'py>,
             k: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 ExhaustiveBf16Inner::F32(idx) => {
@@ -121,7 +129,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
                 ExhaustiveBf16Inner::F64(idx) => {
@@ -129,7 +137,7 @@ ann_handle!(
                         idx,
                         k,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
             }

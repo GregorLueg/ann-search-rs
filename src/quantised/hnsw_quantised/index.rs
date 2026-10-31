@@ -8,8 +8,6 @@ use faer::RowRef;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 use thousands::*;
 
@@ -22,6 +20,7 @@ use crate::quantised::uniform_quant::*;
 use crate::utils::graph_utils::*;
 use crate::utils::heap_structs::BoundedMaxHeap;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 
 ////////////////////////
 // HnswQuantisedIndex //
@@ -68,7 +67,7 @@ where
     /// Construction beam width the graph was built with.
     ef_construction: usize,
     /// Original ids, identity by default. Kept for the trait surface.
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
     /// Ties the index to its float type.
     _phantom: PhantomData<T>,
 }
@@ -118,18 +117,7 @@ where
     where
         F: Fn(usize, usize) -> T + Sync,
     {
-        let start = Instant::now();
-        let built = build_hierarchical_graph::<T, _>(codec.n(), params, dist);
-
-        if params.verbose {
-            println!(
-                "Quantised HNSW over {} nodes built in {:.2?}",
-                codec.n().separate_with_underscores(),
-                start.elapsed()
-            );
-        }
-
-        built
+        build_hierarchical_graph::<T, _>(codec.n(), params, dist)
     }
 
     /// Assemble an index from a codec and a prebuilt topology.
@@ -161,7 +149,7 @@ where
             metric,
             m: params.m,
             ef_construction: params.ef_construction,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
             _phantom: PhantomData,
         }
     }
@@ -458,7 +446,7 @@ where
     /// ### Returns
     ///
     /// Identity mapping unless the index was reordered
-    pub fn original_ids(&self) -> &[usize] {
+    pub fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 
@@ -474,7 +462,7 @@ where
     /// * `k` - Neighbours per vector
     /// * `ef_search` - Beam width
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -484,26 +472,18 @@ where
         k: usize,
         ef_search: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new(C::INDEX_NAME, self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
                 self.query_stored(i, k, ef_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -629,7 +609,8 @@ where
     /// * `metric` - Distance metric; Manhattan is not supported
     /// * `seed` - Random seed
     /// * `quant_params` - Calibration settings, `None` for the default
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   encoding and the per-layer insertion
     ///
     /// ### Returns
     ///
@@ -643,15 +624,16 @@ where
         metric: &Dist,
         seed: usize,
         quant_params: Option<UniformQuantParams>,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("HNSW-SQ8U index", verbosity);
         let (flat, n, dim) = data.into_row_major();
 
         let start = Instant::now();
         let codec = Sq8uCodec::new(&flat, n, dim, *metric, quant_params)?;
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "Encoded {} vectors of dimension {} in {:.2?}",
+                " Encoded {} vectors (dim {}) in {:.2?}",
                 n.separate_with_underscores(),
                 dim,
                 start.elapsed()
@@ -662,8 +644,10 @@ where
         // job until the refiner lands.
         drop(flat);
 
-        let params = GraphBuildParams::new(m, ef_construction, seed, verbose);
-        Ok(Self::from_codec(codec, &params))
+        let params = GraphBuildParams::new(m, ef_construction, seed, verbosity);
+        let index = Self::from_codec(codec, &params);
+        log.finish();
+        Ok(index)
     }
 
     /// Bytes held by the index.
@@ -676,7 +660,7 @@ where
             + self.codec.memory_usage_bytes()
             + self.graph.memory_usage_bytes()
             + self.hierarchy.memory_usage_bytes()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -757,7 +741,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             42,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -784,7 +768,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             7,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -839,9 +823,16 @@ mod tests {
         let (n, dim, k) = (2000, 24, 10);
         let data = varied_directions(n, dim);
         let mat = matrix(&data, n, dim);
-        let index =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::Cosine, 7, None, false)
-                .unwrap();
+        let index = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            200,
+            &Dist::Cosine,
+            7,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let mut hits = 0usize;
         let queries = 100;
@@ -867,8 +858,16 @@ mod tests {
             let (n, dim, k) = (1500, 24, 10);
             let data = clustered(n, dim, 6);
             let mat = matrix(&data, n, dim);
-            let index = HnswSq8uIndex::<f32>::build(mat.as_ref(), 16, 200, &metric, 7, None, false)
-                .unwrap();
+            let index = HnswSq8uIndex::<f32>::build(
+                mat.as_ref(),
+                16,
+                200,
+                &metric,
+                7,
+                None,
+                Verbosity::Quiet,
+            )
+            .unwrap();
 
             let mut hits = 0usize;
             let queries = 60;
@@ -900,7 +899,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             3,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -935,11 +934,11 @@ mod tests {
             &Dist::SquaredEuclidean,
             11,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (ids, dists) = index.generate_knn(k, 64, true, false).unwrap();
+        let (ids, dists) = index.generate_knn(k, 64, true, Verbosity::Quiet).unwrap();
         assert_eq!(ids.len(), n);
         assert!(ids.iter().all(|row| row.len() == k));
         let dists = dists.unwrap();
@@ -962,7 +961,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             5,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -985,7 +984,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             1,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1001,8 +1000,15 @@ mod tests {
         let (n, dim) = (100, 8);
         let data = clustered(n, dim, 3);
         let mat = matrix(&data, n, dim);
-        let got =
-            HnswSq8uIndex::<f32>::build(mat.as_ref(), 8, 50, &Dist::Manhattan, 1, None, false);
+        let got = HnswSq8uIndex::<f32>::build(
+            mat.as_ref(),
+            8,
+            50,
+            &Dist::Manhattan,
+            1,
+            None,
+            Verbosity::Quiet,
+        );
         assert!(matches!(
             got,
             Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
@@ -1021,7 +1027,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             1,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert!(index.query(&vec![0.0f32; dim + 1], 5, 32).is_err());
@@ -1039,7 +1045,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             1,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let (ids, _) = index.query(&data[..dim], 500, 500).unwrap();
@@ -1060,7 +1066,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             9,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

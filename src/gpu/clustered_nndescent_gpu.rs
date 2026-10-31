@@ -30,6 +30,10 @@ use crate::utils::k_means_utils::{
     assign_all_parallel_top_m, invert_assignments_csr, sample_vectors,
 };
 use crate::utils::nndescent_utils::SENTINEL_PID;
+use crate::utils::verbosity::BuildLog;
+
+/// [`SENTINEL_PID`] as stored in the `u32` global graph.
+const SENTINEL: u32 = SENTINEL_PID as u32;
 
 ////////////
 // Consts //
@@ -218,14 +222,14 @@ pub fn plan_cluster_count(
 /// time, and within one cluster every member is a distinct global node, so no
 /// two rayon tasks ever touch the same `g * k` block. Same argument and same
 /// shape as [`crate::utils::nndescent_utils::UnsafeGraphPtr`], which cannot be
-/// reused directly here because the global graph is a `(usize, T)` pair buffer
+/// reused directly here because the global graph is a `(u32, T)` pair buffer
 /// rather than a `Neighbour<T>` one.
 ///
 /// ### Fields
 #[derive(Copy, Clone)]
 struct UnsafeRowPtr<T>(
     /// Raw mutable pointer to the flat `(id, distance)` buffer
-    *mut (usize, T),
+    *mut (u32, T),
 );
 
 unsafe impl<T> Send for UnsafeRowPtr<T> {}
@@ -251,7 +255,7 @@ unsafe impl<T> Sync for UnsafeRowPtr<T> {}
 /// * `graph_dist` - Matching distances, `m * build_k`
 /// * `build_k` - Working degree the cluster ran at
 fn merge_cluster_into_global<T>(
-    global: &mut [(usize, T)],
+    global: &mut [(u32, T)],
     k: usize,
     members: &[u32],
     graph_idx: &[u32],
@@ -273,14 +277,14 @@ fn merge_cluster_into_global<T>(
             return;
         }
 
-        let mut merged: Vec<(usize, T)> = Vec::with_capacity(k + build_k);
+        let mut merged: Vec<(u32, T)> = Vec::with_capacity(k + build_k);
 
         // Existing global row.
         for slot in 0..k {
             // SAFETY: `g` is unique within this cluster, so this row is not
             // touched by any other task in this loop.
             let entry = unsafe { *rows.0.add(g * k + slot) };
-            if entry.0 != SENTINEL_PID {
+            if entry.0 != SENTINEL {
                 merged.push(entry);
             }
         }
@@ -291,8 +295,8 @@ fn merge_cluster_into_global<T>(
             if local_pid >= m || local_pid == local {
                 continue;
             }
-            let cand = members[local_pid] as usize;
-            if cand != g {
+            let cand = members[local_pid];
+            if cand as usize != g {
                 merged.push((cand, graph_dist[local * build_k + j]));
             }
         }
@@ -314,7 +318,7 @@ fn merge_cluster_into_global<T>(
             let value = merged
                 .get(slot)
                 .copied()
-                .unwrap_or((SENTINEL_PID, <T as num_traits::Float>::max_value()));
+                .unwrap_or((SENTINEL, <T as num_traits::Float>::max_value()));
             // SAFETY: as above, `g * k + slot` is owned by this task alone.
             unsafe { *rows.0.add(g * k + slot) = value };
         }
@@ -347,7 +351,8 @@ fn merge_cluster_into_global<T>(
 /// * `refine_knn` - Two-hop refinement sweeps per cluster
 /// * `cluster_params` - Optional [`ClusteredBuildParams`]
 /// * `seed` - RNG seed for reproducibility
-/// * `verbose` - Print per-cluster progress
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the k-means,
+///   the partition and one line per cluster
 /// * `device` - CubeCL runtime device
 ///
 /// ### Returns
@@ -377,7 +382,7 @@ pub fn build_clustered_knn_graph_gpu<T>(
     refine_knn: Option<usize>,
     cluster_params: Option<ClusteredBuildParams>,
     seed: usize,
-    verbose: bool,
+    verbosity: Verbosity,
     device: Device,
 ) -> Result<KnnGraphGpu<T>, AnnSearchErrors>
 where
@@ -415,9 +420,6 @@ where
     // One cluster means the whole dataset fits, and the batching is then pure
     // overhead: the overlap alone doubles the work.
     if n_clusters == 1 {
-        if verbose {
-            println!("Clustered kNN-Graph-GPU: dataset fits one batch, building directly.");
-        }
         // Hand over the buffer we already flattened. `FlattenData` converts by
         // identity, so this costs nothing.
         return crate::gpu::nndescent_gpu::build_knn_graph_gpu::<T>(
@@ -431,12 +433,13 @@ where
             rho,
             refine_knn,
             seed,
-            verbose,
+            verbosity,
             device,
         );
     }
 
-    let start = Instant::now();
+    let log = BuildLog::new("clustered NNDescent-GPU kNN graph", verbosity);
+    let detailed = verbosity.detailed_verbosity();
     let use_cosine = metric == Dist::Cosine;
 
     let norms: Vec<T> = if use_cosine {
@@ -448,10 +451,9 @@ where
         Vec::new()
     };
 
-    if verbose {
+    if detailed {
         println!(
-            "Clustered kNN-Graph-GPU: {} vectors, dim={}, k={}, build_k={}, {} clusters, {} \
-             assignments per point",
+            " {} vectors, dim {}, k = {}, build_k = {}, {} clusters, {} assignments per point",
             n.separate_with_underscores(),
             dim,
             k,
@@ -484,6 +486,7 @@ where
         .kmeans
         .unwrap_or_else(|| KMeansGpuParams::default().with_balancing(true));
 
+    let start = Instant::now();
     let centroids = train_centroids_gpu::<T>(
         &training_data,
         dim,
@@ -493,8 +496,16 @@ where
         Some(kmeans_params),
         seed,
         &client,
-        verbose,
+        Verbosity::Quiet,
     )?;
+    if detailed {
+        println!(
+            " Trained k-means ({} centroids, {} samples) in {:.2?}",
+            n_clusters.separate_with_underscores(),
+            n_train.separate_with_underscores(),
+            start.elapsed()
+        );
+    }
 
     // ---- Partition ----
 
@@ -508,6 +519,7 @@ where
 
     // `norms` is empty on the Euclidean path, which is fine: only the cosine
     // arm of the assignment indexes it.
+    let start = Instant::now();
     let assignments = assign_all_parallel_top_m(
         &vectors_flat,
         &norms,
@@ -522,26 +534,36 @@ where
 
     let (members, offsets) = invert_assignments_csr(&assignments, n, n_assign, n_clusters);
 
-    if verbose {
+    if detailed {
         let sizes: Vec<usize> = (0..n_clusters)
-            .map(|c| offsets[c + 1] - offsets[c])
+            .map(|c| (offsets[c + 1] - offsets[c]) as usize)
             .collect();
         println!(
-            "  Partitioned in {:.2?}: cluster sizes {} .. {} (mean {})",
+            " Partitioned in {:.2?}: cluster sizes {} .. {} (mean {})",
             start.elapsed(),
-            sizes.iter().min().copied().unwrap_or(0),
-            sizes.iter().max().copied().unwrap_or(0),
-            (n * n_assign) / n_clusters,
+            sizes
+                .iter()
+                .min()
+                .copied()
+                .unwrap_or(0)
+                .separate_with_underscores(),
+            sizes
+                .iter()
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .separate_with_underscores(),
+            ((n * n_assign) / n_clusters).separate_with_underscores(),
         );
     }
 
     // ---- Per-cluster NN-Descent ----
 
-    let mut global = vec![(SENTINEL_PID, <T as num_traits::Float>::max_value()); n * k];
+    let mut global = vec![(SENTINEL, <T as num_traits::Float>::max_value()); n * k];
     let mut converged = true;
 
     for c in 0..n_clusters {
-        let member_ids = &members[offsets[c]..offsets[c + 1]];
+        let member_ids = &members[offsets[c] as usize..offsets[c + 1] as usize];
         let m = member_ids.len();
 
         // A cluster too small to hold a graph contributes nothing. At the
@@ -594,7 +616,7 @@ where
             &cfg,
             &client,
             &limits,
-            false,
+            Verbosity::Quiet,
         )?;
         converged &= cluster_converged;
 
@@ -607,9 +629,9 @@ where
             cfg.build_k,
         );
 
-        if verbose {
+        if detailed {
             println!(
-                "  Cluster {}/{}: {} points, {:.2?}{}",
+                "  Cluster {} / {}: {} points in {:.2?}{}",
                 c + 1,
                 n_clusters,
                 m.separate_with_underscores(),
@@ -623,15 +645,15 @@ where
         }
     }
 
-    if verbose {
-        let filled = global.iter().filter(|e| e.0 != SENTINEL_PID).count();
+    if detailed {
+        let filled = global.iter().filter(|e| e.0 != SENTINEL).count();
         println!(
-            "  Total build time: {:.2?} ({} of {} graph slots filled)",
-            start.elapsed(),
+            " Merged graph: {} of {} slots filled",
             filled.separate_with_underscores(),
             (n * k).separate_with_underscores(),
         );
     }
+    log.finish();
 
     Ok(KnnGraphGpu {
         vectors_flat,
@@ -741,7 +763,7 @@ mod tests {
     #[test]
     fn test_merge_into_empty_global_takes_the_cluster_rows() {
         let (k, build_k, n) = (2usize, 2usize, 4usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         // Cluster holds global nodes 1 and 3, two apart on the line.
         let members = vec![1u32, 3];
         let graph_idx = vec![1u32, 0x7FFFFFFF, 0u32, 0x7FFFFFFF];
@@ -750,17 +772,17 @@ mod tests {
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
 
         assert_eq!(global[k], (3, 4.0));
-        assert_eq!(global[k + 1].0, SENTINEL_PID);
+        assert_eq!(global[k + 1].0, SENTINEL);
         assert_eq!(global[3 * k], (1, 4.0));
         // Untouched rows stay sentinel.
-        assert_eq!(global[0].0, SENTINEL_PID);
-        assert_eq!(global[2 * k].0, SENTINEL_PID);
+        assert_eq!(global[0].0, SENTINEL);
+        assert_eq!(global[2 * k].0, SENTINEL);
     }
 
     #[test]
     fn test_merge_keeps_best_k_and_dedups_across_clusters() {
         let (k, build_k, n) = (2usize, 2usize, 3usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         // Node 0 already knows node 2, four away.
         global[0] = (2, 4.0);
 
@@ -781,7 +803,7 @@ mod tests {
         // The merge ranks across two subgraphs, so it must sort rather than
         // take rows in the order the device happened to lay them out.
         let (k, build_k, n) = (2usize, 2usize, 4usize);
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         let members: Vec<u32> = (0..n as u32).collect();
         // Row 0 offers node 3 (nine away) first and node 1 (one away) second.
         let graph_idx = vec![
@@ -843,7 +865,7 @@ mod tests {
         );
 
         for i in 0..n {
-            assert_eq!(top2[i * 2] as usize, single[i], "point {i}");
+            assert_eq!(top2[i * 2], single[i], "point {i}");
             assert_ne!(top2[i * 2 + 1], top2[i * 2], "runner-up must differ");
         }
     }
@@ -904,7 +926,7 @@ mod tests {
 
         let compacted = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
 
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
 
         for i in 0..n {
@@ -922,17 +944,17 @@ mod tests {
 
             let got: Vec<(usize, f32)> = global[i * k..(i + 1) * k]
                 .iter()
-                .filter(|e| e.0 != SENTINEL_PID)
-                .copied()
+                .filter(|e| e.0 != SENTINEL)
+                .map(|&(j, d)| (j as usize, d))
                 .collect();
             assert_eq!(got, cands, "row {i}");
 
             // And it is never worse than the compaction, which spends slots on
             // repeats because it does not deduplicate.
-            let compact_ids: Vec<usize> = compacted[i * k..(i + 1) * k]
+            let compact_ids: Vec<u32> = compacted[i * k..(i + 1) * k]
                 .iter()
                 .map(|e| e.0)
-                .filter(|&j| j != SENTINEL_PID)
+                .filter(|&j| j != SENTINEL)
                 .collect();
             let mut distinct = compact_ids.clone();
             distinct.sort_unstable();
@@ -952,9 +974,9 @@ mod tests {
         let assignments = vec![0u32, 1, 1, 2, 0, 2, 2, 0, 1, 1];
         let (members, offsets) = invert_assignments_csr(&assignments, n, m, k);
 
-        assert_eq!(offsets[k], n * m);
+        assert_eq!(offsets[k] as usize, n * m);
         for c in 0..k {
-            for &g in &members[offsets[c]..offsets[c + 1]] {
+            for &g in &members[offsets[c] as usize..offsets[c + 1] as usize] {
                 assert!(
                     assignments[g as usize * m..(g as usize + 1) * m].contains(&(c as u32)),
                     "point {g} landed in cluster {c} it never joined"
@@ -1035,10 +1057,13 @@ mod device_tests {
     }
 
     /// Fraction of the true k neighbours a flat `n * k` graph recovered.
-    fn recall_at_k(got: &[(usize, f32)], truth: &[Vec<usize>], n: usize, k: usize) -> f64 {
+    fn recall_at_k(got: &[(u32, f32)], truth: &[Vec<usize>], n: usize, k: usize) -> f64 {
         let mut hits = 0usize;
         for i in 0..n {
-            let row: Vec<usize> = got[i * k..(i + 1) * k].iter().map(|e| e.0).collect();
+            let row: Vec<usize> = got[i * k..(i + 1) * k]
+                .iter()
+                .map(|e| e.0 as usize)
+                .collect();
             hits += truth[i].iter().filter(|t| row.contains(t)).count();
         }
         hits as f64 / (n * k) as f64
@@ -1069,7 +1094,7 @@ mod device_tests {
             None,
             Some(params),
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1085,7 +1110,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1114,6 +1139,79 @@ mod device_tests {
         );
     }
 
+    /// The matrix-in, graph-out wrapper keeps the direct build's quality and
+    /// lays the rows out flat with the self-edge first.
+    #[test]
+    fn test_knn_graph_fast_path_layout_and_quality() {
+        let Some(device) = try_device() else { return };
+        let k = 5;
+        let (mat, n) = blob_data(4, 40, 8);
+        let truth = brute_force_knn(&mat, k);
+
+        let params = crate::gpu::nndescent_gpu::NNDescentGpuKnnParams::new(
+            k,
+            Some(10),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+        );
+        let g = crate::build_knn_graph_nndescent_gpu::<f32>(
+            mat.as_ref(),
+            "euclidean",
+            Some(params),
+            None,
+            7,
+            Verbosity::Quiet,
+            device.clone().into(),
+        )
+        .unwrap();
+        let dists = g.distances.as_ref().unwrap();
+        assert_eq!((g.n, g.k), (n, k + 1));
+        for i in 0..n {
+            assert_eq!(g.row(i)[0], i as u32);
+            assert_eq!(dists[i * g.k], 0.0);
+            assert!(
+                !g.row(i)[1..].contains(&(i as u32)),
+                "row {i} repeats itself"
+            );
+            let row_d = &dists[i * g.k..(i + 1) * g.k];
+            assert!(row_d.windows(2).all(|w| w[0] <= w[1]), "row {i} unsorted");
+        }
+
+        let direct = build_knn_graph_gpu::<f32>(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            Some(k),
+            Some(10),
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            7,
+            Verbosity::Quiet,
+            device.clone().into(),
+        )
+        .unwrap();
+        let mut flat: Vec<(u32, f32)> = Vec::with_capacity(n * k);
+        for i in 0..n {
+            for j in 1..=k {
+                flat.push((g.indices[i * g.k + j], dists[i * g.k + j]));
+            }
+        }
+        let fast_recall = recall_at_k(&flat, &truth, n, k);
+        let direct_recall = recall_at_k(&direct.knn_graph, &truth, n, k);
+        // Same tolerance and reason as the single-cluster test above.
+        assert!(
+            (fast_recall - direct_recall).abs() < 0.12,
+            "fast path diverged from direct: {fast_recall:.3} vs {direct_recall:.3}"
+        );
+    }
+
     /// The batched machinery, driven by hand for a "cluster" that is the whole
     /// dataset at the same seed, must land on the same quality as the direct
     /// build. Isolates `nndescent_core` plus the merge from the partitioning
@@ -1137,7 +1235,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1164,7 +1262,7 @@ mod device_tests {
             Some(KMeansGpuParams::default().with_balancing(true)),
             7,
             &client,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1183,10 +1281,11 @@ mod device_tests {
             graph_idx,
             graph_dist,
             ..
-        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, false).unwrap();
+        } = nndescent_core::<f32>(&flat, n, dim, dim, &cfg, &client, &limits, Verbosity::Quiet)
+            .unwrap();
 
         let members: Vec<u32> = (0..n as u32).collect();
-        let mut global = vec![(SENTINEL_PID, f32::MAX); n * k];
+        let mut global = vec![(SENTINEL, f32::MAX); n * k];
         merge_cluster_into_global(&mut global, k, &members, &graph_idx, &graph_dist, build_k);
         let merged_recall = recall_at_k(&global, &truth, n, k);
 
@@ -1215,7 +1314,7 @@ mod device_tests {
             None,
             None,
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
@@ -1236,7 +1335,7 @@ mod device_tests {
                 None,
                 Some(params),
                 7,
-                false,
+                Verbosity::Quiet,
                 device.clone().into(),
             )
             .unwrap();
@@ -1244,11 +1343,7 @@ mod device_tests {
             // Guard the silent-zero failure mode before trusting recall: every
             // launch here is `launch_unchecked`, so a cluster that busts a
             // limit returns zeros and reports nothing.
-            let filled = graph
-                .knn_graph
-                .iter()
-                .filter(|e| e.0 != SENTINEL_PID)
-                .count();
+            let filled = graph.knn_graph.iter().filter(|e| e.0 != SENTINEL).count();
             assert_eq!(
                 filled,
                 n * k,
@@ -1259,7 +1354,7 @@ mod device_tests {
                 .filter(|&i| {
                     let mut ids: Vec<usize> = graph.knn_graph[i * k..(i + 1) * k]
                         .iter()
-                        .map(|e| e.0)
+                        .map(|e| e.0 as usize)
                         .collect();
                     ids.sort_unstable();
                     let before = ids.len();
@@ -1281,7 +1376,7 @@ mod device_tests {
                         .filter(|(j, d)| {
                             let true_d: f32 = (0..dim)
                                 .map(|c| {
-                                    let diff = mat[(i, c)] - mat[(*j, c)];
+                                    let diff = mat[(i, c)] - mat[(*j as usize, c)];
                                     diff * diff
                                 })
                                 .sum();
@@ -1327,22 +1422,21 @@ mod device_tests {
             None,
             Some(params),
             7,
-            false,
+            Verbosity::Quiet,
             device.clone().into(),
         )
         .unwrap();
 
-        let filled = graph
-            .knn_graph
-            .iter()
-            .filter(|e| e.0 != SENTINEL_PID)
-            .count();
+        let filled = graph.knn_graph.iter().filter(|e| e.0 != SENTINEL).count();
         assert_eq!(filled, n * k);
         // Rows stay sorted ascending, which the merge is responsible for.
         for i in 0..n {
             let row = &graph.knn_graph[i * k..(i + 1) * k];
             assert!(row.windows(2).all(|w| w[0].1 <= w[1].1), "row {i} unsorted");
-            assert!(row.iter().all(|e| e.0 != i), "row {i} contains itself");
+            assert!(
+                row.iter().all(|e| e.0 as usize != i),
+                "row {i} contains itself"
+            );
         }
     }
 }

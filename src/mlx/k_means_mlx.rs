@@ -20,6 +20,8 @@ use crate::mlx::exhaustive_mlx::RowTopK;
 use crate::mlx::ffi::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use std::time::Instant;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -173,12 +175,12 @@ fn upload_tiles(data: &[f32], dim: usize, tile: usize) -> Vec<(Array, usize)> {
 ///
 /// The within-cluster sum of squares
 #[cfg(test)]
-pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: &[usize]) -> f64 {
+pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: &[u32]) -> f64 {
     data.par_chunks_exact(dim)
         .zip(assignments.par_iter())
         .map(|(x, &c)| {
             x.iter()
-                .zip(&centroids[c * dim..(c + 1) * dim])
+                .zip(&centroids[c as usize * dim..(c as usize + 1) * dim])
                 .map(|(a, b)| ((a - b) * (a - b)) as f64)
                 .sum::<f64>()
         })
@@ -206,7 +208,8 @@ pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: 
 ///   `balanced` are honoured; `path` has no MLX meaning and is ignored.
 /// * `seed` - Seed for the initialisation and the balancing donor walk
 /// * `s` - Stream to run on
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+///   initialisation
 ///
 /// ### Returns
 ///
@@ -221,11 +224,12 @@ pub fn train_centroids_mlx(
     params: Option<KMeansTrainingParams>,
     seed: usize,
     s: &Stream,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<Vec<f32>, AnnSearchErrors> {
     if *metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
     }
+    let start = Instant::now();
     if n_centroids > n {
         return Err(AnnSearchErrors::TooFewSamplesForCentroids {
             n_centroids,
@@ -249,11 +253,14 @@ pub fn train_centroids_mlx(
             kmeans_parallel_init(data, &norms, dim, n, n_centroids, metric, seed)
         }
     };
-    if verbose {
+    if verbosity.normal_verbosity() {
         println!(
-            "  MLX k-means: {} centroids, {:?} init, {} iterations",
-            n_centroids, init, params.iters
+            "Training k-means on MLX ({} centroids) ...",
+            n_centroids.separate_with_underscores()
         );
+    }
+    if verbosity.detailed_verbosity() {
+        println!(" {:?} initialisation, {} iterations", init, params.iters);
     }
 
     let k = n_centroids as i32;
@@ -299,9 +306,9 @@ pub fn train_centroids_mlx(
             let mut wait: Vec<&Array> = vec![&c, &counts];
             wait.extend(assigns.iter());
             eval_all(&wait, false)?;
-            let assignments: Vec<usize> = assigns
+            let assignments: Vec<u32> = assigns
                 .iter()
-                .map(|a| Ok(a.as_u32()?.iter().map(|&v| v as usize)))
+                .map(|a| Ok(a.as_u32()?.iter().copied()))
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?
                 .into_iter()
                 .flatten()
@@ -329,7 +336,11 @@ pub fn train_centroids_mlx(
     }
 
     eval_all(&[&c], false)?;
-    Ok(c.as_f32()?.to_vec())
+    let centroids = c.as_f32()?.to_vec();
+    if verbosity.normal_verbosity() {
+        println!("... trained k-means in {:.2?}", start.elapsed());
+    }
+    Ok(centroids)
 }
 
 /// Assign every point to its nearest centroid on MLX.
@@ -356,7 +367,7 @@ pub fn assign_all_mlx(
     n_centroids: usize,
     metric: &Dist,
     s: &Stream,
-) -> Result<Vec<usize>, AnnSearchErrors> {
+) -> Result<Vec<u32>, AnnSearchErrors> {
     if *metric == Dist::Manhattan {
         return Err(AnnSearchErrors::DistanceNotSupported(*metric));
     }
@@ -376,7 +387,7 @@ pub fn assign_all_mlx(
     let mut out = Vec::with_capacity(data.len() / dim.max(1));
     for a in &pending {
         eval_all(&[a], false)?;
-        out.extend(a.as_u32()?.iter().map(|&v| v as usize));
+        out.extend_from_slice(a.as_u32()?);
     }
     Ok(out)
 }
@@ -398,7 +409,7 @@ pub fn assign_all_mlx(
 /// * `params` - Optional [`KMeansTrainingParams`]; `iters`, `init` and
 ///   `balanced` are honoured, `path` is ignored
 /// * `seed` - Seed for the initialisation
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - See [`train_centroids_mlx`]
 ///
 /// ### Returns
 ///
@@ -409,10 +420,10 @@ pub fn k_means_clusters_mlx(
     n_centroids: usize,
     params: Option<KMeansTrainingParams>,
     seed: usize,
-    verbose: bool,
-) -> Result<(faer::Mat<f32>, Vec<usize>), AnnSearchErrors> {
+    verbosity: Verbosity,
+) -> Result<(faer::Mat<f32>, Vec<u32>), AnnSearchErrors> {
     let metric = parse_ann_dist(dist).unwrap_or_else(|| {
-        println!("Unknown string provided ({dist:?}). Defaulting to Squared Euclidean");
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
     let (data, n, dim) = data.into_row_major();
@@ -426,7 +437,7 @@ pub fn k_means_clusters_mlx(
         params,
         seed,
         &s,
-        verbose,
+        verbosity,
     )?;
     let assignments = assign_all_mlx(&data, dim, &centroids, n_centroids, &metric, &s)?;
     crate::mlx::clear_cache()?;
@@ -485,9 +496,20 @@ mod tests {
         let params = KMeansTrainingParams::new(15, Some(init), None);
         let s = Stream::default_gpu();
 
-        let mlx =
-            train_centroids_mlx(&data, dim, n, k, &metric, Some(params), 7, &s, false).unwrap();
-        let cpu = train_centroids(&data, dim, n, k, &metric, Some(params), 7, false).unwrap();
+        let mlx = train_centroids_mlx(
+            &data,
+            dim,
+            n,
+            k,
+            &metric,
+            Some(params),
+            7,
+            &s,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let cpu =
+            train_centroids(&data, dim, n, k, &metric, Some(params), 7, Verbosity::Quiet).unwrap();
 
         let mlx_assign = assign_all_mlx(&data, dim, &mlx, k, &metric, &s).unwrap();
         let ones_n = vec![1.0f32; n];
@@ -552,11 +574,18 @@ mod tests {
         let (n, dim, k) = (4_000, 16, 40);
         let data = blobs(n, dim, 25, 11);
         let params = KMeansTrainingParams::new(15, Some(KMeansInit::KMeansParallel), None);
-        let (cent, assign) =
-            k_means_clusters_mlx((&data[..], n, dim), "euclidean", k, Some(params), 7, false)
-                .unwrap();
+        let (cent, assign) = k_means_clusters_mlx(
+            (&data[..], n, dim),
+            "euclidean",
+            k,
+            Some(params),
+            7,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         assert_eq!((cent.nrows(), cent.ncols()), (k, dim));
         assert_eq!(assign.len(), n);
+        let assign_u32: Vec<u32> = assign.clone();
         let flat: Vec<f32> = (0..k)
             .flat_map(|i| (0..dim).map(move |j| (i, j)))
             .map(|(i, j)| cent[(i, j)])
@@ -570,7 +599,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             Some(params),
             7,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let ones_n = vec![1.0f32; n];
@@ -586,7 +615,7 @@ mod tests {
             &Dist::SquaredEuclidean,
         );
         let (a, b) = (
-            inertia(&data, dim, &flat, &assign),
+            inertia(&data, dim, &flat, &assign_u32),
             inertia(&data, dim, &cpu, &cpu_assign),
         );
         assert!((a - b).abs() / b < 0.02, "mlx {a} vs cpu {b}");
@@ -607,7 +636,7 @@ mod tests {
             Some(params),
             3,
             &s,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(c.len(), k * dim);

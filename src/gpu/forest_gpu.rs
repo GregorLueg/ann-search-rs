@@ -381,7 +381,7 @@ pub fn mark_all_new(graph_idx: &mut Tensor<u32>, total_entries: u32) {
 ///   this
 /// * `use_cosine` - Whether to compute cosine distance instead of squared
 ///   Euclidean
-/// * `verbose` - Print timing information for each phase
+/// * `verbosity` - Prints one timed forest line at `Detailed`
 /// * `client` - GPU compute client
 ///
 /// ### Returns
@@ -404,7 +404,7 @@ pub fn gpu_forest_init<T>(
     n_trees: usize,
     seed: usize,
     use_cosine: bool,
-    verbose: bool,
+    verbosity: Verbosity,
     client: &Client,
 ) -> Result<ForestRouter<T>, AnnSearchErrors>
 where
@@ -430,14 +430,7 @@ where
     };
 
     // How many trees to keep routing data for (query entry points)
-    let n_router_trees = n_trees.min(N_ROUTER_TREES);
-
-    if verbose {
-        println!(
-            "  GPU forest init: {} trees, max_depth={}, max_leaf={}, router_trees={}",
-            n_trees, max_depth, max_leaf_size, n_router_trees
-        );
-    }
+    let _n_router_trees = n_trees.min(N_ROUTER_TREES);
 
     let forest_start = Instant::now();
     let mut tree_time = std::time::Duration::ZERO;
@@ -610,17 +603,19 @@ where
         merge_time += gpu_start.elapsed();
     }
 
-    if verbose {
-        println!("    Tree construction: {tree_time:.2?}");
-        println!(
-            "    GPU batched pairwise + merge ({} batches): {:.2?}",
-            n_batches, merge_time
-        );
-    }
-
-    if verbose {
+    if verbosity.detailed_verbosity() {
+        // Read back to sync the queue, so the elapsed time is the real one.
         let _ = update_counter_gpu.clone().read(client);
-        println!("  GPU forest init: {:.2?}", forest_start.elapsed());
+        println!(
+            " Built forest ({} trees, max depth {}, max leaf {}) in {:.2?}: trees {:.2?}, pairwise + merge {:.2?} ({} batches)",
+            n_trees,
+            max_depth,
+            max_leaf_size,
+            forest_start.elapsed(),
+            tree_time,
+            merge_time,
+            n_batches
+        );
     }
 
     Ok(router)
@@ -1277,7 +1272,7 @@ mod tests {
             n_trees,
             42,
             false,
-            true,
+            Verbosity::Normal,
             &client,
         );
 

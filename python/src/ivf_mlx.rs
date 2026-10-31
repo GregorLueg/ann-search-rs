@@ -4,6 +4,7 @@
 //! and a Metal kernel scans the probed cells.
 
 use ann_search_rs::mlx::ivf_mlx::IvfIndexMlx;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_ivf_index_mlx, query_ivf_index_mlx, query_ivf_index_mlx_self};
 use pyo3::prelude::*;
 
@@ -23,7 +24,8 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     ///   runs every one; there is no early stop.
     /// * `kmeans_balanced` - Reseed starved centroids each iteration.
     /// * `seed` - Fixes the k-means initialisation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
@@ -31,7 +33,7 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     #[staticmethod]
     #[pyo3(signature = (
         x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
-        seed = 42, verbose = false
+        seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -42,13 +44,20 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         seed: usize,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<Self> {
         let a = f32_array(x)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
         let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
         let inner = detach(py, || {
-            build_ivf_index_mlx((data, n, dim), nlist, kmp, &metric, seed, verbose)
+            build_ivf_index_mlx(
+                (data, n, dim),
+                nlist,
+                kmp,
+                &metric,
+                seed,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         Ok(Self { inner, n, dim })
@@ -64,13 +73,14 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     /// * `nquery` - Queries per device tile, or `None` for the library's own
     ///   tiling.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
     #[pyo3(signature = (
-        q, k, *, nprobe = None, nquery = None, return_distance = true, verbose = false
+        q, k, *, nprobe = None, nquery = None, return_distance = true, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
@@ -81,7 +91,7 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let a = f32_array(q)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -94,7 +104,7 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
                 nprobe,
                 nquery,
                 return_distance,
-                verbose,
+                parse_annsearch_verbosity(verbose),
             )
         })
         .map_err(crate::error::AnnErr)?;
@@ -110,13 +120,14 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     /// * `nquery` - Points per device tile, or `None` for the library's own
     ///   tiling.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
     #[pyo3(signature = (
-        k, *, nprobe = None, nquery = None, return_distance = true, verbose = false
+        k, *, nprobe = None, nquery = None, return_distance = true, verbose = 0
     ))]
     fn query_self<'py>(
         &self,
@@ -125,11 +136,18 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
         nprobe: Option<usize>,
         nquery: Option<usize>,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let idx = &self.inner;
         let (ids, dists) = detach(py, || {
-            query_ivf_index_mlx_self(idx, k, nprobe, nquery, return_distance, verbose)
+            query_ivf_index_mlx_self(
+                idx,
+                k,
+                nprobe,
+                nquery,
+                return_distance,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         crate::dispatch::pack(py, ids, dists, k)

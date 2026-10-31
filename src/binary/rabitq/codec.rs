@@ -27,8 +27,9 @@
 
 use rayon::prelude::*;
 
-use crate::binary::rabitq::ex_bits::{encode_ex_bits, excode_bytes, MAX_EX_BITS};
+use crate::binary::rabitq::ex_bits::{encode_ex_bits, ex_inner_product, excode_bytes, MAX_EX_BITS};
 use crate::binary::rabitq::rotator::RotatorKind;
+use crate::binary::rabitq::fastscan::build_sign_sums;
 use crate::binary::rabitq::RaBitQEncoder;
 use crate::prelude::*;
 use crate::quantised::hnsw_quantised::build::GraphBuildParams;
@@ -36,6 +37,9 @@ use crate::quantised::hnsw_quantised::codec::GraphCodec;
 use crate::quantised::hnsw_quantised::index::HnswQuantisedIndex;
 use crate::utils::graph_utils::ThreadLocalSearchState;
 use crate::utils::k_means_utils::{assign_all_parallel, sample_vectors, train_centroids};
+use crate::utils::verbosity::BuildLog;
+use std::time::Instant;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -56,9 +60,6 @@ const NIBBLE: usize = 4;
 /// Entries in one sign-table row, one per nibble value.
 const NIBBLE_VALUES: usize = 1 << NIBBLE;
 
-/// Coordinates per byte-aligned group of magnitude levels.
-const CODE_GROUP: usize = 8;
-
 //////////////////////
 // RaBitQCodecQuery //
 //////////////////////
@@ -68,7 +69,7 @@ pub struct RaBitQCodecQuery<T> {
     /// Rotated query, length `padded_dim`
     rotated: Vec<T>,
     /// Partial sums of `rotated` per nibble of a sign code, see
-    /// [`build_sign_lut`]
+    /// [`build_sign_sums`]
     sign_lut: Vec<T>,
     /// `sum(rotated)`, the centring correction's only query-dependent part
     sum: T,
@@ -76,32 +77,6 @@ pub struct RaBitQCodecQuery<T> {
     g_add: Vec<T>,
     /// `||q - c||` per centroid, scaling each vertex's error bound
     g_error: Vec<T>,
-}
-
-/// Partial sums of a rotated query over every 4-bit pattern of its sign code.
-///
-/// Entry `i * 16 + v` is the sum of `rotated[4i + b]` over the set bits `b` of
-/// `v`, so the sign inner product is one lookup per nibble instead of a
-/// data-dependent branch per bit.
-///
-/// ### Params
-///
-/// * `rotated` - Rotated query, length a multiple of eight
-///
-/// ### Returns
-///
-/// The table, `rotated.len() / 4 * 16` entries
-fn build_sign_lut<T: AnnSearchFloat>(rotated: &[T]) -> Vec<T> {
-    let mut lut = vec![T::zero(); rotated.len() / NIBBLE * NIBBLE_VALUES];
-    for (i, row) in lut.chunks_exact_mut(NIBBLE_VALUES).enumerate() {
-        let q = &rotated[i * NIBBLE..(i + 1) * NIBBLE];
-        // Each entry extends the one with its highest bit cleared.
-        for v in 1..NIBBLE_VALUES {
-            let high = (usize::BITS - 1 - v.leading_zeros()) as usize;
-            row[v] = row[v & !(1 << high)] + q[high];
-        }
-    }
-    lut
 }
 
 /////////////////
@@ -166,7 +141,7 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed, for reproducibility
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints the k-means stage at `Detailed`
     ///
     /// ### Returns
     ///
@@ -182,7 +157,7 @@ where
         k_means_params: Option<KMeansTrainingParams>,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
@@ -196,9 +171,9 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1).min(n);
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "  Encoding {n} vectors at {} total bits over {nlist} centroids.",
+                " Encoding {n} vectors at {} total bits over {nlist} centroids.",
                 ex_bits + 1
             );
         }
@@ -208,6 +183,7 @@ where
         // Euclidean.
         let n_train = (TRAIN_PER_CENTROID * nlist).min(MAX_TRAIN).min(n).max(1);
         let (training_data, _) = sample_vectors(vectors_flat, dim, n, n_train, seed);
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -216,8 +192,16 @@ where
             &Dist::SquaredEuclidean,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let vector_norms: Vec<T> = vectors_flat
             .par_chunks(dim)
@@ -270,7 +254,7 @@ where
             .enumerate()
             .try_for_each(
                 |(node, (((sign, ex), factor), bin_factor))| -> Result<(), AnnSearchErrors> {
-                    let c = assignments[node];
+                    let c = assignments[node] as usize;
                     let rotated =
                         encoder.apply_rotation(&vectors_flat[node * dim..(node + 1) * dim]);
                     let centroid = &centroids_rotated[c * padded_dim..(c + 1) * padded_dim];
@@ -308,7 +292,7 @@ where
             ex_codes,
             factors,
             bin_factors,
-            cluster: assignments.iter().map(|&c| c as u32).collect(),
+            cluster: assignments.clone(),
             centroids_rotated,
             nlist,
             ex_bits,
@@ -328,7 +312,7 @@ where
     ///
     /// * `node` - Vertex index
     /// * `query` - Rotated query, length `padded_dim`
-    /// * `sign_lut` - The query's nibble table, see [`build_sign_lut`]
+    /// * `sign_lut` - The query's nibble table, see [`build_sign_sums`]
     ///
     /// ### Returns
     ///
@@ -353,21 +337,7 @@ where
 
         let ex_bytes = excode_bytes(self.padded_dim, w);
         let ex = &self.ex_codes[node * ex_bytes..(node + 1) * ex_bytes];
-        let mask = (1u64 << w) - 1;
-
-        // Eight levels of `w` bits are exactly `w` whole bytes, so every group
-        // is byte-aligned and fits one u64 at any width up to `MAX_EX_BITS`.
-        let mut acc = [T::zero(); CODE_GROUP];
-        for (q, bytes) in query.chunks_exact(CODE_GROUP).zip(ex.chunks_exact(w)) {
-            let mut buf = [0u8; CODE_GROUP];
-            buf[..w].copy_from_slice(bytes);
-            let word = u64::from_le_bytes(buf);
-            for j in 0..CODE_GROUP {
-                let level = (word >> (j * w)) & mask;
-                acc[j] += q[j] * T::from_u64(level).unwrap_or_else(T::zero);
-            }
-        }
-        let ip_ex = acc.iter().fold(T::zero(), |a, &b| a + b);
+        let ip_ex = ex_inner_product(query, ex, w);
 
         (ip_sign, ip_ex)
     }
@@ -378,7 +348,7 @@ where
     ///
     /// * `node` - Vertex index
     /// * `rotated` - Rotated query, length `padded_dim`
-    /// * `sign_lut` - The query's nibble table, see [`build_sign_lut`]
+    /// * `sign_lut` - The query's nibble table, see [`build_sign_sums`]
     /// * `sum` - `sum(rotated)`
     /// * `g_add` - `||q - c||^2` for this vertex's centroid
     ///
@@ -562,6 +532,8 @@ where
 {
     type Query = RaBitQCodecQuery<T>;
 
+    const INDEX_NAME: &'static str = "HNSW-RaBitQ index";
+
     fn n(&self) -> usize {
         self.n
     }
@@ -605,7 +577,7 @@ where
         let g_error = g_add.iter().map(|&g| g.sqrt()).collect();
 
         Ok(RaBitQCodecQuery {
-            sign_lut: build_sign_lut(&rotated),
+            sign_lut: build_sign_sums(&rotated),
             rotated,
             sum,
             g_add,
@@ -632,7 +604,7 @@ where
         let rotated = self.reconstruct(a);
         let sum = rotated.iter().fold(T::zero(), |acc, &x| acc + x);
         let g_add = T::euclidean_simd(self.centroid(self.cluster[b] as usize), &rotated);
-        self.estimate(b, &rotated, &build_sign_lut(&rotated), sum, g_add)
+        self.estimate(b, &rotated, &build_sign_sums(&rotated), sum, g_add)
     }
 
     #[inline]
@@ -678,7 +650,8 @@ where
     /// * `nlist` - Centroid count, `None` picks `sqrt(n)`
     /// * `k_means_params` - Optional k-means settings
     /// * `seed` - Random seed, for reproducibility
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   encoding and the per-layer insertion
     ///
     /// ### Returns
     ///
@@ -693,8 +666,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("HNSW-RaBitQ index", verbosity);
         let (mut flat, n, dim) = data.into_row_major();
 
         // Cosine runs as squared Euclidean on unit vectors, which is the frame
@@ -718,17 +692,19 @@ where
             k_means_params,
             None,
             seed,
-            verbose,
+            verbosity,
         )?;
 
-        let params = GraphBuildParams::new(m, ef_construction, seed, verbose);
+        let params = GraphBuildParams::new(m, ef_construction, seed, verbosity);
         let (graph, hierarchy) = Self::build_topology(&codec, &params, |a, b| {
             T::euclidean_simd(&flat[a * dim..(a + 1) * dim], &flat[b * dim..(b + 1) * dim])
         });
 
         drop(flat);
 
-        Ok(Self::from_parts(codec, graph, hierarchy, &params))
+        let index = Self::from_parts(codec, graph, hierarchy, &params);
+        log.finish();
+        Ok(index)
     }
 
     /// Bytes held by the index.
@@ -798,7 +774,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap()
     }
@@ -958,7 +934,7 @@ mod tests {
                 None,
                 None,
                 42,
-                false
+                Verbosity::Quiet
             ),
             Err(AnnSearchErrors::DistanceNotSupported(Dist::Manhattan))
         ));
@@ -977,7 +953,7 @@ mod tests {
                 None,
                 None,
                 42,
-                false
+                Verbosity::Quiet
             ),
             Err(AnnSearchErrors::RaBitQInvalidExBits { .. })
         ));
@@ -995,7 +971,7 @@ mod tests {
             Some(1),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1025,7 +1001,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1062,7 +1038,7 @@ mod tests {
             None,
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

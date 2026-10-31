@@ -4,6 +4,7 @@
 //! construction.
 
 use ann_search_rs::mlx::exhaustive_mlx::ExhaustiveIndexMlx;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{
     build_exhaustive_index_mlx, query_exhaustive_index_mlx, query_exhaustive_index_mlx_self,
 };
@@ -19,17 +20,26 @@ mlx_handle!(PyExhaustiveMlx, ExhaustiveIndexMlx, "ExhaustiveMlx", {
     ///
     /// * `x` - Samples by features, C-contiguous float32.
     /// * `metric` - Already validated by the Python layer.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle, or a build error.
     #[staticmethod]
-    #[pyo3(signature = (x, *, metric))]
-    fn build(py: Python<'_>, x: &Bound<'_, PyAny>, metric: String) -> PyResult<Self> {
+    #[pyo3(signature = (x, *, metric, verbose = 0))]
+    fn build(
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        metric: String,
+        verbose: usize,
+    ) -> PyResult<Self> {
         let a = f32_array(x)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
-        let inner = detach(py, || build_exhaustive_index_mlx((data, n, dim), &metric))
-            .map_err(crate::error::AnnErr)?;
+        let inner = detach(py, || {
+            build_exhaustive_index_mlx((data, n, dim), &metric, parse_annsearch_verbosity(verbose))
+        })
+        .map_err(crate::error::AnnErr)?;
         Ok(Self { inner, n, dim })
     }
 
@@ -40,25 +50,32 @@ mlx_handle!(PyExhaustiveMlx, ExhaustiveIndexMlx, "ExhaustiveMlx", {
     /// * `q` - Queries by features, C-contiguous float32.
     /// * `k` - Neighbours per query.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Device versus host time split, to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         q: &Bound<'py, PyAny>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let a = f32_array(q)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
         let idx = &self.inner;
         let (ids, dists) = detach(py, || {
-            query_exhaustive_index_mlx((data, n, dim), idx, k, return_distance, verbose)
+            query_exhaustive_index_mlx(
+                (data, n, dim),
+                idx,
+                k,
+                return_distance,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         crate::dispatch::pack(py, ids, dists, k)
@@ -70,22 +87,28 @@ mlx_handle!(PyExhaustiveMlx, ExhaustiveIndexMlx, "ExhaustiveMlx", {
     ///
     /// * `k` - Neighbours per point.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Device versus host time split, to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let idx = &self.inner;
         let (ids, dists) = detach(py, || {
-            query_exhaustive_index_mlx_self(idx, k, return_distance, verbose)
+            query_exhaustive_index_mlx_self(
+                idx,
+                k,
+                return_distance,
+                parse_annsearch_verbosity(verbose),
+            )
         })
         .map_err(crate::error::AnnErr)?;
         crate::dispatch::pack(py, ids, dists, k)

@@ -28,15 +28,21 @@ fn main() {
     // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -54,7 +60,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -85,7 +91,7 @@ fn main() {
             None,
             &cli.distance,
             cli.seed as usize,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -118,7 +124,7 @@ fn main() {
                 cli.k,
                 Some(*nprobe),
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -152,7 +158,7 @@ fn main() {
         println!("Self-querying IVF index (nprobe={})...", nprobe_self);
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_ivf_self(&ivf_idx, cli.k, Some(nprobe_self), true, false).unwrap();
+            query_ivf_self(&ivf_idx, cli.k, Some(nprobe_self), true, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

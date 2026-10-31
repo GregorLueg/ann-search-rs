@@ -3,13 +3,13 @@
 
 use faer::RowRef;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+use std::time::Instant;
 
 /////////////
 // IvfIndex//
@@ -38,13 +38,13 @@ pub struct IvfIndex<T> {
     /// The norms of the centroids for Cosine distance calculations
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (in a flat structure)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets of the elements of each inverted list
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of clusters in the index
     nlist: usize,
     /// Original indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -137,7 +137,8 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds timed
+    ///   stages
     ///
     /// ### Returns
     ///
@@ -148,8 +149,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -173,11 +175,8 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("Generating IVF index with {} Voronoi cells.", nlist);
-        }
-
         // 2. train the centroids
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -186,8 +185,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -212,6 +219,7 @@ where
             vec![T::one(); n]
         };
 
+        let start = Instant::now();
         let assignments = assign_all_parallel(
             &vectors_flat,
             &data_norms_for_assignment,
@@ -222,6 +230,13 @@ where
             nlist,
             &metric,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
@@ -243,6 +258,8 @@ where
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
+        log.finish();
+
         Ok(idx)
     }
 
@@ -252,17 +269,13 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
+            new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -273,6 +286,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
             if !self.norms.is_empty() {
@@ -301,8 +315,8 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -368,8 +382,8 @@ where
         let mut heap = BoundedMaxHeap::new(k);
 
         for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
             let tail = start + (end - start) / 4 * 4;
 
             match self.metric {
@@ -408,7 +422,11 @@ where
         heap.sort();
 
         let distances = heap.dists().to_vec();
-        let indices = heap.ids().iter().map(|i| self.original_ids[*i]).collect();
+        let indices = heap
+            .ids()
+            .iter()
+            .map(|i| self.original_ids[*i] as usize)
+            .collect();
 
         Ok((indices, distances))
     }
@@ -456,7 +474,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -467,9 +485,9 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -477,23 +495,15 @@ where
                 let start = i * self.dim;
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(vec, k, nprobe)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -542,7 +552,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -592,7 +602,7 @@ mod tests {
             Some(2), // nlist
             None,
             42,
-            false,
+            Verbosity::Quiet,
         );
     }
 
@@ -605,7 +615,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -626,7 +636,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -645,7 +655,15 @@ mod tests {
     fn test_ivf_query_cosine() {
         let data = create_simple_matrix();
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(2), None, 42, false).unwrap();
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(2),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -663,7 +681,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -682,7 +700,7 @@ mod tests {
             Some(3),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -704,7 +722,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index2 = IvfIndex::build(
@@ -713,7 +731,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -734,7 +752,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index2 = IvfIndex::build(
@@ -743,7 +761,7 @@ mod tests {
             Some(2),
             None,
             123,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -767,7 +785,7 @@ mod tests {
             Some(10), // sqrt(100)
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -782,7 +800,15 @@ mod tests {
     fn test_ivf_orthogonal_vectors() {
         let data = Mat::from_fn(3, 3, |i, j| if i == j { 1.0 } else { 0.0 });
 
-        let index = IvfIndex::build(data.as_ref(), Dist::Cosine, Some(3), None, 42, false).unwrap();
+        let index = IvfIndex::build(
+            data.as_ref(),
+            Dist::Cosine,
+            Some(3),
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -810,7 +836,7 @@ mod tests {
             Some(5),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -837,7 +863,7 @@ mod tests {
             Some(2),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let index_many = IvfIndex::build(
@@ -846,7 +872,7 @@ mod tests {
             Some(4),
             None,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

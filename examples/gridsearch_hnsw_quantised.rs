@@ -44,14 +44,20 @@ fn main() {
     // Ground truth
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -68,7 +74,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -87,14 +93,21 @@ fn main() {
     // lose beyond this is the graph, anything they lose up to it is the codec.
     println!("Building exhaustive SQ8 index...");
     let start = Instant::now();
-    let sq8_idx = build_exhaustive_sq8_index(data.as_ref(), &cli.distance, None, false).unwrap();
+    let sq8_idx =
+        build_exhaustive_sq8_index(data.as_ref(), &cli.distance, None, Verbosity::Quiet).unwrap();
     let build_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
     let size_sq8 = sq8_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     println!("Querying exhaustive SQ8 index...");
     let start = Instant::now();
-    let (sq8_neighbors, _) =
-        query_exhaustive_sq8_index(query_data.as_ref(), &sq8_idx, cli.k, false, false).unwrap();
+    let (sq8_neighbors, _) = query_exhaustive_sq8_index(
+        query_data.as_ref(),
+        &sq8_idx,
+        cli.k,
+        false,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time_sq8 = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -131,8 +144,9 @@ fn main() {
             ef_construction,
             &cli.distance,
             cli.seed as usize,
-            false,
-        );
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
         let index_size_mb = hnsw_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
@@ -145,7 +159,7 @@ fn main() {
                 cli.k,
                 ef_search,
                 true,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -173,7 +187,7 @@ fn main() {
         println!("Self-querying HNSW index...");
         let start = Instant::now();
         let (approx_self, approx_dists_self) =
-            query_hnsw_self(&hnsw_idx, cli.k, 100, true, false).unwrap();
+            query_hnsw_self(&hnsw_idx, cli.k, 100, true, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         results.push(BenchmarkResultSize {
@@ -209,7 +223,7 @@ fn main() {
             &cli.distance,
             cli.seed as usize,
             None,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -220,9 +234,15 @@ fn main() {
             let start = Instant::now();
             // Distances are recomputed exactly below, so there is no point
             // asking the index to report its estimates.
-            let (approx_neighbors, _) =
-                query_hnsw_sq8u_index(query_data.as_ref(), &idx, cli.k, ef_search, false, false)
-                    .unwrap();
+            let (approx_neighbors, _) = query_hnsw_sq8u_index(
+                query_data.as_ref(),
+                &idx,
+                cli.k,
+                ef_search,
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap();
             let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
             results.push(BenchmarkResultSize {
@@ -247,7 +267,8 @@ fn main() {
 
         println!("Self-querying HNSW-SQ8U index...");
         let start = Instant::now();
-        let (approx_self, _) = query_hnsw_sq8u_self(&idx, cli.k, 100, false, false).unwrap();
+        let (approx_self, _) =
+            query_hnsw_sq8u_self(&idx, cli.k, 100, false, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         results.push(BenchmarkResultSize {
@@ -288,15 +309,22 @@ fn main() {
             &cli.distance,
             cli.seed as usize,
             Some(params),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let build_time = start.elapsed().as_secs_f64() * 1000.0;
         let index_size_mb = idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
         let start = Instant::now();
-        let (approx_neighbors, _) =
-            query_hnsw_sq8u_index(query_data.as_ref(), &idx, cli.k, 100, false, false).unwrap();
+        let (approx_neighbors, _) = query_hnsw_sq8u_index(
+            query_data.as_ref(),
+            &idx,
+            cli.k,
+            100,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         results.push(BenchmarkResultSize {

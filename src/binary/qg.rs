@@ -38,11 +38,14 @@
 //!
 //! ### What is not from the paper
 //!
-//! The graph. SymphonyQG builds its own with random init, repeated
-//! search-prune-reverse rounds and a cosine-threshold refill whose purpose is
-//! to force exact-degree regularity. [`VamanaIndex`] already produces a
-//! fixed-degree graph, so it builds the topology here and the contribution kept
-//! is the storage layout and the estimator.
+//! The graph. SymphonyQG builds its own with random init and repeated
+//! search-prune-reverse rounds. [`VamanaIndex`] builds the topology here, and
+//! the contribution kept is the storage layout and the estimator. What is kept
+//! from its build is the refill: Vamana's prune leaves vertices well short of
+//! the degree bound, and a hop sweeps a whole batch of lanes whatever they
+//! hold, so the empty lanes of a scanned batch are filled with the nearest
+//! 2-hop neighbours (SymphonyQG relaxes an angle threshold instead). Batches
+//! that hold no edge at all stay empty and are skipped by the walk.
 //!
 //! ### References
 //!
@@ -54,9 +57,6 @@ use faer_traits::ComplexField;
 use num_traits::{Float, FromPrimitive};
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use thousands::*;
 
 use crate::binary::rabitq::fastscan::{
     build_sign_lut, pack_rabitq_blocked, score_sign_block, unpack_rabitq_blocked, BLOCKED_ARCH,
@@ -68,7 +68,9 @@ use crate::cpu::vamana::{VamanaIndex, VamanaState};
 use crate::prelude::*;
 use crate::utils::graph_utils::ThreadLocalSearchState;
 use crate::utils::pack_knn_results;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::KnnValidation;
+use std::time::Instant;
 
 ////////////
 // Consts //
@@ -145,7 +147,7 @@ pub struct QgIndex<T> {
     /// The metric the index answers in
     metric: Dist,
     /// Original row indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -265,6 +267,64 @@ where
     (v_dist, dot_correction_inv)
 }
 
+/// Fill every vertex's empty slots with its nearest unlinked 2-hop neighbours.
+///
+/// Vamana's prune leaves most vertices well short of the degree bound, but a
+/// hop sweeps all [`QG_BATCH`] lanes of a batch whatever they hold, so an
+/// empty lane in a batch that is already scanned is an edge thrown away. Each
+/// vertex keeps its pruned edges and tops up from its neighbours' neighbours,
+/// nearest first. A batch that was entirely empty stays empty, so the walk
+/// still skips it.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vectors, `n * dim`
+/// * `dim` - Dimensionality
+/// * `edges` - Adjacency, `n * degree`, packed at the front
+/// * `degree` - Slots per vertex
+///
+/// ### Returns
+///
+/// The completed adjacency, same layout
+fn complete_degree<T>(vectors: &[T], dim: usize, edges: &[u32], degree: usize) -> Vec<u32>
+where
+    T: AnnSearchFloat,
+{
+    let mut out = edges.to_vec();
+    out.par_chunks_mut(degree)
+        .enumerate()
+        .for_each(|(node, slots)| {
+            let filled = slots.iter().take_while(|&&nb| nb != SENTINEL).count();
+            let target = filled.div_ceil(QG_BATCH) * QG_BATCH;
+            if filled == 0 || filled == target {
+                return;
+            }
+
+            let x = &vectors[node * dim..(node + 1) * dim];
+            let mut pool: Vec<(OrderedFloat<T>, u32)> = slots[..filled]
+                .iter()
+                .flat_map(|&nb| {
+                    let nb = nb as usize;
+                    edges[nb * degree..(nb + 1) * degree]
+                        .iter()
+                        .take_while(|&&c| c != SENTINEL)
+                })
+                .filter(|&&c| c as usize != node && !slots[..filled].contains(&c))
+                .map(|&c| {
+                    let c_vec = &vectors[c as usize * dim..(c as usize + 1) * dim];
+                    (OrderedFloat(T::euclidean_simd(x, c_vec)), c)
+                })
+                .collect();
+            pool.sort_unstable();
+            pool.dedup_by_key(|e| e.1);
+
+            for (slot, (_, c)) in slots[filled..target].iter_mut().zip(pool) {
+                *slot = c;
+            }
+        });
+    out
+}
+
 impl<T> QgIndex<T>
 where
     T: AnnSearchFloat + ComplexField + ThreadLocalSearchState,
@@ -288,6 +348,8 @@ where
     /// * `rotator_kind` - Which rotation to encode with, or `None` to let the
     ///   dimensionality decide
     /// * `seed` - Random seed, for reproducibility
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   graph build
     ///
     /// ### Returns
     ///
@@ -303,7 +365,9 @@ where
         alpha_pass2: f32,
         rotator_kind: Option<RotatorKind>,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("QG index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -337,6 +401,7 @@ where
 
         // The graph is built in the space the walk searches, which for cosine
         // is the normalised one.
+        let start = Instant::now();
         let graph_index = VamanaIndex::build(
             (&vectors_flat[..], n, dim),
             Dist::SquaredEuclidean,
@@ -346,8 +411,15 @@ where
             alpha_pass1,
             alpha_pass2,
             seed,
+            Verbosity::Quiet,
         );
-        let edges = graph_index.graph;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Built Vamana graph (R = {degree}) in {:.2?}",
+                start.elapsed()
+            );
+        }
+        let edges = complete_degree(&vectors_flat, dim, &graph_index.graph, degree);
         let entry_point = graph_index.medoid;
 
         let encoder = match rotator_kind {
@@ -435,6 +507,8 @@ where
                 },
             )?;
 
+        log.finish();
+
         Ok(Self {
             vectors_flat,
             norms,
@@ -450,7 +524,7 @@ where
             padded_dim,
             n,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         })
     }
 
@@ -565,6 +639,12 @@ where
                 let factors = &self.factors[node * self.degree * 2..(node + 1) * self.degree * 2];
 
                 for b in 0..self.n_batches {
+                    // Edges are packed at the front, so an empty first slot
+                    // means this batch and every later one hold nothing worth
+                    // a sweep.
+                    if slots[b * QG_BATCH] == SENTINEL {
+                        break;
+                    }
                     score_sign_block(&lut, &self.codes, node * self.n_batches + b, &mut lanes);
 
                     let add = &factors[b * 2 * QG_BATCH..b * 2 * QG_BATCH + QG_BATCH];
@@ -638,7 +718,7 @@ where
     /// * `k` - Number of neighbours per sample
     /// * `ef_search` - Beam width
     /// * `return_dist` - Whether to return distances alongside indices
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -648,23 +728,14 @@ where
         k: usize,
         ef_search: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("QG index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(
                     &self.vectors_flat[i * self.dim..(i + 1) * self.dim],
@@ -673,6 +744,7 @@ where
                 )
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -727,7 +799,7 @@ where
     /// ### Returns
     ///
     /// Slice of original indices
-    pub fn original_ids(&self) -> &[usize] {
+    pub fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 
@@ -744,7 +816,7 @@ where
             + self.edges.capacity() * std::mem::size_of::<u32>()
             + self.codes.capacity()
             + self.factors.capacity() * std::mem::size_of::<T>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -805,7 +877,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -867,7 +939,19 @@ mod tests {
     }
 
     fn build(data: &Mat<f32>, metric: Dist, degree: usize) -> QgIndex<f32> {
-        QgIndex::build(data.as_ref(), metric, degree, 128, None, 1.2, 1.2, None, 42).unwrap()
+        QgIndex::build(
+            data.as_ref(),
+            metric,
+            degree,
+            128,
+            None,
+            1.2,
+            1.2,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap()
     }
 
     fn brute_force(data: &Mat<f32>, query: &[f32], k: usize, metric: Dist) -> Vec<usize> {
@@ -1024,7 +1108,8 @@ mod tests {
                 1.2,
                 1.2,
                 None,
-                42
+                42,
+                Verbosity::Quiet,
             ),
             Err(AnnSearchErrors::DistanceNotSupported(_))
         ));
@@ -1045,7 +1130,8 @@ mod tests {
                         1.2,
                         1.2,
                         None,
-                        42
+                        42,
+                        Verbosity::Quiet,
                     ),
                     Err(AnnSearchErrors::QgInvalidDegree { .. })
                 ),
@@ -1068,7 +1154,7 @@ mod tests {
     fn test_generate_knn_returns_k_per_row() {
         let data = clustered(600, 64, 8, 41);
         let index = build(&data, Dist::SquaredEuclidean, 32);
-        let (ids, dists) = index.generate_knn(5, 64, true, false).unwrap();
+        let (ids, dists) = index.generate_knn(5, 64, true, Verbosity::Quiet).unwrap();
 
         assert_eq!(ids.len(), 600);
         assert!(ids.iter().all(|row| row.len() == 5));
@@ -1089,6 +1175,7 @@ mod tests {
             1.2,
             None,
             42,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1132,5 +1219,55 @@ mod tests {
 
         assert_eq!(index.blocked_arch, BLOCKED_ARCH);
         assert_eq!(index.query(&query, 10, 128).unwrap(), before);
+    }
+
+    #[test]
+    fn test_complete_degree_fills_scanned_batches_only() {
+        let (n, dim, degree) = (300usize, 16usize, 64usize);
+        let data = clustered(n, dim, 3, 5);
+        let vectors: Vec<f32> = (0..n)
+            .flat_map(|i| (0..dim).map(move |j| (i, j)))
+            .map(|(i, j)| data[(i, j)])
+            .collect();
+
+        // Each vertex links to a handful of others, far short of a batch,
+        // except vertex 0, which already fills its first batch exactly.
+        let mut edges = vec![SENTINEL; n * degree];
+        for i in 0..n {
+            for s in 0..3 + i % 4 {
+                edges[i * degree + s] = ((i + 1 + s * 7) % n) as u32;
+            }
+        }
+        for s in 0..QG_BATCH {
+            edges[s] = (s + 1) as u32;
+        }
+
+        let filled = complete_degree(&vectors, dim, &edges, degree);
+
+        for i in 0..n {
+            let before = &edges[i * degree..(i + 1) * degree];
+            let after = &filled[i * degree..(i + 1) * degree];
+            let kept = before.iter().take_while(|&&e| e != SENTINEL).count();
+
+            // Original edges keep their slots, and nothing spills into a
+            // batch that held no edge.
+            assert_eq!(&after[..kept], &before[..kept]);
+            assert!(
+                after[QG_BATCH..].iter().all(|&e| e == SENTINEL),
+                "vertex {i}"
+            );
+
+            let live: Vec<u32> = after
+                .iter()
+                .copied()
+                .take_while(|&e| e != SENTINEL)
+                .collect();
+            assert!(i == 0 || live.len() > kept, "vertex {i} was not topped up");
+            assert!(!live.contains(&(i as u32)), "vertex {i} links to itself");
+            let mut unique = live.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), live.len(), "vertex {i} has a duplicate edge");
+        }
     }
 }

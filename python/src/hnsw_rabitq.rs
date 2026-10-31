@@ -5,6 +5,7 @@
 //! answer from the codes alone.
 
 use ann_search_rs::binary::rabitq::codec::HnswRaBitQIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_hnsw_rabitq_index, query_hnsw_rabitq_index, query_hnsw_rabitq_self};
 use pyo3::prelude::*;
 
@@ -33,7 +34,8 @@ ann_handle!(
         /// * `nlist` - Centroids the codes are taken against, or `None` for
         ///   `sqrt(n)`.
         /// * `seed` - Fixes the level assignment, the rotation and the k-means.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
@@ -41,7 +43,7 @@ ann_handle!(
         #[staticmethod]
         #[pyo3(signature = (
             x, *, m, ef_construction, metric, ex_bits, nlist = None, seed = 42,
-            verbose = false
+            verbose = 0
         ))]
         #[allow(clippy::too_many_arguments)]
         fn build(
@@ -53,7 +55,7 @@ ann_handle!(
             ex_bits: usize,
             nlist: Option<usize>,
             seed: usize,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<Self> {
             build_dispatch!(py, x, HnswRaBitQInner, |data, n, dim| {
                 build_hnsw_rabitq_index(
@@ -65,7 +67,7 @@ ann_handle!(
                     nlist,
                     None,
                     seed,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             })
         }
@@ -78,13 +80,14 @@ ann_handle!(
         /// * `k` - Neighbours per query.
         /// * `ef_search` - Candidate list size. Raise for recall.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`. Distances are the codec's estimate. See
         /// [`QueryOut`].
-        #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = false))]
+        #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = 0))]
         fn query<'py>(
             &self,
             py: Python<'py>,
@@ -92,7 +95,7 @@ ann_handle!(
             k: usize,
             ef_search: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 HnswRaBitQInner::F32(idx) => {
@@ -103,7 +106,7 @@ ann_handle!(
                             k,
                             ef_search,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -115,7 +118,7 @@ ann_handle!(
                             k,
                             ef_search,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -132,19 +135,20 @@ ann_handle!(
         /// * `k` - Neighbours per point.
         /// * `ef_search` - Candidate list size. Raise for recall.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-        #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = false))]
+        #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = 0))]
         fn query_self<'py>(
             &self,
             py: Python<'py>,
             k: usize,
             ef_search: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 HnswRaBitQInner::F32(idx) => {
@@ -153,7 +157,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
                 HnswRaBitQInner::F64(idx) => {
@@ -162,7 +166,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
             }

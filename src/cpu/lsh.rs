@@ -38,9 +38,9 @@ use rand_distr::StandardNormal;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::num::NonZero;
-use thousands::*;
 
 use crate::prelude::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ////////////
@@ -585,7 +585,7 @@ pub struct LSHIndex<T> {
     /// Addressable codes per table, `1 << (n_proj * slot_bits)`
     n_buckets: usize,
     /// Orignal indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -645,6 +645,7 @@ where
     /// * `slot_bits` - Bits per quantised projection; `None` picks 1 for cosine
     ///   and 2 for squared Euclidean
     /// * `seed` - Random seed for reproducibility
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -656,7 +657,9 @@ where
         bits_per_hash: usize,
         slot_bits: Option<usize>,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("LSH index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -749,6 +752,8 @@ where
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
 
+        log.finish();
+
         Ok(idx)
     }
 
@@ -766,19 +771,16 @@ where
     /// ### Returns
     ///
     /// New-to-old id mapping, to be stored as `original_ids`.
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         if self.n == 0 {
             return Vec::new();
         }
 
-        let new_to_old: Vec<usize> = self.bucket_ids[..self.n]
-            .iter()
-            .map(|&id| id as usize)
-            .collect();
+        let new_to_old: Vec<u32> = self.bucket_ids[..self.n].to_vec();
 
         let mut old_to_new = vec![0u32; self.n];
         for (new_id, &old_id) in new_to_old.iter().enumerate() {
-            old_to_new[old_id] = new_id as u32;
+            old_to_new[old_id as usize] = new_id as u32;
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -789,6 +791,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
             if !self.norms.is_empty() {
@@ -822,7 +825,7 @@ where
         total += self.boundaries.capacity() * std::mem::size_of::<T>();
         total += self.bucket_offsets.capacity() * std::mem::size_of::<u32>();
         total += self.bucket_ids.capacity() * std::mem::size_of::<u32>();
-        total += self.original_ids.capacity() * std::mem::size_of::<usize>();
+        total += self.original_ids.capacity() * std::mem::size_of::<u32>();
 
         total
     }
@@ -1061,7 +1064,7 @@ where
                 let (indices, dists) = buffer
                     .data()
                     .iter()
-                    .map(|&(OrderedFloat(d), idx)| (self.original_ids[idx], d))
+                    .map(|&(OrderedFloat(d), idx)| (self.original_ids[idx] as usize, d))
                     .unzip();
 
                 (indices, dists, fallback_triggered)
@@ -1148,7 +1151,7 @@ where
     /// * `max_cand` - Optional candidate limit per query
     /// * `n_probes` - Number of additional buckets to probe per table
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -1160,43 +1163,32 @@ where
         max_cand: Option<usize>,
         n_probes: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> (Vec<Vec<usize>>, Option<Vec<Vec<T>>>) {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("LSH index", self.n, true, verbosity);
 
         let results: Vec<(usize, Vec<usize>, Vec<T>, bool)> = (0..self.n)
             .into_par_iter()
             .map(|vec_idx| {
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists, fallback) = self.self_query_at(vec_idx, k, max_cand, n_probes);
-                (self.original_ids[vec_idx], indices, dists, fallback)
+                (
+                    self.original_ids[vec_idx] as usize,
+                    indices,
+                    dists,
+                    fallback,
+                )
             })
             .collect();
+        progress.finish();
 
-        if verbose {
-            let missed = results
-                .iter()
-                .filter(|(_, _, _, fallback)| *fallback)
-                .count();
-            if (missed as f32) / (self.n as f32) >= 0.01 {
-                println!("More than 1% of samples were not represented in the buckets.");
-                println!("Please verify underlying data");
-            }
+        let missed = results
+            .iter()
+            .filter(|(_, _, _, fallback)| *fallback)
+            .count();
+        if (missed as f32) / (self.n as f32) >= 0.01 {
+            println!("[WARNING] More than 1% of samples were not represented in the buckets. Please verify the underlying data.");
         }
 
         // Rows come back in internal order, so they are scattered into the
@@ -1282,7 +1274,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1333,7 +1325,16 @@ mod tests {
     #[test]
     fn test_index_creation_euclidean() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -1351,7 +1352,8 @@ mod tests {
     #[test]
     fn test_index_creation_cosine() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, None, 42).unwrap();
+        let index =
+            LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, None, 42, Verbosity::Quiet).unwrap();
 
         assert_eq!(index.n, 5);
         assert_eq!(index.dim, 3);
@@ -1373,13 +1375,22 @@ mod tests {
             MAX_BITS_PER_HASH + 1,
             None,
             42,
+            Verbosity::Quiet,
         );
         assert!(matches!(
             too_many,
             Err(AnnSearchErrors::InvalidLshBits { .. })
         ));
 
-        let zero = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 0, None, 42);
+        let zero = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            0,
+            None,
+            42,
+            Verbosity::Quiet,
+        );
         assert!(matches!(zero, Err(AnnSearchErrors::InvalidLshBits { .. })));
 
         // The limit itself must still build
@@ -1389,7 +1400,8 @@ mod tests {
             1,
             MAX_BITS_PER_HASH,
             None,
-            42
+            42,
+            Verbosity::Quiet,
         )
         .is_ok());
     }
@@ -1397,7 +1409,15 @@ mod tests {
     #[test]
     fn test_manhattan_not_supported() {
         let mat = simple_test_data();
-        let result = LSHIndex::new(mat.as_ref(), Dist::Manhattan, 4, 8, None, 42);
+        let result = LSHIndex::new(
+            mat.as_ref(),
+            Dist::Manhattan,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        );
         assert!(matches!(
             result,
             Err(AnnSearchErrors::DistanceNotSupported(_))
@@ -1411,7 +1431,16 @@ mod tests {
         // sits ~50 units from the origin. This is the property plain SimHash
         // does not have.
         let mat = offset_data(2000, 16);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 8, Some(1), 7).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            2,
+            8,
+            Some(1),
+            7,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.slot_bits, 1);
 
@@ -1440,7 +1469,16 @@ mod tests {
     #[test]
     fn test_csr_layout_covers_every_vector() {
         let mat = offset_data(500, 8);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 3, 8, None, 11).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            3,
+            8,
+            None,
+            11,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         for table_idx in 0..index.num_tables {
             let offs = &index.bucket_offsets
@@ -1518,13 +1556,22 @@ mod tests {
             scale * (1.0 + j as f32 * 0.1)
         });
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 1, 8, Some(4), 3).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            1,
+            8,
+            Some(4),
+            3,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let internal = |orig: usize| {
             index
                 .original_ids
                 .iter()
-                .position(|&o| o == orig)
+                .position(|&o| o as usize == orig)
                 .expect("every original id is present")
         };
         let (lo, hi) = (internal(0), internal(n - 1));
@@ -1562,7 +1609,16 @@ mod tests {
     #[test]
     fn test_basic_query_no_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances, _) = index.query(&query, 3, None, 0).unwrap();
@@ -1580,7 +1636,16 @@ mod tests {
     #[test]
     fn test_basic_query_with_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances, _) = index.query(&query, 3, None, 8).unwrap();
@@ -1601,7 +1666,16 @@ mod tests {
         let dim = 50;
         let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 12, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            2,
+            12,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.5; dim];
         let (idx_no_probe, _, _) = index.query(&query, 10, None, 0).unwrap();
@@ -1613,7 +1687,8 @@ mod tests {
     #[test]
     fn test_query_cosine() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, None, 42).unwrap();
+        let index =
+            LSHIndex::new(mat.as_ref(), Dist::Cosine, 4, 8, None, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![2.0, 0.0, 0.0];
         let (indices, distances, _) = index.query(&query, 2, None, 0).unwrap();
@@ -1626,7 +1701,16 @@ mod tests {
     #[test]
     fn test_query_row() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query_mat = Mat::from_fn(1, 3, |_, j| [1.0, 0.0, 0.0][j]);
         let (indices, distances, _) = index.query_row(query_mat.row(0), 3, None, 0).unwrap();
@@ -1644,7 +1728,16 @@ mod tests {
         let dim = 8;
         let mat = Mat::from_fn(n, dim, |_, j| j as f32);
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let budget = 64;
@@ -1664,7 +1757,16 @@ mod tests {
     #[test]
     fn test_k_larger_than_n() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances, _) = index.query(&query, 100, None, 0).unwrap();
@@ -1676,7 +1778,16 @@ mod tests {
     #[test]
     fn test_dimension_mismatch() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query = vec![1.0, 0.0];
         let result = index.query(&query, 3, None, 0);
         assert!(matches!(
@@ -1688,7 +1799,16 @@ mod tests {
     #[test]
     fn test_query_row_dimension_mismatch() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let query_mat = Mat::from_fn(1, 2, |_, j| [1.0, 0.0][j]);
         let result = index.query_row(query_mat.row(0), 3, None, 0);
 
@@ -1702,7 +1822,16 @@ mod tests {
     fn test_fallback_mechanism() {
         let mat = Mat::from_fn(10, 100, |i, j| if j == i * 10 { 1.0 } else { 0.0 });
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 16, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            2,
+            16,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0; 100];
         let (indices, distances, _) = index.query(&query, 3, None, 0).unwrap();
@@ -1715,8 +1844,26 @@ mod tests {
     fn test_deterministic_with_seed() {
         let mat = simple_test_data();
 
-        let index1 = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
-        let index2 = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index1 = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let index2 = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices1, _, _) = index1.query(&query, 3, None, 4).unwrap();
@@ -1728,7 +1875,16 @@ mod tests {
     #[test]
     fn test_f64_query() {
         let mat = Mat::from_fn(3, 3, |i, j| if i == j { 1.0f64 } else { 0.0f64 });
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances, _) = index.query(&query, 2, None, 0).unwrap();
@@ -1741,7 +1897,16 @@ mod tests {
     #[test]
     fn test_distances_sorted() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (_, distances, _) = index.query(&query, 5, None, 8).unwrap();
@@ -1754,7 +1919,16 @@ mod tests {
     #[test]
     fn test_query_returns_k_or_fewer() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            8,
+            6,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -1768,7 +1942,16 @@ mod tests {
     #[test]
     fn test_no_duplicate_results() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            8,
+            6,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, _, _) = index.query(&query, 5, None, 6).unwrap();
@@ -1783,7 +1966,16 @@ mod tests {
     #[test]
     fn test_no_duplicate_results_with_probes() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 8, 6, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            8,
+            6,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.5];
         let (indices, _, _) = index.query(&query, 5, None, 10).unwrap();
@@ -1804,7 +1996,16 @@ mod tests {
         // Self-query re-projects rather than reading a cached code, so it must
         // land on exactly the same buckets and probes as the cross-set path.
         let mat = offset_data(300, 12);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 3, 10, None, 5).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            3,
+            10,
+            None,
+            5,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         for vec_idx in [0usize, 7, 42, 299] {
             let stored = &index.vectors_flat[vec_idx * index.dim..(vec_idx + 1) * index.dim];
@@ -1818,7 +2019,8 @@ mod tests {
     #[test]
     fn test_self_query_cosine_matches_query() {
         let mat = offset_data(300, 12);
-        let index = LSHIndex::new(mat.as_ref(), Dist::Cosine, 3, 10, None, 5).unwrap();
+        let index =
+            LSHIndex::new(mat.as_ref(), Dist::Cosine, 3, 10, None, 5, Verbosity::Quiet).unwrap();
 
         for vec_idx in [0usize, 13, 250] {
             let stored = &index.vectors_flat[vec_idx * index.dim..(vec_idx + 1) * index.dim];
@@ -1834,11 +2036,21 @@ mod tests {
         let n = 2000;
         let dim = 16;
         let mat = offset_data(n, dim);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 11).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            11,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         // `original_ids` must be a bijection, else results map back wrongly.
         let mut seen = vec![false; n];
         for &old in &index.original_ids {
+            let old = old as usize;
             assert!(!seen[old], "original id {old} appeared twice");
             seen[old] = true;
         }
@@ -1846,6 +2058,7 @@ mod tests {
 
         // Every stored row must still be the vector its original id names.
         for (new_id, &old_id) in index.original_ids.iter().enumerate() {
+            let old_id = old_id as usize;
             let stored = &index.vectors_flat[new_id * dim..(new_id + 1) * dim];
             for (j, &v) in stored.iter().enumerate() {
                 assert_eq!(v, mat[(old_id, j)], "row {old_id} moved but changed");
@@ -1856,7 +2069,16 @@ mod tests {
     #[test]
     fn test_table_zero_scan_is_sequential_after_reorder() {
         let mat = offset_data(2000, 16);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 11).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            11,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         // The whole point of the reorder: table 0's CSR becomes the identity,
         // so its candidate scan walks `vectors_flat` front to back.
@@ -1875,9 +2097,18 @@ mod tests {
         let n = 500;
         let dim = 16;
         let mat = offset_data(n, dim);
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 5).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            5,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let (knn, _) = index.generate_knn(3, None, index.n_proj, false, false);
+        let (knn, _) = index.generate_knn(3, None, index.n_proj, false, Verbosity::Quiet);
 
         assert_eq!(knn.len(), n);
 
@@ -1898,22 +2129,40 @@ mod tests {
     #[test]
     fn test_self_query_finds_self() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let (indices, distances, _) = index.self_query_at(0, 3, None, 0);
 
         assert!(!indices.is_empty());
         assert!(indices.len() <= 3);
         assert_eq!(indices.len(), distances.len());
-        assert!(indices.contains(&index.original_ids[0]));
+        assert!(indices.contains(&(index.original_ids[0] as usize)));
     }
 
     #[test]
     fn test_generate_knn() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let (knn_indices, knn_dists) = index.generate_knn(2, None, 4, true, false);
+        let (knn_indices, knn_dists) = index.generate_knn(2, None, 4, true, Verbosity::Quiet);
 
         assert_eq!(knn_indices.len(), 5);
         assert!(knn_dists.is_some());
@@ -1930,9 +2179,18 @@ mod tests {
     #[test]
     fn test_generate_knn_no_distances() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let (knn_indices, knn_dists) = index.generate_knn(2, None, 0, false, false);
+        let (knn_indices, knn_dists) = index.generate_knn(2, None, 0, false, Verbosity::Quiet);
 
         assert_eq!(knn_indices.len(), 5);
         assert!(knn_dists.is_none());
@@ -1944,7 +2202,16 @@ mod tests {
         let dim = 50;
         let mat = Mat::from_fn(n, dim, |i, j| ((i * 7 + j * 13) % 100) as f32 / 100.0);
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 6, 10, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            6,
+            10,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.5; dim];
         let (indices, distances, _) = index.query(&query, 10, None, 10).unwrap();
@@ -1970,7 +2237,16 @@ mod tests {
             40.0 + cluster * 3.0 + jitter
         });
 
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 12, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            12,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
         let recall = index.validate_index(10, 42, Some(200)).unwrap();
 
         assert!(recall > 0.8, "recall on offset data was {recall}");
@@ -1979,7 +2255,16 @@ mod tests {
     #[test]
     fn test_memory_usage_accounts_for_buckets() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 4, 8, None, 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            4,
+            8,
+            None,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let mem = index.memory_usage_bytes();
         assert!(mem >= index.bucket_ids.len() * std::mem::size_of::<u32>());
@@ -1988,7 +2273,16 @@ mod tests {
     #[test]
     fn test_slot_bits_clamped_to_bits_per_hash() {
         let mat = simple_test_data();
-        let index = LSHIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 2, 4, Some(9), 42).unwrap();
+        let index = LSHIndex::new(
+            mat.as_ref(),
+            Dist::SquaredEuclidean,
+            2,
+            4,
+            Some(9),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(index.slot_bits, 4);
         assert_eq!(index.n_proj, 1);

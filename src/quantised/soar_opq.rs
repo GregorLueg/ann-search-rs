@@ -29,13 +29,13 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::ops::AddAssign;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 //////////////////////////
 // Thread-local buffers //
@@ -82,11 +82,11 @@ pub struct SoarOpqIndex<T> {
     centroids_norm: Vec<T>,
     /// Offsets over CSR positions, `nlist + 1` entries. Differences are list
     /// lengths *including* spilled entries
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Cumulative count of primary entries per cell, `nlist + 1` entries. Used
     /// only to tell `select_probed_clusters` how many *distinct* points a probe
     /// list reaches
-    primary_offsets: Vec<usize>,
+    primary_offsets: Vec<u32>,
     /// CSR position holding each point's primary copy, `n` entries. Only needed
     /// to reconstruct a point for the self-query path
     primary_pos: Vec<u32>,
@@ -259,7 +259,7 @@ where
     /// * `n_opq_centroids` - Optional codebook size, defaults to 256
     /// * `opq_iter` - Optional number of rotation-refinement iterations
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -280,8 +280,9 @@ where
         n_opq_centroids: Option<usize>,
         opq_iter: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("SOAR-OPQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -300,13 +301,11 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!(
-                "  Generating SOAR-OPQ index with {} Voronoi cells, rule {:?}.",
-                nlist, rule
-            );
+        if verbosity.detailed_verbosity() {
+            println!(" Spilling rule {:?}", rule);
         }
 
+        let start = Instant::now();
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -315,8 +314,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         if metric == Dist::Cosine {
             centroids
@@ -338,19 +345,14 @@ where
             &metric,
         );
 
-        if verbose {
-            println!("  Computing primary residuals for OPQ training");
-        }
         let mut training_residuals = Vec::with_capacity(training_data.len());
         for (vec_idx, &cluster_id) in training_primary.iter().enumerate() {
             let vec = &training_data[vec_idx * dim..(vec_idx + 1) * dim];
-            let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
             training_residuals.extend_from_slice(&T::subtract_simd(vec, centroid));
         }
 
-        if verbose {
-            println!("  Training optimised product quantiser with m={}", m);
-        }
+        let start = Instant::now();
         let codebook = OptimisedProductQuantiser::train(
             &training_residuals,
             dim,
@@ -359,8 +361,15 @@ where
             opq_iter,
             30,
             seed + 1000,
-            verbose,
+            verbosity,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained optimised product quantiser (m = {}) in {:.2?}",
+                m,
+                start.elapsed()
+            );
+        }
 
         let data_norms = vec![T::one(); n];
         let primary = assign_all_parallel(
@@ -388,7 +397,7 @@ where
 
         let mut both = vec![0u32; n * 2];
         for i in 0..n {
-            both[i * 2] = primary[i] as u32;
+            both[i * 2] = primary[i];
             both[i * 2 + 1] = secondary[i];
         }
         let (members, offsets) = invert_assignments_csr(&both, n, 2, nlist);
@@ -396,14 +405,14 @@ where
         let n_entries = members.len();
         let mut pos_cluster = vec![0u32; n_entries];
         for cluster in 0..nlist {
-            for pos in offsets[cluster]..offsets[cluster + 1] {
+            for pos in offsets[cluster] as usize..offsets[cluster + 1] as usize {
                 pos_cluster[pos] = cluster as u32;
             }
         }
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "  Encoding {} rotated residuals",
+                " Encoding {} rotated residuals",
                 n_entries.separate_with_underscores()
             );
         }
@@ -427,21 +436,21 @@ where
         // to the primary and both positions would otherwise claim the tag.
         let mut primary_pos = vec![0u32; n];
         let mut dedup_key = vec![0u32; n_entries];
-        let mut primary_counts = vec![0usize; nlist];
+        let mut primary_counts = vec![0u32; nlist];
         let mut seen_primary = vec![false; n];
         for pos in 0..n_entries {
             let point = members[pos] as usize;
             let cluster = pos_cluster[pos] as usize;
-            if cluster == primary[point] && !seen_primary[point] {
+            if cluster == primary[point] as usize && !seen_primary[point] {
                 seen_primary[point] = true;
                 primary_pos[point] = pos as u32;
                 primary_counts[cluster] += 1;
                 dedup_key[pos] = u32::MAX;
             } else {
-                dedup_key[pos] = primary[point] as u32;
+                dedup_key[pos] = primary[point];
             }
         }
-        let mut primary_offsets = vec![0usize; nlist + 1];
+        let mut primary_offsets = vec![0u32; nlist + 1];
         for c in 0..nlist {
             primary_offsets[c + 1] = primary_offsets[c] + primary_counts[c];
         }
@@ -452,6 +461,8 @@ where
             .chunks_exact(dim)
             .flat_map(|c| codebook.rotate(c))
             .collect();
+
+        log.finish();
 
         Ok(Self {
             quantised_codes,
@@ -492,8 +503,8 @@ where
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_rotated.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.primary_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.primary_offsets.capacity() * std::mem::size_of::<u32>()
             + self.primary_pos.capacity() * std::mem::size_of::<u32>()
             + self.dedup_key.capacity() * std::mem::size_of::<u32>()
             + self.original_ids.capacity() * std::mem::size_of::<u32>()
@@ -560,8 +571,8 @@ where
                 let residual_rot = T::subtract_simd(&query_rotated, centroid_rot);
                 let lookup_tables = self.build_lookup_tables_direct(&residual_rot);
 
-                let start = self.offsets[cluster_idx];
-                let end = self.offsets[cluster_idx + 1];
+                let start = self.offsets[cluster_idx] as usize;
+                let end = self.offsets[cluster_idx + 1] as usize;
 
                 let mut worst_dist = if heap.len() >= k {
                     heap.peek().unwrap().0 .0
@@ -648,7 +659,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -658,14 +669,14 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("SOAR-OPQ index", self.n, true, verbosity);
 
         let mut pos_cluster = vec![0u32; self.original_ids.len()];
         for cluster in 0..self.nlist {
-            for pos in self.offsets[cluster]..self.offsets[cluster + 1] {
+            for pos in self.offsets[cluster] as usize..self.offsets[cluster + 1] as usize {
                 pos_cluster[pos] = cluster as u32;
             }
         }
@@ -680,21 +691,13 @@ where
                 let residual = self.codebook.decode(codes);
                 let reconstructed: Vec<T> = T::add_simd(centroid, &residual);
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(&reconstructed, k, nprobe)?;
                 Ok((self.original_ids[pos] as usize, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -780,7 +783,7 @@ mod tests {
             Some(N_CENTROIDS),
             Some(1),
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         (idx, data)
@@ -882,7 +885,7 @@ mod tests {
             Some(N_CENTROIDS),
             Some(1),
             1,
-            false
+            Verbosity::Quiet
         )
         .is_err());
     }
@@ -898,7 +901,9 @@ mod tests {
     #[test]
     fn test_soar_opq_generate_knn_shape() {
         let (idx, _) = build(300, 32, 8, Dist::SquaredEuclidean);
-        let (indices, dists) = idx.generate_knn(7, Some(8), true, false).unwrap();
+        let (indices, dists) = idx
+            .generate_knn(7, Some(8), true, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(indices.len(), 300);
         assert!(indices.iter().all(|row| row.len() == 7));
         assert!(dists.unwrap().iter().all(|row| row.len() == 7));
@@ -920,7 +925,7 @@ mod tests {
             None,
             Some(1),
             1,
-            false,
+            Verbosity::Quiet,
         );
         assert!(matches!(
             err,

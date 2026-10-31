@@ -3,6 +3,125 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.12.0
+
+**Features**
+
+- `build_knn_graph_nndescent()`: matrix in, kNN graph out, on the CPU. Nothing
+  else is kept. With the same seed and tree count it returns the same graph as
+  `extract_knn` on an NN-Descent index.
+- `build_knn_graph_nndescent_gpu()`: the same on the GPU, through the
+  clustered build, so datasets past the per-binding limit work too. Takes
+  `NNDescentGpuKnnParams`.
+- `build_nsg_index_gpu()`: matrix in, NSG out, with the kNN graph built on
+  the GPU through the clustered build. The vectors move from the kNN handoff
+  into the NSG instead of being copied. Takes `NNDescentGpuKnnParams` for the
+  kNN graph. `build_nsg_from_gpu_knn` stays for reusing one graph across
+  several NSG builds.
+- The two kNN-graph builders return a flat `KnnGraph<T>`: `n * k` `u32` ids,
+  optional distancess rows sorted ascending.
+- Manhattan NN-Descent seeds by Kd-tree leaf join as well, instead of one
+  forest query per point.
+- One verbosity grammar across every index, k-means and kNN-graph builder:
+  `Verbosity { Quiet, Normal, Detailed }`. `Normal` prints `Building <name>
+  ...` / `... built <name> in 1.23s`, `Querying <name> ...`, a progress line
+  every 100_000 samples and `... queried <name> in`. `Detailed` adds timed
+  build stages (forest, k-means, assignment, quantiser training, NSG steps,
+  CAGRA prune) and per-iteration lines.
+- `parse_annsearch_verbosity(usize)` maps `0`/`1`/`2` to the enum for callers
+  that carry verbosity as an integer.
+- The binary, RaBitQ and TurboQuant indices (exhaustive and IVF) can keep
+  their re-ranking store at f16: `StoreEncoding::F16`, against the default
+  `StoreEncoding::Full`. Halves the store file. Rows decode in chunks through
+  `half` (F16C or the aarch64 fp16 conversion, picked at runtime) into the
+  existing SIMD kernels, so re-ranking runs at f32 speed.
+- Exhaustive and IVF RaBitQ follow the upstream RaBitQ-Library estimator: one
+  lookup table per query instead of one per probed cluster, the
+  `f_add`/`f_rescale`/`f_error` factor form, and a lower bound per candidate.
+  One-bit IVF queries run about 2.5x faster, and builds encode in parallel.
+- `ex_bits` on exhaustive and IVF RaBitQ: magnitude bits on top of the sign
+  bit. Candidates the one-bit bound cannot rule out are re-scored on the wider
+  code, so high recall works without the on-disk store.
+- `rerank_factor: None` on exhaustive and IVF RaBitQ is the bound-gated
+  rerank: exact distances only for candidates whose lower bound still beats
+  the current k-th distance. `Some(f)` keeps the fixed `k * f` shortlist.
+- Quantised Graph stops at the first empty FastScan batch, and fills empty
+  slots of the scanned batches with the nearest 2-hop neighbours at build.
+  Higher recall at the same `ef`.
+
+**Memory**
+
+- Annoy and Kd forests build in place: one `u32` permutation per tree,
+  partitioned recursively, with leaves as ranges into it. Reduction in
+  allocations and in memory.
+- The NN-Descent index no longer keeps a second, reordered copy of the vectors
+  inside its forest, reducing index size substantially.
+- Stored point ids are `u32` crate-wide: `original_ids` on every index, the
+  IVF-family id and offset arrays, the k-means assignments, the HNSW update
+  buffers, the NN-Descent and NSG build buffers and the GPU/MLX host storage.
+  Index arithmetic stays `usize`.
+- `build_nsg_index` runs its internal NN-Descent graph-only, see above.
+- Ball tree builds in place on the same pattern and drops `leaf_indices`, which
+  had become the identity once the vectors were stored in leaf order.
+
+**Breaking changes**
+
+- Every `verbose: bool` parameter is now `verbosity: Verbosity`, including
+  `train_centroids`, `k_means_clusters_gpu`, `k_means_clusters_mlx` and
+  `GraphBuildParams::verbosity` (was `verbose`). Builders and self-queries that
+  took no flag before take one now: `build_annoy_index`, `build_balltree_index`,
+  `build_exhaustive_index` and its BF16, SQ8, binary, RaBitQ, TurboQuant, GPU
+  and MLX variants, `build_kd_tree_index`, `build_lsh_index`,
+  `build_vamana_index`, `build_qg_index`, `build_qg_index_with_rotator`,
+  `query_nndescent_index_gpu_self`, `query_nndescent_index_mlx_self`,
+  `query_cagra_index_mlx` and `query_cagra_index_mlx_self`. The matching
+  struct constructors follow.
+- The LSH "more than 1% of samples not in the buckets" warning prints at every
+  verbosity, as the cross-query path already did.
+- Datasets with more than `u32::MAX - 1` samples (`2^31 - 2` for NN-Descent and
+  RNN-Descent) are refused with the new `AnnSearchErrors::TooManySamples`.
+- `build_hnsw_index`, `build_kd_tree_index` and `build_vamana_index` return a
+  `Result` now, like the other builders.
+- `KnnValidation::original_ids` returns `&[u32]`.
+- `KnnGraphGpu::knn_graph` and `KnnGraphMlx::knn_graph` hold `(u32, T)` pairs.
+  `NsgIndex::build_from_knn` takes `&[(u32, T)]`.
+- `k_means_clusters_gpu`, `k_means_clusters_mlx`, `k_means_gpu_flat`,
+  `assign_all_gpu`, `assign_all_mlx` and `assign_all_parallel` return `u32`
+  assignments. `build_csr_layout` and `invert_assignments_csr` return `u32` ids
+  and offsets. `assign_secondary_soar` and `adjust_centers` take `u32`
+  assignments, `select_probed_clusters` takes `u32` offsets.
+- `RaBitQStorage::vector_indices` and `offsets` are `Vec<u32>`, and
+  `cluster_vector_indices` returns `&[u32]`.
+- `compact_knn_rows` returns `(u32, T)` and lost its id type parameter. The
+  `GraphPid` trait is gone.
+- The vector store behind the binary indices is one file, `vectors.bin`,
+  instead of `vectors_flat.bin` plus `norms.bin`. It carries its own header
+  (magic, version, float type, encoding, shape) and a fingerprint of the
+  norms, which the index records and checks on load. A store from a
+  different dataset of the same shape used to load silently; it is refused
+  now. Little-endian hosts only.
+- `build_exhaustive_index_binary`, `build_ivf_index_binary`,
+  `build_exhaustive_index_rabitq`, `build_ivf_index_rabitq`,
+  `build_exhaustive_index_turboquant` and `build_ivf_index_turboquant` take
+  `store_encoding: StoreEncoding` after `save_path`, as do the matching
+  `new_with_vector_store` / `build_with_vector_store` constructors.
+- `MmapVectorStore` is `VectorStore`, `load_vector` is `row` and returns a
+  `Cow<[T]>`. The old `VectorStore` trait and `StoreMeta` are gone.
+  `AnnSearchErrors::SizeMismatch` is replaced by `StoreInvalid { path, reason }`.
+- The `binary` feature pulls in `half`.
+- `build_ivf_index_rabitq` takes `ex_bits` after `k_means_params`,
+  `build_exhaustive_index_rabitq` after `n_clust_rabitq`. The IVF and
+  exhaustive RaBitQ constructors and `RaBitQQuantiser::new` /
+  `with_rotator_kind` follow.
+- `rerank_factor: None` on exhaustive and IVF RaBitQ no longer means
+  `Some(20)`, see above.
+- `RaBitQEncoder::encode_query` takes the normalised query and `ex_bits`, and
+  builds one lookup table per query. `encode_query_prerotated`, the
+  quantiser's `encode_query` wrappers and `RaBitQStorage::cluster_dist_to_centroid`
+  / `cluster_dot_corrections` are gone.
+- Save format bumped from 6 to 7: the Annoy, Kd, NN-Descent, ball tree,
+  IVF-family and binary-index layouts changed. Older indices error on load.
+
 ## 0.11.2
 
 **Chore**

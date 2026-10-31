@@ -4,6 +4,7 @@
 //! a sparse navigable graph without the separate NSG-style refinement step.
 
 use ann_search_rs::cpu::rnn_descent::RnnDescentIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_rnn_descent_index, query_rnn_descent_index, query_rnn_descent_self};
 use pyo3::prelude::*;
 
@@ -29,14 +30,15 @@ ann_handle!(
         /// * `n_trees` - Forest size for the initial graph, or `None` for the
         ///   library's heuristic.
         /// * `seed` - Fixes the seed graph.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// The built handle, or a build error.
         #[staticmethod]
         #[pyo3(signature = (
-        x, *, metric, s, r, t1, t2, n_trees = None, seed = 42, verbose = false
+        x, *, metric, s, r, t1, t2, n_trees = None, seed = 42, verbose = 0
     ))]
         #[allow(clippy::too_many_arguments)]
         fn build(
@@ -49,7 +51,7 @@ ann_handle!(
             t2: usize,
             n_trees: Option<usize>,
             seed: usize,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<Self> {
             build_dispatch!(py, x, RnnDescentInner, |data, n, dim| {
                 build_rnn_descent_index(
@@ -61,7 +63,7 @@ ann_handle!(
                     &metric,
                     n_trees,
                     seed,
-                    verbose,
+                    parse_annsearch_verbosity(verbose),
                 )
             })
         }
@@ -77,13 +79,14 @@ ann_handle!(
         /// * `k_search` - Neighbours expanded per visited node, or `None` for
         ///   `min(32, r)`.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`, dense and padded. See [`QueryOut`].
         #[pyo3(signature = (
-        q, k, *, ef_search = None, k_search = None, return_distance = true, verbose = false
+        q, k, *, ef_search = None, k_search = None, return_distance = true, verbose = 0
     ))]
         #[allow(clippy::too_many_arguments)]
         fn query<'py>(
@@ -94,7 +97,7 @@ ann_handle!(
             ef_search: Option<usize>,
             k_search: Option<usize>,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 RnnDescentInner::F32(idx) => {
@@ -106,7 +109,7 @@ ann_handle!(
                             ef_search,
                             k_search,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -119,7 +122,7 @@ ann_handle!(
                             ef_search,
                             k_search,
                             return_distance,
-                            verbose,
+                            parse_annsearch_verbosity(verbose),
                         )
                     })
                 }
@@ -134,13 +137,14 @@ ann_handle!(
         /// * `ef_search` - Beam width, or `None` for the default.
         /// * `k_search` - Neighbours expanded per visited node, or `None`.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
         #[pyo3(signature = (
-        k, *, ef_search = None, k_search = None, return_distance = true, verbose = false
+        k, *, ef_search = None, k_search = None, return_distance = true, verbose = 0
     ))]
         fn query_self<'py>(
             &self,
@@ -149,7 +153,7 @@ ann_handle!(
             ef_search: Option<usize>,
             k_search: Option<usize>,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 RnnDescentInner::F32(idx) => self_arm!(py, k, || query_rnn_descent_self(
@@ -158,7 +162,7 @@ ann_handle!(
                     ef_search,
                     k_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 )),
                 RnnDescentInner::F64(idx) => self_arm!(py, k, || query_rnn_descent_self(
                     idx,
@@ -166,7 +170,7 @@ ann_handle!(
                     ef_search,
                     k_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 )),
             }
         }

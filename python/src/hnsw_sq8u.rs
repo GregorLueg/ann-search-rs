@@ -5,6 +5,7 @@
 //! distance preserve the ordering of the float one, so a single kernel serves
 //! construction and query.
 
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::quantised::hnsw_quantised::index::HnswSq8uIndex;
 use ann_search_rs::{build_hnsw_sq8u_index, query_hnsw_sq8u_index, query_hnsw_sq8u_self};
 use pyo3::prelude::*;
@@ -36,7 +37,8 @@ ann_handle!(
         /// * `quant_sample_rows` - Rows sampled for calibration, or `None` to
         ///   auto-pick.
         /// * `seed` - Fixes the level assignment and the calibration sample.
-        /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
@@ -44,7 +46,7 @@ ann_handle!(
         #[staticmethod]
         #[pyo3(signature = (
             x, *, m, ef_construction, metric, quant_drop_ratio = None,
-            quant_sample_rows = None, seed = 42, verbose = false
+            quant_sample_rows = None, seed = 42, verbose = 0
         ))]
         #[allow(clippy::too_many_arguments)]
         fn build(
@@ -56,7 +58,7 @@ ann_handle!(
             quant_drop_ratio: Option<f64>,
             quant_sample_rows: Option<usize>,
             seed: usize,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<Self> {
             let qp = quant_params(quant_drop_ratio, quant_sample_rows, seed);
             build_dispatch!(py, x, HnswSq8uInner, |data, n, dim| build_hnsw_sq8u_index(
@@ -66,7 +68,7 @@ ann_handle!(
                 &metric,
                 seed,
                 qp,
-                verbose
+                parse_annsearch_verbosity(verbose)
             ))
         }
 
@@ -78,13 +80,14 @@ ann_handle!(
         /// * `k` - Neighbours per query.
         /// * `ef_search` - Candidate list size. Raise for recall.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)`. Distances are the codec's estimate. See
         /// [`QueryOut`].
-        #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = false))]
+        #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = 0))]
         fn query<'py>(
             &self,
             py: Python<'py>,
@@ -92,7 +95,7 @@ ann_handle!(
             k: usize,
             ef_search: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 HnswSq8uInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
@@ -102,7 +105,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                     )
                 }),
                 HnswSq8uInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
@@ -112,7 +115,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose,
+                        parse_annsearch_verbosity(verbose),
                     )
                 }),
             }
@@ -127,19 +130,20 @@ ann_handle!(
         /// * `k` - Neighbours per point.
         /// * `ef_search` - Candidate list size. Raise for recall.
         /// * `return_distance` - Skips the copy into numpy, not the computation.
-        /// * `verbose` - Progress to the process stdout.
+        /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+        ///   stdout, not `sys.stdout`.
         ///
         /// ### Returns
         ///
         /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-        #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = false))]
+        #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = 0))]
         fn query_self<'py>(
             &self,
             py: Python<'py>,
             k: usize,
             ef_search: usize,
             return_distance: bool,
-            verbose: bool,
+            verbose: usize,
         ) -> PyResult<QueryOut<'py>> {
             match &self.inner {
                 HnswSq8uInner::F32(idx) => {
@@ -148,7 +152,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
                 HnswSq8uInner::F64(idx) => {
@@ -157,7 +161,7 @@ ann_handle!(
                         k,
                         ef_search,
                         return_distance,
-                        verbose
+                        parse_annsearch_verbosity(verbose)
                     ))
                 }
             }

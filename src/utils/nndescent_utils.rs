@@ -26,43 +26,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// ~2 billion.
 pub const SENTINEL_PID: usize = u32::MAX as usize >> 1;
 
-/// A stored neighbour id
-///
-/// The CPU NN-Descent graph stores `u32` ids, the GPU and clustered graphs
-/// `usize`. Both fit below [`SENTINEL_PID`], so readers such as
-/// [`unpack_knn_graph`] take either without a copy.
-pub trait GraphPid: Copy + Send + Sync {
-    /// The id as an index.
-    fn pid(self) -> usize;
-
-    /// The id from a 31-bit device id.
-    fn from_u32(pid: u32) -> Self;
-}
-
-impl GraphPid for usize {
-    #[inline(always)]
-    fn pid(self) -> usize {
-        self
-    }
-
-    #[inline(always)]
-    fn from_u32(pid: u32) -> Self {
-        pid as usize
-    }
-}
-
-impl GraphPid for u32 {
-    #[inline(always)]
-    fn pid(self) -> usize {
-        self as usize
-    }
-
-    #[inline(always)]
-    fn from_u32(pid: u32) -> Self {
-        pid
-    }
-}
-
 ////////////////
 // Neighbours //
 ////////////////
@@ -100,11 +63,11 @@ impl<T: Copy> Neighbour<T> {
     ///
     /// Packed neighbour entry with the encoded flag.
     #[inline(always)]
-    pub fn new(pid: usize, dist: T, is_new: bool) -> Self {
-        debug_assert!(pid <= Self::PID_MASK as usize, "PID exceeds 31-bit limit");
+    pub fn new(pid: u32, dist: T, is_new: bool) -> Self {
+        debug_assert!(pid <= Self::PID_MASK, "PID exceeds 31-bit limit");
         let flag = if is_new { Self::IS_NEW_MASK } else { 0 };
         Self {
-            pid_and_flag: (pid as u32) | flag,
+            pid_and_flag: pid | flag,
             dist,
         }
     }
@@ -128,8 +91,8 @@ impl<T: Copy> Neighbour<T> {
     ///
     /// Point index in the range `[0, 2^31)`.
     #[inline(always)]
-    pub fn pid(&self) -> usize {
-        (self.pid_and_flag & Self::PID_MASK) as usize
+    pub fn pid(&self) -> u32 {
+        self.pid_and_flag & Self::PID_MASK
     }
 
     /// Whether this slot is empty (holds the sentinel point id).
@@ -139,7 +102,7 @@ impl<T: Copy> Neighbour<T> {
     /// `true` if this slot does not hold a valid neighbour.
     #[inline(always)]
     pub fn is_sentinel(&self) -> bool {
-        self.pid() == SENTINEL_PID
+        self.pid() == SENTINEL_PID as u32
     }
 
     /// Mark this neighbour as old (already explored).
@@ -202,8 +165,8 @@ impl<T: Copy> Neighbour<T> {
 ///
 /// `(indices, distances)` with one row per node. Distances are `None` when
 /// `return_dist` is false.
-pub fn unpack_knn_graph<P: GraphPid, T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
-    graph: &[(P, T)],
+pub fn unpack_knn_graph<T: Copy + Send + Sync + num_traits::Zero + PartialOrd>(
+    graph: &[(u32, T)],
     n: usize,
     k: usize,
     k_out: Option<usize>,
@@ -232,14 +195,13 @@ pub fn unpack_knn_graph<P: GraphPid, T: Copy + Send + Sync + num_traits::Zero + 
                 }
             }
             for &(pid, dist) in &graph[i * k..(i + 1) * k] {
-                let pid = pid.pid();
-                if pid == SENTINEL_PID {
+                if pid == SENTINEL_PID as u32 {
                     continue;
                 }
                 if ids.len() == take + self_slot {
                     break;
                 }
-                ids.push(pid);
+                ids.push(pid as usize);
                 if return_dist {
                     dists.push(dist);
                 }
@@ -249,6 +211,118 @@ pub fn unpack_knn_graph<P: GraphPid, T: Copy + Send + Sync + num_traits::Zero + 
         .collect();
 
     crate::utils::pack_knn_results(rows, return_dist)
+}
+
+//////////////
+// KnnGraph //
+//////////////
+
+/// Id of an empty slot in a [`KnnGraph`] row.
+pub const KNN_GRAPH_EMPTY: u32 = u32::MAX;
+
+/// A flat kNN graph, the output of the matrix-in, graph-out builders.
+///
+/// Row `i` is `indices[i * k..(i + 1) * k]`, sorted by distance ascending.
+/// A row the descent could not fill ends in [`KNN_GRAPH_EMPTY`] ids, with
+/// `T::max_value()` distances when distances are kept.
+#[derive(Clone, Debug)]
+pub struct KnnGraph<T> {
+    /// Neighbour ids, `n * k`, row-major
+    pub indices: Vec<u32>,
+    /// Distances matching `indices`, when requested. Squared for Euclidean
+    pub distances: Option<Vec<T>>,
+    /// Number of rows
+    pub n: usize,
+    /// Row length, the self-edge included when it was asked for
+    pub k: usize,
+}
+
+impl<T> KnnGraph<T>
+where
+    T: num_traits::Float + Send + Sync,
+{
+    /// Flatten a sentinel-padded `(pid, dist)` graph of `n * k_in` entries.
+    ///
+    /// ### Params
+    ///
+    /// * `graph` - Rows sorted ascending, empty slots at [`SENTINEL_PID`]
+    /// * `n` - Number of rows
+    /// * `k_in` - Row length of `graph`
+    /// * `include_self` - Prepend `(i, 0)` to row `i`, so rows are
+    ///   `k_in + 1` long
+    /// * `return_dist` - Keep the distances
+    ///
+    /// ### Returns
+    ///
+    /// The flat graph.
+    pub fn from_rows(
+        graph: &[(u32, T)],
+        n: usize,
+        k_in: usize,
+        include_self: bool,
+        return_dist: bool,
+    ) -> Self {
+        let self_slot = usize::from(include_self);
+        let k = k_in + self_slot;
+        let mut indices = vec![KNN_GRAPH_EMPTY; n * k];
+        indices
+            .par_chunks_mut(k.max(1))
+            .enumerate()
+            .for_each(|(i, row)| {
+                let mut j = 0;
+                if include_self {
+                    row[0] = i as u32;
+                    j = 1;
+                }
+                for &(pid, _) in &graph[i * k_in..(i + 1) * k_in] {
+                    if pid != SENTINEL_PID as u32 {
+                        row[j] = pid;
+                        j += 1;
+                    }
+                }
+            });
+
+        let distances = return_dist.then(|| {
+            let mut dists = vec![T::max_value(); n * k];
+            dists
+                .par_chunks_mut(k.max(1))
+                .enumerate()
+                .for_each(|(i, row)| {
+                    let mut j = 0;
+                    if include_self {
+                        row[0] = T::zero();
+                        j = 1;
+                    }
+                    for &(pid, dist) in &graph[i * k_in..(i + 1) * k_in] {
+                        if pid != SENTINEL_PID as u32 {
+                            row[j] = dist;
+                            j += 1;
+                        }
+                    }
+                });
+            dists
+        });
+
+        Self {
+            indices,
+            distances,
+            n,
+            k,
+        }
+    }
+
+    /// One row's ids.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Row index
+    ///
+    /// ### Returns
+    ///
+    /// The `k` ids of row `i`, padding included.
+    pub fn row(&self, i: usize) -> &[u32] {
+        &self.indices[i * self.k..(i + 1) * self.k]
+    }
 }
 
 ///////////////
@@ -568,14 +642,14 @@ mod tests {
 
     #[test]
     fn neighbour_sentinel_detected() {
-        let n = Neighbour::<f32>::new(SENTINEL_PID, f32::MAX, false);
+        let n = Neighbour::<f32>::new(SENTINEL_PID as u32, f32::MAX, false);
         assert!(n.is_sentinel());
     }
 
     #[test]
     fn neighbour_max_valid_pid() {
         // Largest PID that still fits in 31 bits without hitting the sentinel.
-        let pid = SENTINEL_PID - 1;
+        let pid = SENTINEL_PID as u32 - 1;
         let n = Neighbour::<f32>::new(pid, 0.0, true);
         assert_eq!(n.pid(), pid);
         assert!(!n.is_sentinel());
@@ -621,14 +695,14 @@ mod tests {
     }
 
     /// Two-node graph at `k = 3` with the last slot of each row empty.
-    fn padded_graph() -> Vec<(usize, f32)> {
+    fn padded_graph() -> Vec<(u32, f32)> {
         vec![
             (1, 0.5),
             (2, 1.5),
-            (SENTINEL_PID, f32::MAX),
+            (SENTINEL_PID as u32, f32::MAX),
             (0, 0.5),
             (2, 2.5),
-            (SENTINEL_PID, f32::MAX),
+            (SENTINEL_PID as u32, f32::MAX),
         ]
     }
 
@@ -661,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_unpack_all_sentinel_row_is_empty() {
-        let graph = vec![(SENTINEL_PID, f32::MAX); 4];
+        let graph = vec![(SENTINEL_PID as u32, f32::MAX); 4];
         let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, false, true);
         assert_eq!(ids, vec![Vec::<usize>::new(), Vec::new()]);
         assert_eq!(dists.unwrap(), vec![Vec::<f32>::new(), Vec::new()]);
@@ -688,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_unpack_include_self_on_an_empty_row_returns_only_self() {
-        let graph = vec![(SENTINEL_PID, f32::MAX); 4];
+        let graph = vec![(SENTINEL_PID as u32, f32::MAX); 4];
         let (ids, dists) = unpack_knn_graph(&graph, 2, 2, None, true, true);
         assert_eq!(ids, vec![vec![0], vec![1]]);
         assert_eq!(dists.unwrap(), vec![vec![0.0], vec![0.0]]);

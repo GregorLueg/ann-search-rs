@@ -33,6 +33,7 @@ use crate::gpu::topk_gpu::atomic_u32_add_supported;
 use crate::gpu::{WORKGROUP_128, WORKGROUP_SIZE_X};
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use thousands::*;
 
 ////////////
 // Consts //
@@ -1744,7 +1745,7 @@ where
 /// * `dist` - Distance metric
 /// * `params` - Iteration count and the fixed / assignment-checked switch
 /// * `seed` - Seeds the donor round-robin when `params.balanced` is set
-/// * `verbose` - Print per-iteration convergence progress to stdout
+/// * `verbosity` - Prints per-iteration lines at `Detailed`
 ///
 /// ### Returns
 ///
@@ -1764,8 +1765,8 @@ fn run_kmeans_loop<S, A>(
     dist: &Dist,
     params: &KMeansGpuParams,
     seed: usize,
-    verbose: bool,
-) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
+    verbosity: Verbosity,
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
 where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float,
@@ -1779,12 +1780,6 @@ where
     let all_indices = GpuTensor::<u32>::empty(vec![n], client)?;
 
     if params.fixed {
-        if verbose {
-            println!(
-                "    Dispatching the {:?} iters to the GPU kernel.",
-                params.iters
-            )
-        }
         for iter in 0..params.iters {
             lloyd_step::<S, A>(
                 client,
@@ -1889,20 +1884,20 @@ where
             // Iteration 0 has no meaningful `prev` (uninitialised buffer), so
             // only test convergence from the second iteration onward.
             if iter > 0 && changed <= change_floor {
-                if verbose {
+                if verbosity.detailed_verbosity() {
                     println!(
-                        "    Converged at iteration {} ({} assignments changed)",
+                        "  Converged at iteration {} ({} assignments changed)",
                         iter + 1,
-                        changed
+                        changed.separate_with_underscores()
                     );
                 }
                 break;
             }
-            if verbose && (iter + 1) % 10 == 0 {
+            if verbosity.detailed_verbosity() && (iter + 1) % 10 == 0 {
                 println!(
-                    "    Iteration {} complete ({} assignments changed)",
+                    "  Iteration {}: {} assignments changed",
                     iter + 1,
-                    changed
+                    changed.separate_with_underscores()
                 );
             }
         }
@@ -1923,11 +1918,7 @@ where
         dist,
     )?;
 
-    let assignments: Vec<usize> = assign_gpu
-        .read(client)?
-        .into_iter()
-        .map(|x| x as usize)
-        .collect();
+    let assignments = assign_gpu.read(client)?;
 
     let final_cents = cent_gpu.clone().read(client)?;
 
@@ -1961,7 +1952,7 @@ where
 /// * `params` - GPU k-means parameters
 /// * `init_method` - Resolved initialisation strategy
 /// * `seed` - Random seed
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - Prints the initialisation and per-iteration lines at `Detailed`
 ///
 /// ### Returns
 ///
@@ -1985,37 +1976,35 @@ fn init_and_run<S, A>(
     params: &KMeansGpuParams,
     init_method: KMeansInit,
     seed: usize,
-    verbose: bool,
-) -> Result<(Vec<usize>, Vec<A>), AnnSearchErrors>
+    verbosity: Verbosity,
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
 where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
 {
     let centroids = match init_method {
-        KMeansInit::Random => {
-            if verbose {
-                println!("  Initialising centroids via fast random selection");
-            }
-            fast_random_init(data_host, dim_padded, n, n_centroids, seed)
-        }
-        KMeansInit::KMeansParallel => {
-            if verbose {
-                println!("  Initialising centroids via k-means|| (GPU)");
-            }
-            kmeans_parallel_init_gpu::<S, A>(
-                client,
-                data_gpu,
-                data_host,
-                norms_host,
-                pnorm_gpu,
-                n,
-                dim_padded,
-                n_centroids,
-                dist,
-                seed,
-            )?
-        }
+        KMeansInit::Random => fast_random_init(data_host, dim_padded, n, n_centroids, seed),
+        KMeansInit::KMeansParallel => kmeans_parallel_init_gpu::<S, A>(
+            client,
+            data_gpu,
+            data_host,
+            norms_host,
+            pnorm_gpu,
+            n,
+            dim_padded,
+            n_centroids,
+            dist,
+            seed,
+        )?,
     };
+
+    if verbosity.detailed_verbosity() {
+        let how = match init_method {
+            KMeansInit::Random => "random selection",
+            KMeansInit::KMeansParallel => "k-means|| on the GPU",
+        };
+        println!(" Initialised centroids via {how}");
+    }
 
     let cent_gpu = GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
 
@@ -2040,7 +2029,7 @@ where
         dist,
         params,
         seed,
-        verbose,
+        verbosity,
     )
 }
 
@@ -2087,7 +2076,8 @@ where
 /// * `kmeans_params` - Optional [KMeansGpuParams]
 /// * `seed` - Seed for reproducible initialisation
 /// * `device` - CubeCL runtime device
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the upload,
+///   initialisation and per-iteration lines
 ///
 /// ### Returns
 ///
@@ -2105,16 +2095,13 @@ pub fn k_means_clusters_gpu<T>(
     kmeans_params: Option<KMeansGpuParams>,
     seed: usize,
     device: Device,
-    verbose: bool,
-) -> Result<(Mat<T>, Vec<usize>), AnnSearchErrors>
+    verbosity: Verbosity,
+) -> Result<(Mat<T>, Vec<u32>), AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
     let metric = parse_ann_dist(dist).unwrap_or_else(|| {
-        println!(
-            "Unknown string provided ({:?}). Defaulting to Squared Euclidean",
-            dist
-        );
+        println!("[WARNING] Weird string used for distance metric. Using default squared Euclidean distance");
         Dist::default()
     });
 
@@ -2130,7 +2117,7 @@ where
         kmeans_params,
         seed,
         &client,
-        verbose,
+        verbosity,
     )?;
 
     let centroid_mat = Mat::from_fn(n_centroids, dim, |i, j| centroids[i * dim + j]);
@@ -2153,12 +2140,10 @@ where
 /// * `metric` - Distance metric
 /// * `params` - GPU parameters, mapped onto [`KMeansTrainingParams`]
 /// * `seed` - Random seed
-/// * `verbose` - Controls verbosity
 ///
 /// ### Returns
 ///
 /// `(centroids, assignments)` in the same layout as [`k_means_gpu_flat`].
-#[allow(clippy::too_many_arguments)]
 fn kmeans_cpu_fallback<T>(
     data: &[T],
     dim: usize,
@@ -2167,8 +2152,7 @@ fn kmeans_cpu_fallback<T>(
     metric: &Dist,
     params: &KMeansGpuParams,
     seed: usize,
-    verbose: bool,
-) -> Result<(Vec<T>, Vec<usize>), AnnSearchErrors>
+) -> Result<(Vec<T>, Vec<u32>), AnnSearchErrors>
 where
     T: AnnSearchFloat,
 {
@@ -2183,7 +2167,7 @@ where
         metric,
         Some(cpu_params),
         seed,
-        verbose,
+        Verbosity::Quiet,
     )?;
 
     let (data_norms, centroid_norms) = if *metric == Dist::Cosine {
@@ -2231,7 +2215,8 @@ where
 /// * `params` - Optional [`KMeansGpuParams`]; `None` takes the defaults
 /// * `seed` - Seed for reproducible initialisation
 /// * `client` - CubeCL compute client, borrowed for the call
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the upload,
+///   initialisation and per-iteration lines
 ///
 /// ### Returns
 ///
@@ -2254,8 +2239,8 @@ pub fn k_means_gpu_flat<T>(
     params: Option<KMeansGpuParams>,
     seed: usize,
     client: &Client,
-    verbose: bool,
-) -> Result<(Vec<T>, Vec<usize>), AnnSearchErrors>
+    verbosity: Verbosity,
+) -> Result<(Vec<T>, Vec<u32>), AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
@@ -2284,11 +2269,22 @@ where
     // `atomic_u32_add_supported` for why that failure is silent.
     // Falling back to the CPU k-means keeps the answer correct; only the
     // acceleration is lost.
+    if verbosity.normal_verbosity() {
+        println!(
+            "Training k-means on the GPU ({} centroids) ...",
+            n_centroids.separate_with_underscores()
+        );
+    }
+
     if !atomic_u32_add_supported(client) {
-        if verbose {
-            println!("  Device has no u32 atomics; running k-means on the CPU instead.");
+        if verbosity.detailed_verbosity() {
+            println!(" Device has no u32 atomics, running k-means on the CPU instead");
         }
-        return kmeans_cpu_fallback(data, dim, n, n_centroids, metric, &params, seed, verbose);
+        let out = kmeans_cpu_fallback(data, dim, n, n_centroids, metric, &params, seed);
+        if verbosity.normal_verbosity() {
+            println!("... trained k-means in {:.2?}", start.elapsed());
+        }
+        return out;
     }
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
@@ -2303,10 +2299,6 @@ where
     } else {
         KMeansInit::KMeansParallel
     });
-
-    if verbose {
-        println!("  Moving data to GPU.");
-    }
 
     // Norms are needed by the cosine assignment kernel and by the k-means||
     // initialisation, so compute them once. They depend only on the data, so
@@ -2325,9 +2317,9 @@ where
         GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?
     };
 
-    if verbose {
+    if verbosity.detailed_verbosity() {
         println!(
-            "  Running Lloyd's iterations (GPU, {}, {})",
+            " Running Lloyd's iterations ({}, {})",
             if params.fixed {
                 "fixed"
             } else {
@@ -2351,8 +2343,11 @@ where
             .collect();
         let data_gpu = GpuTensor::<half::f16>::from_slice(&data_f16, vec![n, dim_padded], client)?;
 
-        if verbose {
-            println!("  ... moved data to GPU (fp16): {:.2?}", start.elapsed());
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Uploaded data to the GPU (fp16) in {:.2?}",
+                start.elapsed()
+            );
         }
 
         init_and_run::<half::f16, T>(
@@ -2368,13 +2363,13 @@ where
             &params,
             init_method,
             seed,
-            verbose,
+            verbosity,
         )?
     } else {
         let data_gpu = GpuTensor::<T>::from_slice(&data_padded, vec![n, dim_padded], client)?;
 
-        if verbose {
-            println!("  ... moved data to GPU: {:.2?}", start.elapsed());
+        if verbosity.detailed_verbosity() {
+            println!(" Uploaded data to the GPU in {:.2?}", start.elapsed());
         }
 
         init_and_run::<T, T>(
@@ -2390,7 +2385,7 @@ where
             &params,
             init_method,
             seed,
-            verbose,
+            verbosity,
         )?
     };
 
@@ -2403,11 +2398,8 @@ where
         final_cents
     };
 
-    if verbose {
-        println!(
-            "Finished GPU-accelerated k-means in {:.2?}.",
-            start.elapsed()
-        );
+    if verbosity.normal_verbosity() {
+        println!("... trained k-means in {:.2?}", start.elapsed());
     }
 
     Ok((centroids, assignments))
@@ -2430,7 +2422,8 @@ where
 /// * `params` - Optional [`KMeansGpuParams`]
 /// * `seed` - Seed for reproducible initialisation
 /// * `client` - CubeCL compute client, borrowed for the call
-/// * `verbose` - Controls verbosity
+/// * `verbosity` - `Normal` prints start and end, `Detailed` adds the upload,
+///   initialisation and per-iteration lines
 ///
 /// ### Returns
 ///
@@ -2445,7 +2438,7 @@ pub fn train_centroids_gpu<T>(
     params: Option<KMeansGpuParams>,
     seed: usize,
     client: &Client,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> Result<Vec<T>, AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
@@ -2459,7 +2452,7 @@ where
         params,
         seed,
         client,
-        verbose,
+        verbosity,
     )
     .map(|(centroids, _)| centroids)
 }
@@ -2498,7 +2491,7 @@ pub fn assign_all_gpu<T>(
     n_centroids: usize,
     metric: &Dist,
     client: &Client,
-) -> Result<Vec<usize>, AnnSearchErrors>
+) -> Result<Vec<u32>, AnnSearchErrors>
 where
     T: cubecl::prelude::Float + cubecl::CubeElement + num_traits::Float + Sum + AnnSearchFloat,
 {
@@ -2555,8 +2548,7 @@ where
         metric,
     )?;
 
-    let raw = assign_gpu.read(client)?;
-    Ok(raw.into_iter().map(|c| c as usize).collect())
+    Ok(assign_gpu.read(client)?)
 }
 
 ///////////
@@ -2601,13 +2593,13 @@ mod entry_point_tests {
             Some(params),
             42,
             &client,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
         assert_eq!(centroids.len(), k * dim);
         assert_eq!(assignments.len(), n);
-        assert!(assignments.iter().all(|&c| c < k));
+        assert!(assignments.iter().all(|&c| (c as usize) < k));
     }
 
     #[test]
@@ -2633,7 +2625,7 @@ mod entry_point_tests {
             Some(params),
             42,
             &client,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -2668,7 +2660,7 @@ mod entry_point_tests {
             Some(params),
             42,
             &client,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -2933,7 +2925,7 @@ mod tests {
 
     fn cpu_centroid_means(
         data: &[f32],
-        assignments: &[usize],
+        assignments: &[u32],
         init: &[f32],
         n: usize,
         k: usize,
@@ -2942,7 +2934,7 @@ mod tests {
         let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0usize; k];
         for i in 0..n {
-            let c = assignments[i];
+            let c = assignments[i] as usize;
             counts[c] += 1;
             for j in 0..dim {
                 sums[c * dim + j] += data[i * dim + j];
@@ -3044,21 +3036,19 @@ mod tests {
         let idx = all_indices.read(&client).unwrap();
         let off = offsets.read(&client).unwrap();
 
-        let (cpu_idx, cpu_off) = crate::utils::k_means_utils::build_csr_layout(
-            assignments.iter().map(|&c| c as usize).collect(),
-            n,
-            k,
-        );
+        let (cpu_idx, cpu_off) =
+            crate::utils::k_means_utils::build_csr_layout(assignments.clone(), n, k);
 
-        assert_eq!(off.iter().map(|&o| o as usize).collect::<Vec<_>>(), cpu_off);
+        assert_eq!(off, cpu_off);
 
         for c in 0..k {
             let s = off[c] as usize;
             let e = off[c + 1] as usize;
             let got: std::collections::HashSet<u32> = idx[s..e].iter().copied().collect();
-            let want: std::collections::HashSet<u32> = cpu_idx[cpu_off[c]..cpu_off[c + 1]]
+            let want: std::collections::HashSet<u32> = cpu_idx
+                [cpu_off[c] as usize..cpu_off[c + 1] as usize]
                 .iter()
-                .map(|&i| i as u32)
+                .copied()
                 .collect();
             assert_eq!(got, want, "cluster {} membership mismatch", c);
         }
@@ -3076,14 +3066,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3145,14 +3128,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3182,14 +3158,7 @@ mod tests {
         let init = vec![-1.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert!(
@@ -3220,7 +3189,7 @@ mod tests {
             Some(params),
             42,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -3247,14 +3216,7 @@ mod tests {
         let init = vec![-5.0f32; k * dim];
 
         let got = run_update(&data, &assignments, &init, n, k, dim, &device);
-        let want = cpu_centroid_means(
-            &data,
-            &assignments.iter().map(|&c| c as usize).collect::<Vec<_>>(),
-            &init,
-            n,
-            k,
-            dim,
-        );
+        let want = cpu_centroid_means(&data, &assignments, &init, n, k, dim);
 
         for j in 0..k * dim {
             assert_relative_eq!(got[j], want[j], max_relative = 1e-4);
@@ -3292,16 +3254,16 @@ mod tests {
             Some(params),
             7,
             device.clone().into(),
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
         // Every blob must land wholly inside one cluster, and no two blobs
         // may share one.
-        let mut blob_to_cluster = vec![usize::MAX; n_blobs];
+        let mut blob_to_cluster = vec![u32::MAX; n_blobs];
         for (point, &cluster) in assignments.iter().enumerate() {
             let blob = point / per_blob;
-            if blob_to_cluster[blob] == usize::MAX {
+            if blob_to_cluster[blob] == u32::MAX {
                 blob_to_cluster[blob] = cluster;
             }
             assert_eq!(
@@ -3310,7 +3272,7 @@ mod tests {
                 blob
             );
         }
-        let distinct: std::collections::HashSet<usize> = blob_to_cluster.iter().copied().collect();
+        let distinct: std::collections::HashSet<u32> = blob_to_cluster.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             n_blobs,
@@ -3337,7 +3299,7 @@ mod tests {
                 Some(params),
                 99,
                 device.clone().into(),
-                false,
+                Verbosity::Quiet,
             )
             .unwrap()
             .1
@@ -3394,12 +3356,12 @@ mod tests {
                 Some(params),
                 7,
                 device.clone().into(),
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
             let mut counts = vec![0usize; k];
             for &a in &assignments {
-                counts[a] += 1;
+                counts[a as usize] += 1;
             }
             *counts.iter().max().unwrap()
         };

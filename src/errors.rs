@@ -35,6 +35,15 @@ pub enum AnnSearchErrors {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// Dataset is too large for the `u32` point ids the index stores.
+    #[error("{n} samples exceed the {max} this index can address with u32 ids.")]
+    TooManySamples {
+        /// Number of samples given
+        n: usize,
+        /// Largest supported sample count
+        max: usize,
+    },
+
     // -- lsh errors --
     /// Requested hash width exceeds what a directly addressed bucket table can
     /// hold.
@@ -169,14 +178,14 @@ pub enum AnnSearchErrors {
         actual: usize,
     },
 
-    /// Size mismatch error for locally stored files
+    /// A store file exists but cannot be used
     #[cfg(feature = "binary")]
-    #[error("Size mismatch: expected {expected} bytes, got {actual} bytes.")]
-    SizeMismatch {
-        /// Expected size of the file
-        expected: usize,
-        /// Actual size of the file
-        actual: usize,
+    #[error("Unusable vector store file '{path}': {reason}.")]
+    StoreInvalid {
+        /// The store file
+        path: String,
+        /// What is wrong with it
+        reason: String,
     },
 
     /// A store file could not be opened

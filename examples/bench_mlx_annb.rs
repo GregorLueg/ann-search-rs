@@ -143,21 +143,26 @@ fn main() {
 
     // Exhaustive
     let t = Instant::now();
-    let ex_g = build_exhaustive_index_gpu::<f32>((&train[..], n, dim), metric, dev.clone().into())
-        .unwrap();
+    let ex_g = build_exhaustive_index_gpu::<f32>(
+        (&train[..], n, dim),
+        metric,
+        dev.clone().into(),
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_exhaustive_index_gpu((&test[..], nq, dim), &ex_g, k, false, false)
+        query_exhaustive_index_gpu((&test[..], nq, dim), &ex_g, k, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
     row("exhaustive wgpu", b, &q, &truth, cols, k);
     drop(ex_g);
     let t = Instant::now();
-    let ex_m = build_exhaustive_index_mlx((&train[..], n, dim), metric).unwrap();
+    let ex_m = build_exhaustive_index_mlx((&train[..], n, dim), metric, Verbosity::Quiet).unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_exhaustive_index_mlx((&test[..], nq, dim), &ex_m, k, false, false)
+        query_exhaustive_index_mlx((&test[..], nq, dim), &ex_m, k, false, Verbosity::Quiet)
             .unwrap()
             .0
     });
@@ -172,25 +177,49 @@ fn main() {
         None,
         metric,
         42,
-        false,
+        Verbosity::Quiet,
         dev.clone().into(),
     )
     .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_ivf_index_gpu((&test[..], nq, dim), &ivf_g, k, None, None, false, false)
-            .unwrap()
-            .0
+        query_ivf_index_gpu(
+            (&test[..], nq, dim),
+            &ivf_g,
+            k,
+            None,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     row("ivf wgpu", b, &q, &truth, cols, k);
     drop(ivf_g);
     let t = Instant::now();
-    let ivf_m = build_ivf_index_mlx((&train[..], n, dim), None, None, metric, 42, false).unwrap();
+    let ivf_m = build_ivf_index_mlx(
+        (&train[..], n, dim),
+        None,
+        None,
+        metric,
+        42,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_ivf_index_mlx((&test[..], nq, dim), &ivf_m, k, None, None, false, false)
-            .unwrap()
-            .0
+        query_ivf_index_mlx(
+            (&test[..], nq, dim),
+            &ivf_m,
+            k,
+            None,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     row("ivf mlx", b, &q, &truth, cols, k);
     drop(ivf_m);
@@ -208,16 +237,23 @@ fn main() {
         None,
         None,
         42,
-        false,
+        Verbosity::Quiet,
         true,
         dev.clone().into(),
     )
     .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_nndescent_index_gpu((&test[..], nq, dim), &mut nnd_g, k, None, false, false)
-            .unwrap()
-            .0
+        query_nndescent_index_gpu(
+            (&test[..], nq, dim),
+            &mut nnd_g,
+            k,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     row("cagra wgpu", b, &q, &truth, cols, k);
     drop(nnd_g);
@@ -233,14 +269,21 @@ fn main() {
         None,
         None,
         42,
-        false,
+        Verbosity::Quiet,
     )
     .unwrap();
     let b = t.elapsed().as_secs_f64() * 1e3;
     let q = time_query(|| {
-        query_nndescent_index_mlx((&test[..], nq, dim), &nnd_m, k, None, false, false)
-            .unwrap()
-            .0
+        query_nndescent_index_mlx(
+            (&test[..], nq, dim),
+            &nnd_m,
+            k,
+            None,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap()
+        .0
     });
     row("cagra mlx", b, &q, &truth, cols, k);
 }

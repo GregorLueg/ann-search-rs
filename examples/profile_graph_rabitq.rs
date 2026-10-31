@@ -19,6 +19,7 @@ use ann_search_rs::binary::qg::QgIndex;
 use ann_search_rs::binary::rabitq::codec::HnswRaBitQIndex;
 use ann_search_rs::prelude::Dist;
 use ann_search_rs::quantised::hnsw_quantised::index::HnswSq8uIndex;
+use ann_search_rs::Verbosity;
 use ann_search_rs::{
     build_exhaustive_index, build_qg_index, build_vamana_index, query_exhaustive_index,
     query_qg_index,
@@ -299,6 +300,7 @@ impl GraphIndex {
                     cli.alpha_pass2,
                     &cli.distance,
                     cli.seed as usize,
+                    Verbosity::Quiet,
                 )
                 .expect("qg build failed"),
             )),
@@ -312,7 +314,7 @@ impl GraphIndex {
                     cli.nlist,
                     None,
                     cli.seed as usize,
-                    false,
+                    Verbosity::Quiet,
                 )
                 .expect("hnsw-rabitq build failed"),
             )),
@@ -324,7 +326,7 @@ impl GraphIndex {
                     &metric,
                     cli.seed as usize,
                     None,
-                    false,
+                    Verbosity::Quiet,
                 )
                 .expect("hnsw-sq8 build failed"),
             )),
@@ -369,8 +371,9 @@ impl GraphIndex {
     ) -> Vec<Vec<usize>> {
         match self {
             Self::Qg(i) => {
-                let (res, _) = query_qg_index((queries, n_probes, dim), i, k, ef, false, false)
-                    .expect("query failed");
+                let (res, _) =
+                    query_qg_index((queries, n_probes, dim), i, k, ef, false, Verbosity::Quiet)
+                        .expect("query failed");
                 res
             }
             // The quantised indices answer one row at a time, so the fan-out
@@ -408,13 +411,13 @@ fn probe_set(flat: &[f32], n: usize, dim: usize, cli: &Cli) -> (Vec<f32>, usize,
         queries.extend_from_slice(&flat[i * dim..(i + 1) * dim]);
     }
 
-    let exhaustive = build_exhaustive_index((flat, n, dim), &cli.distance);
+    let exhaustive = build_exhaustive_index((flat, n, dim), &cli.distance, Verbosity::Quiet);
     let (truth, _) = query_exhaustive_index(
         (&queries[..], probes.len(), dim),
         &exhaustive,
         cli.k,
         false,
-        false,
+        Verbosity::Quiet,
     )
     .expect("exhaustive query failed");
 
@@ -469,7 +472,9 @@ fn main() {
                     cli.alpha_pass2,
                     &cli.distance,
                     cli.seed as usize,
-                );
+                    Verbosity::Quiet,
+                )
+                .unwrap();
                 println!(
                     "degree {}, l_build {} (built in {:.2?})",
                     degree,

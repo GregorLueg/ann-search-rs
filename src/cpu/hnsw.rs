@@ -10,6 +10,7 @@ use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::graph_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ////////////
@@ -31,7 +32,7 @@ const PARALLEL_BUCKET_THRESHOLD: usize = 100;
 /////////////
 
 /// Type alias for the Neighbour updates
-pub type NeighbourUpdates<T> = Vec<(usize, Vec<(OrderedFloat<T>, usize)>)>;
+pub type NeighbourUpdates<T> = Vec<(u32, Vec<(OrderedFloat<T>, u32)>)>;
 
 impl<T: Ord> Default for SortedBuffer<T> {
     fn default() -> Self {
@@ -147,7 +148,7 @@ where
     /// Size of dynamic candidate list during construction
     ef_construction: usize,
     /// Original indices - for trait purposes
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -207,7 +208,8 @@ where
     /// * `ef_construction` - Size of dynamic candidate list during construction
     /// * `metric` - The distance metric, see [Dist].
     /// * `seed` - Random seed for layer assignment
-    /// * `verbose` - Whether to print progress information
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   per-layer insertion
     ///
     /// ### Returns
     ///
@@ -218,19 +220,10 @@ where
         ef_construction: usize,
         metric: &Dist,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Self {
+        let log = BuildLog::new("HNSW index", verbosity);
         let (vectors_flat, n, dim) = data.into_row_major();
-
-        if verbose {
-            println!(
-                "Building HNSW index with {} nodes, M = {}",
-                n.separate_with_underscores(),
-                m
-            );
-        }
-
-        let start_total = Instant::now();
 
         let norms = if *metric == Dist::Cosine {
             (0..n)
@@ -281,19 +274,17 @@ where
             max_layer,
             m,
             ef_construction,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
         // Build the graph layer by layer, from TOP to BOTTOM
-        index.build_graph(&construction_graph, seed, verbose);
+        index.build_graph(&construction_graph, seed, verbosity);
 
         let (neighbours_flat, neighbour_offsets, _) = construction_graph.into_flat();
         index.neighbours_flat = neighbours_flat;
         index.neighbour_offsets = neighbour_offsets;
 
-        if verbose {
-            println!("Total HNSW build time: {:.2?}", start_total.elapsed());
-        }
+        log.finish();
 
         index
     }
@@ -312,26 +303,27 @@ where
     ///
     /// * `graph` - Construction graph to populate
     /// * `seed` - Random seed for the within-bucket permutation
-    /// * `verbose` - Whether to print progress
-    fn build_graph(&self, graph: &ConstructionGraph<T>, seed: usize, verbose: bool) {
+    /// * `verbosity` - Prints one line per layer at `Detailed`
+    fn build_graph(&self, graph: &ConstructionGraph<T>, seed: usize, verbosity: Verbosity) {
         // The entry point acquires its edges through reverse links only: it is
         // the first node any insertion descends to, so inserting it against an
         // empty graph would be a no-op.
         let ep = self.entry_point as usize;
 
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.max_layer as usize + 1];
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.max_layer as usize + 1];
         for node in (0..self.n).filter(|&id| id != ep) {
-            buckets[self.layer_assignments[node] as usize].push(node);
+            buckets[self.layer_assignments[node] as usize].push(node as u32);
         }
 
-        if verbose {
+        if verbosity.detailed_verbosity() {
             println!(
-                "Inserting {} nodes incrementally",
-                self.n.separate_with_underscores()
+                " {} nodes, M = {}, max layer {}",
+                self.n.separate_with_underscores(),
+                self.m,
+                self.max_layer
             );
         }
 
-        let start = Instant::now();
         let mut rng = SmallRng::seed_from_u64(seed as u64);
 
         for layer in (0..=self.max_layer as usize).rev() {
@@ -341,10 +333,10 @@ where
             let bucket_start = Instant::now();
             let parallel = bucket.len() > PARALLEL_BUCKET_THRESHOLD;
 
-            let insert = |node: usize| {
+            let insert = |node: u32| {
                 Self::with_build_state(|state_cell| {
                     let mut state = state_cell.borrow_mut();
-                    self.insert_node(node, graph, &mut state);
+                    self.insert_node(node as usize, graph, &mut state);
                 });
             };
 
@@ -354,19 +346,15 @@ where
                 bucket.iter().for_each(|&node| insert(node));
             }
 
-            if verbose {
+            if verbosity.detailed_verbosity() {
                 println!(
-                    "  Layer {}: {} nodes ({}) in {:.2?}",
+                    " Layer {}: {} nodes ({}) in {:.2?}",
                     layer,
                     bucket.len().separate_with_underscores(),
                     if parallel { "parallel" } else { "sequential" },
                     bucket_start.elapsed()
                 );
             }
-        }
-
-        if verbose {
-            println!("  Total build in {:.2?}", start.elapsed());
         }
     }
 
@@ -956,7 +944,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `ef_search` - Search budget
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Whether to print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -967,14 +955,9 @@ where
         k: usize,
         ef_search: usize,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("HNSW index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -983,20 +966,12 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, ef_search)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
     }
@@ -1071,7 +1046,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1116,20 +1091,33 @@ mod tests {
     #[test]
     fn test_hnsw_build_euclidean() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let _ = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
     }
 
     #[test]
     fn test_hnsw_build_cosine() {
         let mat = create_simple_matrix();
-        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
+        let _ = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, Verbosity::Quiet);
     }
 
     #[test]
     fn test_hnsw_query_finds_self() {
         let mat = create_simple_matrix();
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 1, 50).unwrap();
@@ -1142,8 +1130,14 @@ mod tests {
     #[test]
     fn test_hnsw_query_euclidean() {
         let mat = create_simple_matrix();
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, 50).unwrap();
@@ -1159,7 +1153,8 @@ mod tests {
     #[test]
     fn test_hnsw_query_cosine() {
         let mat = create_simple_matrix();
-        let index = HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, false);
+        let index =
+            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::Cosine, 42, Verbosity::Quiet);
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, 50).unwrap();
@@ -1175,8 +1170,14 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            200,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, 50).unwrap();
@@ -1193,7 +1194,7 @@ mod tests {
             100,
             &Dist::SquaredEuclidean,
             42,
-            false,
+            Verbosity::Quiet,
         ));
 
         let mut handles = vec![];
@@ -1216,10 +1217,22 @@ mod tests {
     fn test_hnsw_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
-        let index2 =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 100, &Dist::SquaredEuclidean, 42, false);
+        let index1 = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
+        let index2 = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, 50).unwrap();
@@ -1242,8 +1255,14 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), 16, 200, &Dist::SquaredEuclidean, 42, false);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            16,
+            200,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let query = vec![0.0, 0.0, 0.0];
         let (indices, _) = index.query(&query, 5, 100).unwrap();
@@ -1267,8 +1286,14 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.01).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), 8, 100, &Dist::SquaredEuclidean, 42, true);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            8,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Normal,
+        );
 
         let mut layer_counts = vec![0usize; (index.max_layer + 1) as usize];
         for &level in &index.layer_assignments {
@@ -1302,8 +1327,14 @@ mod tests {
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
         for m in [8, 12, 16, 20] {
-            let index =
-                HnswIndex::<f32>::build(mat.as_ref(), m, 200, &Dist::SquaredEuclidean, 42, false);
+            let index = HnswIndex::<f32>::build(
+                mat.as_ref(),
+                m,
+                200,
+                &Dist::SquaredEuclidean,
+                42,
+                Verbosity::Quiet,
+            );
 
             let query: Vec<f32> = (0..dim).map(|_| 0.5).collect();
             let (indices, _) = index.query(&query, 10, 50).unwrap();
@@ -1323,8 +1354,14 @@ mod tests {
             .collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index =
-            HnswIndex::<f32>::build(mat.as_ref(), m, 100, &Dist::SquaredEuclidean, 42, false);
+        let index = HnswIndex::<f32>::build(
+            mat.as_ref(),
+            m,
+            100,
+            &Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         let degrees: Vec<usize> = (0..n)
             .map(|node| {
@@ -1349,10 +1386,22 @@ mod tests {
         let mat32 = Mat::<f32>::from_fn(n, dim, |i, j| ((i + j) as f32) * 0.01);
         let mat64 = Mat::<f64>::from_fn(n, dim, |i, j| ((i + j) as f64) * 0.01);
 
-        let index32 =
-            HnswIndex::<f32>::build(mat32.as_ref(), 16, 50, &Dist::SquaredEuclidean, 7, false);
-        let index64 =
-            HnswIndex::<f64>::build(mat64.as_ref(), 16, 50, &Dist::SquaredEuclidean, 7, false);
+        let index32 = HnswIndex::<f32>::build(
+            mat32.as_ref(),
+            16,
+            50,
+            &Dist::SquaredEuclidean,
+            7,
+            Verbosity::Quiet,
+        );
+        let index64 = HnswIndex::<f64>::build(
+            mat64.as_ref(),
+            16,
+            50,
+            &Dist::SquaredEuclidean,
+            7,
+            Verbosity::Quiet,
+        );
 
         assert_eq!(index32.layer_assignments, index64.layer_assignments);
     }

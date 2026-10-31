@@ -6,14 +6,13 @@ use faer::RowRef;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::ops::AddAssign;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use thousands::*;
 
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 ////////////////
 // Main index //
@@ -42,15 +41,15 @@ pub struct IvfOpqIndex<T> {
     /// Norms of the centroids - not relevant for this index.
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (CSR format)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets for each inverted list
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Product quantiser with M codebooks
     codebook: OptimisedProductQuantiser<T>,
     /// Number of k-means clusters
     nlist: usize,
     /// /// Original indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 //////////////////////
@@ -174,7 +173,7 @@ where
     /// * `n_opq_centroids` - Number of centroids to use for the product
     ///   quantisation. If not provided, it uses the default `256`.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -189,8 +188,9 @@ where
         opq_iter: Option<usize>,
         n_opq_centroids: Option<usize>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-OPQ index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -201,9 +201,6 @@ where
 
         // normalise for cosine distance
         if metric == Dist::Cosine {
-            if verbose {
-                println!("  Normalising vectors for cosine distance");
-            }
             vectors_flat
                 .par_chunks_mut(dim)
                 .for_each(|chunk| normalise_vector(chunk));
@@ -213,11 +210,8 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!("  Generating IVF-OPQ index with {} Voronoi cells.", nlist);
-        }
-
         // 2. train IVF centroids
+        let start = Instant::now();
         let mut centroids = train_centroids(
             &training_data,
             dim,
@@ -226,23 +220,25 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // normalise centroids for cosine
         if metric == Dist::Cosine {
-            if verbose {
-                println!("  Normalising centroids");
-            }
             centroids
                 .par_chunks_mut(dim)
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
         // 3. compute residuals for training data
-        if verbose {
-            println!("  Computing residuals for OPQ training");
-        }
         let training_norms = vec![T::one(); n_train];
         let centroid_norms = vec![T::one(); nlist];
         let training_assignments = assign_all_parallel(
@@ -262,15 +258,13 @@ where
         for (vec_idx, &cluster_id) in training_assignments.iter().enumerate() {
             let vec_start = vec_idx * dim;
             let vec = &training_data[vec_start..vec_start + dim];
-            let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
             let residuals = T::subtract_simd(vec, centroid);
             training_residuals.extend_from_slice(&residuals);
         }
 
         // 4. train OPQ on residuals
-        if verbose {
-            println!("  Training optimised product quantiser with m={}", m);
-        }
+        let start = Instant::now();
         let codebook = OptimisedProductQuantiser::train(
             &training_residuals,
             dim,
@@ -279,8 +273,15 @@ where
             opq_iter,
             30,
             seed + 1000,
-            verbose,
+            verbosity,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained optimised product quantiser (m = {}) in {:.2?}",
+                m,
+                start.elapsed()
+            );
+        }
 
         // 5. assign all vectors to IVF clusters
         let data_norms = vec![T::one(); n];
@@ -298,8 +299,8 @@ where
         let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 6. encode all vectors with product quantiser
-        if verbose {
-            println!("  Encoding residuals");
+        if verbosity.detailed_verbosity() {
+            println!(" Encoding residuals ...");
         }
         let mut quantised_codes = vec![0u8; n * m];
 
@@ -311,16 +312,13 @@ where
                 let vec_start = vec_idx * dim;
                 let vec = &vectors_flat[vec_start..vec_start + dim];
 
-                let centroid = &centroids[cluster_id * dim..(cluster_id + 1) * dim];
+                let centroid =
+                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
                 let residual = T::subtract_simd(vec, centroid);
 
                 let codes = codebook.encode(&residual);
                 chunk.copy_from_slice(&codes);
             });
-
-        if verbose {
-            println!("  (Optimised) Quantisation complete");
-        }
 
         // Pre-rotate once at build so the query path never pays `dim^2` per
         // probed cell.
@@ -346,6 +344,8 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -409,8 +409,8 @@ where
             let residual_rot = T::subtract_simd(&query_rotated, centroid_rot);
             let lookup_tables = self.build_lookup_tables_direct(&residual_rot);
 
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
 
             let mut worst_dist = if heap.len() >= k {
                 heap.peek().unwrap().0 .0
@@ -443,7 +443,7 @@ where
 
         let (distances, indices) = results
             .into_iter()
-            .map(|(d, i)| (d.0, self.original_ids[i]))
+            .map(|(d, i)| (d.0, self.original_ids[i] as usize))
             .unzip();
 
         Ok((indices, distances))
@@ -487,7 +487,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -498,15 +498,15 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-OPQ index", self.n, true, verbosity);
 
         let mut cluster_assignments = vec![0usize; self.n];
         for cluster_idx in 0..self.nlist {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
             for new_idx in start..end {
                 cluster_assignments[new_idx] = cluster_idx;
             }
@@ -523,23 +523,15 @@ where
                 let residual = self.codebook.decode(codes);
                 let reconstructed: Vec<T> = T::add_simd(my_centroid, &residual);
 
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(&reconstructed, k, nprobe)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -570,8 +562,8 @@ where
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_rotated.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.codebook.memory_usage_bytes()
     }
 
@@ -581,22 +573,19 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let m = self.codebook.m();
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
-            for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
+            new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
         let mut new_codes = Vec::with_capacity(self.quantised_codes.len());
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * m;
             new_codes.extend_from_slice(&self.quantised_codes[start..start + m]);
         }
@@ -666,7 +655,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -691,7 +680,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -710,7 +699,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -733,7 +722,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -755,7 +744,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -779,7 +768,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -802,7 +791,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -829,7 +818,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -852,7 +841,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -877,7 +866,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -903,7 +892,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -924,7 +913,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -950,7 +939,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -979,7 +968,7 @@ mod tests {
             Some(2),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -999,7 +988,7 @@ mod tests {
             Some(1),
             Some(4),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

@@ -4,6 +4,7 @@
 //! get ground truth for a dataset too large to score on the CPU.
 
 use ann_search_rs::gpu::exhaustive_gpu::ExhaustiveIndexGpu;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{
     build_exhaustive_index_gpu, query_exhaustive_index_gpu, query_exhaustive_index_gpu_self,
 };
@@ -19,19 +20,31 @@ gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
     ///
     /// * `x` - Samples by features, C-contiguous float32.
     /// * `metric` - Already validated by the Python layer.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle, or a build error.
     #[staticmethod]
-    #[pyo3(signature = (x, *, metric))]
-    fn build(py: Python<'_>, x: &Bound<'_, PyAny>, metric: String) -> PyResult<Self> {
+    #[pyo3(signature = (x, *, metric, verbose = 0))]
+    fn build(
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        metric: String,
+        verbose: usize,
+    ) -> PyResult<Self> {
         let a = f32_array!(x);
         let (data, n, dim) = crate::convert::flat(&a)?;
         let inner = py
             .detach(|| {
                 crate::pool::run(|| {
-                    build_exhaustive_index_gpu::<f32>((data, n, dim), &metric, default_device())
+                    build_exhaustive_index_gpu::<f32>(
+                        (data, n, dim),
+                        &metric,
+                        default_device(),
+                        parse_annsearch_verbosity(verbose),
+                    )
                 })
             })
             .map_err(crate::error::AnnErr)?;
@@ -45,19 +58,20 @@ gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
     /// * `q` - Queries by features, C-contiguous float32.
     /// * `k` - Neighbours per query.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout, not `sys.stdout`.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`, dense and padded. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         q: &Bound<'py, PyAny>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let a = f32_array!(q);
         let (data, n, dim) = crate::convert::flat(&a)?;
@@ -65,7 +79,13 @@ gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
         let (ids, dists) = py
             .detach(|| {
                 crate::pool::run(|| {
-                    query_exhaustive_index_gpu((data, n, dim), idx, k, return_distance, verbose)
+                    query_exhaustive_index_gpu(
+                        (data, n, dim),
+                        idx,
+                        k,
+                        return_distance,
+                        parse_annsearch_verbosity(verbose),
+                    )
                 })
             })
             .map_err(crate::error::AnnErr)?;
@@ -78,24 +98,30 @@ gpu_handle!(PyExhaustiveGpu, ExhaustiveIndexGpu, "ExhaustiveGpu", {
     ///
     /// * `k` - Neighbours per point.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         let idx = &self.inner;
         let (ids, dists) = py
             .detach(|| {
                 crate::pool::run(|| {
-                    query_exhaustive_index_gpu_self(idx, k, return_distance, verbose)
+                    query_exhaustive_index_gpu_self(
+                        idx,
+                        k,
+                        return_distance,
+                        parse_annsearch_verbosity(verbose),
+                    )
                 })
             })
             .map_err(crate::error::AnnErr)?;

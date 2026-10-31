@@ -123,7 +123,7 @@ fn train_gpu(
         Some(params),
         cli.seed as usize,
         &client,
-        true,
+        Verbosity::Normal,
     )
     .expect("train_centroids_gpu failed")
 }
@@ -229,6 +229,7 @@ fn wcss(data: &[f32], n: usize, dim: usize, centroids: &[f32], k: usize) -> f64 
     data.chunks_exact(dim)
         .zip(&assign)
         .map(|(v, &c)| {
+            let c = c as usize;
             let c = &centroids[c * dim..(c + 1) * dim];
             v.iter()
                 .zip(c)
@@ -284,7 +285,7 @@ fn main() {
                 &metric,
                 Some(params),
                 cli.seed as usize,
-                true,
+                Verbosity::Normal,
             )
             .expect("train_centroids failed")
         };

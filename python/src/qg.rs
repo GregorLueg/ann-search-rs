@@ -5,6 +5,7 @@
 //! distances the walk anchors on, so this is a speed structure, not a small one.
 
 use ann_search_rs::binary::qg::QgIndex;
+use ann_search_rs::parse_annsearch_verbosity;
 use ann_search_rs::{build_qg_index, query_qg_index, query_qg_self};
 use pyo3::prelude::*;
 
@@ -26,13 +27,15 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
     /// * `alpha_pass1` - Prune slack, first pass.
     /// * `alpha_pass2` - Prune slack, second pass.
     /// * `seed` - Fixes the graph and the rotation.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// The built handle, or an unsupported-metric or invalid-degree error.
     #[staticmethod]
     #[pyo3(signature = (
-        x, *, metric, degree, l_build, alpha_pass1, alpha_pass2, seed = 42
+        x, *, metric, degree, l_build, alpha_pass1, alpha_pass2, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -44,6 +47,7 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
         alpha_pass1: f32,
         alpha_pass2: f32,
         seed: usize,
+        verbose: usize,
     ) -> PyResult<Self> {
         build_dispatch!(py, x, QgInner, |data, n, dim| build_qg_index(
             (data, n, dim),
@@ -53,7 +57,8 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
             alpha_pass1,
             alpha_pass2,
             &metric,
-            seed
+            seed,
+            parse_annsearch_verbosity(verbose),
         ))
     }
 
@@ -65,12 +70,13 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
     /// * `k` - Neighbours per query.
     /// * `ef_search` - Beam width. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)`. Distances are exact. See [`QueryOut`].
-    #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = false))]
+    #[pyo3(signature = (q, k, *, ef_search, return_distance = true, verbose = 0))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -78,14 +84,28 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
         k: usize,
         ef_search: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             QgInner::F32(idx) => query_arm!(py, q, k, f32, "float32", |data, n, dim| {
-                query_qg_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_qg_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
             QgInner::F64(idx) => query_arm!(py, q, k, f64, "float64", |data, n, dim| {
-                query_qg_index((data, n, dim), idx, k, ef_search, return_distance, verbose)
+                query_qg_index(
+                    (data, n, dim),
+                    idx,
+                    k,
+                    ef_search,
+                    return_distance,
+                    parse_annsearch_verbosity(verbose),
+                )
             }),
         }
     }
@@ -97,19 +117,20 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
     /// * `k` - Neighbours per point.
     /// * `ef_search` - Beam width. Raise for recall.
     /// * `return_distance` - Skips the copy into numpy, not the computation.
-    /// * `verbose` - Progress to the process stdout.
+    /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
+    ///   stdout, not `sys.stdout`.
     ///
     /// ### Returns
     ///
     /// `(indices, distances)` for every indexed point. See [`QueryOut`].
-    #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = false))]
+    #[pyo3(signature = (k, *, ef_search, return_distance = true, verbose = 0))]
     fn query_self<'py>(
         &self,
         py: Python<'py>,
         k: usize,
         ef_search: usize,
         return_distance: bool,
-        verbose: bool,
+        verbose: usize,
     ) -> PyResult<QueryOut<'py>> {
         match &self.inner {
             QgInner::F32(idx) => {
@@ -118,7 +139,7 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
                     k,
                     ef_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
             QgInner::F64(idx) => {
@@ -127,7 +148,7 @@ ann_handle!(PyQg, QgInner, QgIndex, "Qg", method, {
                     k,
                     ef_search,
                     return_distance,
-                    verbose
+                    parse_annsearch_verbosity(verbose)
                 ))
             }
         }

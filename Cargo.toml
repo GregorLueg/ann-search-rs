@@ -1,6 +1,6 @@
 [package]
 name = "ann-search-rs"
-version = "0.11.2"
+version = "0.12.0"
 edition = "2021"
 # Exposes `DEP_MLXC_AVAILABLE` to dependants' build scripts, see build.rs.
 links = "mlxc"
@@ -31,7 +31,7 @@ codegen-units = 1
 [features]
 default = ["accelerate"]
 ## Enables binary index support with optional memory-mapped files for on-disk vector storage
-binary = ["memmap2", "bytemuck", "statrs"]
+binary = ["memmap2", "bytemuck", "statrs", "half"]
 ## Enables GPU-accelerated indices via the CubeCL backend
 gpu = ["cubecl", "cubecl-utils-rs", "half"]
 ## Enables GPU integration tests (requires 'wgpu' and a GPU on the machine). This is for CI/CD
@@ -209,6 +209,14 @@ required-features = ["binary"]
 
 [[example]]
 name = "gridsearch_rabitq"
+required-features = ["binary"]
+
+[[example]]
+name = "gridsearch_store_encoding"
+required-features = ["binary"]
+
+[[example]]
+name = "bench_store_kernels"
 required-features = ["binary"]
 
 [[example]]

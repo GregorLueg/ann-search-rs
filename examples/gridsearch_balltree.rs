@@ -26,15 +26,21 @@ fn main() {
     // Exhaustive query benchmark
     println!("Building exhaustive index...");
     let start = Instant::now();
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
     let index_size_mb = exhaustive_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("Querying exhaustive index...");
     let start = Instant::now();
-    let (true_neighbors, true_distances) =
-        query_exhaustive_index(query_data.as_ref(), &exhaustive_idx, cli.k, true, false).unwrap();
+    let (true_neighbors, true_distances) = query_exhaustive_index(
+        query_data.as_ref(),
+        &exhaustive_idx,
+        cli.k,
+        true,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -52,7 +58,7 @@ fn main() {
     println!("Self-querying exhaustive index...");
     let start = Instant::now();
     let (true_neighbors_self, true_distances_self) =
-        query_exhaustive_self(&exhaustive_idx, cli.k, true, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k, true, Verbosity::Quiet).unwrap();
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
     results.push(BenchmarkResultSize {
@@ -79,8 +85,13 @@ fn main() {
 
     println!("Building BallTree index...");
     let start = Instant::now();
-    let balltree_idx =
-        build_balltree_index(data.as_ref(), &cli.distance, cli.seed as usize).unwrap();
+    let balltree_idx = build_balltree_index(
+        data.as_ref(),
+        &cli.distance,
+        cli.seed as usize,
+        Verbosity::Quiet,
+    )
+    .unwrap();
     let index_size_mb = balltree_idx.memory_usage_bytes() as f64 / (1024.0 * 1024.0);
 
     let build_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -97,7 +108,7 @@ fn main() {
             cli.k,
             Some(search_budget),
             true,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let query_time = start.elapsed().as_secs_f64() * 1000.0;
@@ -128,7 +139,7 @@ fn main() {
 
     let start = Instant::now();
     let (approx_neighbours_self, approx_dist_self) =
-        query_balltree_self(&balltree_idx, cli.k, None, true, false).unwrap();
+        query_balltree_self(&balltree_idx, cli.k, None, true, Verbosity::Quiet).unwrap();
 
     let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 

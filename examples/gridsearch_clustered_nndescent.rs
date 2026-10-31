@@ -103,7 +103,7 @@ fn count_filled(graph: &KnnGraphGpu<f32>) -> usize {
     graph
         .knn_graph
         .iter()
-        .filter(|&&(pid, _)| pid != SENTINEL_PID)
+        .filter(|&&(pid, _)| pid as usize != SENTINEL_PID)
         .count()
 }
 
@@ -210,12 +210,12 @@ fn main() {
 
     // Ground truth: exhaustive self-kNN, self-matches stripped.
     println!("Building exhaustive index...");
-    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance);
+    let exhaustive_idx = build_exhaustive_index(data.as_ref(), &cli.distance, Verbosity::Quiet);
 
     println!("Self-querying exhaustive index (ground truth)...");
     let start = Instant::now();
     let (true_neighbors_self, _) =
-        query_exhaustive_self(&exhaustive_idx, cli.k + 1, false, false).unwrap();
+        query_exhaustive_self(&exhaustive_idx, cli.k + 1, false, Verbosity::Quiet).unwrap();
     println!(
         "Ground truth in {:.2} ms",
         start.elapsed().as_secs_f64() * 1000.0
@@ -240,7 +240,7 @@ fn main() {
         None,
         None,
         cli.seed as usize,
-        true,
+        Verbosity::Normal,
         device.clone().into(),
     )
     .unwrap();
@@ -290,7 +290,7 @@ fn main() {
             None,
             Some(cluster_params),
             cli.seed as usize,
-            true,
+            Verbosity::Normal,
             device.clone().into(),
         )
         .unwrap();

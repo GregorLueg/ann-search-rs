@@ -1,20 +1,24 @@
 //! Annoy implementation in ann-search-rs. This is an in-memory implementation
 //! of Annoy in Rust.
+//!
+//! The trees ([`AnnoyTrees`]) are kept apart from the vectors so NN-Descent
+//! can route queries through them without holding a second copy of the data.
+//! Each tree is built by partitioning one `u32` permutation in place, so its
+//! leaves are contiguous ranges of that permutation and the build makes no
+//! per-node allocations.
 
 use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::time::Instant;
 use thousands::*;
 
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::tree_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 
 ////////////
@@ -24,6 +28,9 @@ use crate::utils::*;
 /// Samples drawn by the angular two-means split, as in Spotify Annoy.
 const TWO_MEANS_STEPS: usize = 200;
 
+/// Random hyperplanes tried per node before it falls back to a leaf.
+const SPLIT_ATTEMPTS: usize = 10;
+
 /////////////
 // Helpers //
 /////////////
@@ -32,44 +39,603 @@ const TWO_MEANS_STEPS: usize = 200;
 ///
 /// Uses tagged union pattern: `n_descendants == 1` indicates leaf node,
 /// otherwise it's a split node.
-///
-/// ### Fields
-///
-/// * `n_descendants` - 1 for leaf, 2 for split node
-/// * `child_a` - For split: left child index; For leaf: start index in
-///   leaf_indices
-/// * `child_b` - For split: right child index; For leaf: count of items
-/// * `split_idx` - Index into split_data (only used for split nodes)
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
-struct FlatNode {
+pub(crate) struct FlatNode {
+    /// 1 for leaf, 2 for split node
     n_descendants: u32,
+    /// Split: left child index. Leaf: start within its tree's permutation
     child_a: u32,
+    /// Split: right child index. Leaf: number of items
     child_b: u32,
+    /// Split: index into `split_data`. Leaf: the tree it belongs to, so the
+    /// leaf start stays tree-local and `n_trees * n` never has to fit a `u32`
     split_idx: u32,
 }
 
-/// Build-time node representation
+impl FlatNode {
+    /// Tree-local `(start, len)` of a leaf, as [`AnnoyTrees::build_tree`]
+    /// returns it.
+    ///
+    /// ### Returns
+    ///
+    /// The range for a leaf, `None` for a split node.
+    pub(crate) fn leaf_range(&self) -> Option<(usize, usize)> {
+        (self.n_descendants == 1).then_some((self.child_a as usize, self.child_b as usize))
+    }
+}
+
+/// Per-tree build scratch, reused across every node of the tree.
+struct SplitScratch<T> {
+    /// Side of each item of the node under the candidate hyperplane
+    left: Vec<bool>,
+    /// Staging for the right-hand items during the stable partition
+    right: Vec<u32>,
+    /// Candidate hyperplane normal
+    hyperplane: Vec<T>,
+    /// First two-means centroid
+    p: Vec<T>,
+    /// Second two-means centroid
+    q: Vec<T>,
+}
+
+impl<T: AnnSearchFloat> SplitScratch<T> {
+    /// Allocate scratch for a tree over `n` points of dimension `dim`.
+    ///
+    /// ### Params
+    ///
+    /// * `n` - Number of points the tree partitions
+    /// * `dim` - Dimensionality of vectors
+    ///
+    /// ### Returns
+    ///
+    /// Scratch sized for the root node.
+    fn new(n: usize, dim: usize) -> Self {
+        Self {
+            left: Vec::with_capacity(n),
+            right: Vec::with_capacity(n),
+            hyperplane: Vec::with_capacity(dim),
+            p: vec![T::zero(); dim],
+            q: vec![T::zero(); dim],
+        }
+    }
+}
+
+/// One tree as built: its nodes with tree-local child indices and its packed
+/// hyperplanes. The leaves live in the permutation the tree partitioned.
+pub(crate) struct TreeParts<T> {
+    /// Nodes in pre-order, children indexed from the tree root
+    pub(crate) nodes: Vec<FlatNode>,
+    /// `dim + 1` values per split node: normal then offset
+    split_data: Vec<T>,
+}
+
+////////////////
+// AnnoyTrees //
+////////////////
+
+/// The random projection forest of an Annoy index, without the vectors.
 ///
-/// Temporary structure used during tree construction, later flattened into
-/// FlatNode format for better cache performance during queries.
+/// Tree `t` owns `leaf_indices[t * n..(t + 1) * n]`: every tree partitions all
+/// points, so its leaves are exactly one permutation of the ids.
 #[derive(Clone)]
-enum BuildNode<T> {
-    Split {
-        /// Hyperplane normal vector
-        hyperplane: Vec<T>,
-        /// Dot product threshold for split decision
-        offset: T,
-        /// Index of left child in build tree
-        left: usize,
-        /// Index of right child in build tree
-        right: usize,
-    },
-    Leaf {
-        /// Original data indices in this leaf
-        items: Vec<usize>,
-    },
+#[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) struct AnnoyTrees<T> {
+    /// Flattened tree structure containing all split and leaf nodes
+    nodes: Vec<FlatNode>,
+    /// Starting node of each tree in the forest
+    roots: Vec<u32>,
+    /// Hyperplane coefficients and offsets for split nodes
+    split_data: Vec<T>,
+    /// Point ids stored in the leaves, `n` per tree
+    leaf_indices: Vec<u32>,
+    /// Dimensionality of the vectors the trees split
+    dim: usize,
+    /// Number of points each tree partitions
+    n: usize,
+}
+
+impl<T> AnnoyTrees<T>
+where
+    T: AnnSearchFloat,
+{
+    /// Build the forest in parallel, one tree per task.
+    ///
+    /// Each tree partitions its own chunk of `leaf_indices` in place, so the
+    /// only allocations are that buffer and the per-tree nodes and hyperplanes.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data, row-major
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality of vectors
+    /// * `n_trees` - Number of trees to build
+    /// * `metric` - Euclidean or Cosine
+    /// * `seed` - Random seed for reproducibility
+    ///
+    /// ### Returns
+    ///
+    /// The forest, with ids in the order of `vectors_flat`.
+    pub(crate) fn build(
+        vectors_flat: &[T],
+        n: usize,
+        dim: usize,
+        n_trees: usize,
+        metric: Dist,
+        seed: usize,
+    ) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed as u64);
+        let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
+
+        let mut leaf_indices = vec![0u32; n_trees * n];
+        let parts: Vec<TreeParts<T>> = leaf_indices
+            .par_chunks_mut(n.max(1))
+            .zip(seeds.into_par_iter())
+            .map(|(perm, tree_seed)| Self::build_tree(vectors_flat, dim, metric, tree_seed, perm))
+            .collect();
+
+        let total_nodes: usize = parts.iter().map(|t| t.nodes.len()).sum();
+        let total_split: usize = parts.iter().map(|t| t.split_data.len()).sum();
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut split_data = Vec::with_capacity(total_split);
+        let mut roots = Vec::with_capacity(n_trees);
+
+        for (tree, part) in parts.into_iter().enumerate() {
+            let root_offset = nodes.len() as u32;
+            let split_offset = (split_data.len() / (dim + 1)) as u32;
+            roots.push(root_offset);
+            nodes.extend(part.nodes.into_iter().map(|mut node| {
+                if node.n_descendants == 1 {
+                    node.split_idx = tree as u32;
+                } else {
+                    node.child_a += root_offset;
+                    node.child_b += root_offset;
+                    node.split_idx += split_offset;
+                }
+                node
+            }));
+            split_data.extend(part.split_data);
+        }
+
+        Self {
+            nodes,
+            roots,
+            split_data,
+            leaf_indices,
+            dim,
+            n,
+        }
+    }
+
+    /// Build one tree by partitioning `perm` in place.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `metric` - Euclidean or Cosine
+    /// * `seed` - Seed for this tree
+    /// * `perm` - Length `n`, overwritten with the tree's leaf order
+    ///
+    /// ### Returns
+    ///
+    /// The tree's nodes and hyperplanes, indexed from its root.
+    pub(crate) fn build_tree(
+        vectors_flat: &[T],
+        dim: usize,
+        metric: Dist,
+        seed: u64,
+        perm: &mut [u32],
+    ) -> TreeParts<T> {
+        for (i, p) in perm.iter_mut().enumerate() {
+            *p = i as u32;
+        }
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut scratch = SplitScratch::new(perm.len(), dim);
+        let mut parts = TreeParts {
+            nodes: Vec::new(),
+            split_data: Vec::new(),
+        };
+        Self::build_node(
+            vectors_flat,
+            dim,
+            perm,
+            0,
+            &mut parts,
+            &mut scratch,
+            &mut rng,
+            metric,
+        );
+        parts
+    }
+
+    /// Angular split normal from two-means over the node's items
+    ///
+    /// Spotify Annoy's angular split. Starts from two unit-normalised seed
+    /// rows and moves each centroid towards the sampled items closer to it
+    /// in angle, for `TWO_MEANS_STEPS` samples. The normal is the difference
+    /// of the two unit centroids, so the plane passes through the origin. A
+    /// random pair alone splits on whichever two points were drawn; on hubby
+    /// cosine data such as word embeddings that leaves poor leaves.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - Ids in this node to sample from
+    /// * `seed_a` - First seed row, non-zero
+    /// * `seed_b` - Second seed row, non-zero
+    /// * `scratch` - Tree scratch; the normal is left in `scratch.hyperplane`
+    /// * `rng` - Random number generator for this tree
+    #[allow(clippy::too_many_arguments)]
+    fn angular_two_means(
+        vectors_flat: &[T],
+        dim: usize,
+        items: &[u32],
+        seed_a: &[T],
+        seed_b: &[T],
+        scratch: &mut SplitScratch<T>,
+        rng: &mut StdRng,
+    ) {
+        let SplitScratch {
+            hyperplane, p, q, ..
+        } = scratch;
+        let na = T::calculate_l2_norm(seed_a);
+        let nb = T::calculate_l2_norm(seed_b);
+        for k in 0..dim {
+            p[k] = seed_a[k] / na;
+            q[k] = seed_b[k] / nb;
+        }
+        let (mut pc, mut qc) = (T::one(), T::one());
+        let (mut p_norm, mut q_norm) = (T::one(), T::one());
+
+        for _ in 0..TWO_MEANS_STEPS {
+            let item = items[rng.random_range(0..items.len())] as usize;
+            let row = &vectors_flat[item * dim..(item + 1) * dim];
+            let row_norm = T::calculate_l2_norm(row);
+            if row_norm == T::zero() {
+                continue;
+            }
+            // Cosine distance to each centroid, weighted by its size as in
+            // Spotify's two_means, so a big cluster does not swallow the node.
+            let dp = pc * cosine_from_dot(T::dot_simd(p, row), p_norm * row_norm);
+            let dq = qc * cosine_from_dot(T::dot_simd(q, row), q_norm * row_norm);
+            let (c, cnt, c_norm) = if dp < dq {
+                (&mut *p, &mut pc, &mut p_norm)
+            } else if dq < dp {
+                (&mut *q, &mut qc, &mut q_norm)
+            } else {
+                continue;
+            };
+            let next = *cnt + T::one();
+            for k in 0..dim {
+                c[k] = (c[k] * *cnt + row[k] / row_norm) / next;
+            }
+            *cnt = next;
+            *c_norm = T::calculate_l2_norm(c);
+        }
+
+        let np = T::calculate_l2_norm(p);
+        let nq = T::calculate_l2_norm(q);
+        hyperplane.clear();
+        hyperplane.extend((0..dim).map(|k| p[k] / np - q[k] / nq));
+    }
+
+    /// Recursively build a node (split or leaf) over `items`.
+    ///
+    /// Tries up to `SPLIT_ATTEMPTS` random hyperplanes and accepts the first
+    /// that puts 5-95% of the items on each side. Falls back to a leaf if
+    /// none does or if the node holds at most `LEAF_MIN_MEMBERS` items. The
+    /// partition is stable, so child order matches a build that copies the
+    /// two sides into fresh vectors.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - This node's slice of the tree permutation
+    /// * `start` - Offset of `items` within the permutation
+    /// * `parts` - Accumulator for the tree's nodes and hyperplanes
+    /// * `scratch` - Tree scratch
+    /// * `rng` - Random number generator
+    /// * `metric` - Euclidean or Cosine
+    ///
+    /// ### Returns
+    ///
+    /// Index of the created node in `parts.nodes`
+    #[allow(clippy::too_many_arguments)]
+    fn build_node(
+        vectors_flat: &[T],
+        dim: usize,
+        items: &mut [u32],
+        start: usize,
+        parts: &mut TreeParts<T>,
+        scratch: &mut SplitScratch<T>,
+        rng: &mut StdRng,
+        metric: Dist,
+    ) -> usize {
+        let leaf = |parts: &mut TreeParts<T>, len: usize| {
+            parts.nodes.push(FlatNode {
+                n_descendants: 1,
+                child_a: start as u32,
+                child_b: len as u32,
+                split_idx: 0,
+            });
+            parts.nodes.len() - 1
+        };
+
+        if items.len() <= LEAF_MIN_MEMBERS {
+            return leaf(parts, items.len());
+        }
+
+        for _ in 0..SPLIT_ATTEMPTS {
+            let idx1 = items[rng.random_range(0..items.len())] as usize;
+            let idx2 = items[rng.random_range(0..items.len())] as usize;
+            if idx1 == idx2 {
+                continue;
+            }
+
+            let v1 = &vectors_flat[idx1 * dim..idx1 * dim + dim];
+            let v2 = &vectors_flat[idx2 * dim..idx2 * dim + dim];
+
+            let threshold = match metric {
+                Dist::Cosine => {
+                    let norm1 = v1
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt();
+                    let norm2 = v2
+                        .iter()
+                        .map(|&x| x * x)
+                        .fold(T::zero(), |a, b| a + b)
+                        .sqrt();
+
+                    if norm1 == T::zero() || norm2 == T::zero() {
+                        continue;
+                    }
+
+                    Self::angular_two_means(vectors_flat, dim, items, v1, v2, scratch, rng);
+                    T::zero()
+                }
+                Dist::SquaredEuclidean => {
+                    scratch.hyperplane.clear();
+                    let mut dot_v1 = T::zero();
+                    let mut dot_v2 = T::zero();
+
+                    for k in 0..dim {
+                        let val1 = v1[k];
+                        let val2 = v2[k];
+                        scratch.hyperplane.push(val1 - val2);
+                        dot_v1 += val1 * val1;
+                        dot_v2 += val2 * val2;
+                    }
+
+                    (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap()
+                }
+                Dist::Manhattan => unreachable!(),
+            };
+
+            scratch.left.clear();
+            let mut n_left = 0usize;
+            for &item in items.iter() {
+                let item = item as usize;
+                let vec = &vectors_flat[item * dim..item * dim + dim];
+                let is_left = T::dot_simd(vec, &scratch.hyperplane) > threshold;
+                n_left += is_left as usize;
+                scratch.left.push(is_left);
+            }
+
+            if n_left == 0 || n_left == items.len() {
+                continue;
+            }
+
+            let ratio = n_left as f64 / items.len() as f64;
+            if !(0.05..=0.95).contains(&ratio) {
+                continue;
+            }
+
+            // Stable partition: lefts compact forwards in place, rights wait
+            // in scratch and land behind them.
+            scratch.right.clear();
+            let mut write = 0;
+            for read in 0..items.len() {
+                let item = items[read];
+                if scratch.left[read] {
+                    items[write] = item;
+                    write += 1;
+                } else {
+                    scratch.right.push(item);
+                }
+            }
+            items[n_left..].copy_from_slice(&scratch.right);
+
+            let node_idx = parts.nodes.len();
+            parts.nodes.push(FlatNode {
+                n_descendants: 2,
+                child_a: 0,
+                child_b: 0,
+                split_idx: (parts.split_data.len() / (dim + 1)) as u32,
+            });
+            parts.split_data.extend_from_slice(&scratch.hyperplane);
+            parts.split_data.push(threshold);
+
+            let (left_items, right_items) = items.split_at_mut(n_left);
+            let left_idx = Self::build_node(
+                vectors_flat,
+                dim,
+                left_items,
+                start,
+                parts,
+                scratch,
+                rng,
+                metric,
+            );
+            let right_idx = Self::build_node(
+                vectors_flat,
+                dim,
+                right_items,
+                start + n_left,
+                parts,
+                scratch,
+                rng,
+                metric,
+            );
+
+            parts.nodes[node_idx].child_a = left_idx as u32;
+            parts.nodes[node_idx].child_b = right_idx as u32;
+            return node_idx;
+        }
+
+        leaf(parts, items.len())
+    }
+
+    /// Number of trees in the forest.
+    ///
+    /// ### Returns
+    ///
+    /// The tree count.
+    pub(crate) fn n_trees(&self) -> usize {
+        self.roots.len()
+    }
+
+    /// Items of a leaf node.
+    ///
+    /// ### Params
+    ///
+    /// * `node` - A leaf node of this forest
+    ///
+    /// ### Returns
+    ///
+    /// The leaf's ids.
+    #[inline(always)]
+    fn leaf_items(&self, node: &FlatNode) -> &[u32] {
+        let start = node.split_idx as usize * self.n + node.child_a as usize;
+        // SAFETY: leaf ranges are built inside their tree's chunk
+        unsafe {
+            self.leaf_indices
+                .get_unchecked(start..start + node.child_b as usize)
+        }
+    }
+
+    /// Leaves of one tree.
+    ///
+    /// The leaves of a tree partition the points, which is what lets a caller
+    /// process them in parallel while writing per-point state.
+    ///
+    /// ### Params
+    ///
+    /// * `tree` - Tree index, below `n_trees`
+    ///
+    /// ### Returns
+    ///
+    /// Iterator over the tree's leaves as id slices.
+    pub(crate) fn tree_leaves(&self, tree: usize) -> impl Iterator<Item = &[u32]> {
+        let lo = self.roots[tree] as usize;
+        let hi = self
+            .roots
+            .get(tree + 1)
+            .map_or(self.nodes.len(), |&r| r as usize);
+        self.nodes[lo..hi]
+            .iter()
+            .filter(|node| node.n_descendants == 1)
+            .map(|node| self.leaf_items(node))
+    }
+
+    /// Best-first walk over all trees, handing each reached leaf to `on_leaf`.
+    ///
+    /// Greedily descends to a leaf and backtracks to the unexplored branch
+    /// with the smallest margin. Stops once `limit` leaf items have been
+    /// handed out, counting repeats across trees.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector, length `dim`
+    /// * `limit` - Budget of leaf items to visit
+    /// * `pq` - Reusable backtracking frontier, left empty on return
+    /// * `on_leaf` - Called once per reached leaf with its ids
+    #[inline]
+    pub(crate) fn visit(
+        &self,
+        query_vec: &[T],
+        limit: usize,
+        pq: &mut BinaryHeap<BacktrackEntry>,
+        mut on_leaf: impl FnMut(&[u32]),
+    ) {
+        let mut visited_count = 0;
+        pq.clear();
+        pq.reserve(self.roots.len() * 2);
+        for &root in &self.roots {
+            pq.push(BacktrackEntry {
+                margin: f64::MAX,
+                node_idx: root,
+            });
+        }
+
+        while visited_count < limit {
+            let Some(entry) = pq.pop() else { break };
+            let mut current_idx = entry.node_idx;
+
+            loop {
+                // SAFETY: Tree structure is static and verified at build
+                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
+
+                if node.n_descendants == 1 {
+                    visited_count += node.child_b as usize;
+                    on_leaf(self.leaf_items(node));
+                    break;
+                }
+
+                let split_offset = node.split_idx as usize * (self.dim + 1);
+                let plane = unsafe {
+                    self.split_data
+                        .get_unchecked(split_offset..split_offset + self.dim + 1)
+                };
+                let margin = (T::dot_simd(query_vec, &plane[..self.dim]) - plane[self.dim])
+                    .to_f64()
+                    .unwrap();
+
+                let (closer, farther) = if margin > 0.0 {
+                    (node.child_a, node.child_b)
+                } else {
+                    (node.child_b, node.child_a)
+                };
+
+                pq.push(BacktrackEntry {
+                    margin: -margin.abs(),
+                    node_idx: farther,
+                });
+
+                current_idx = closer;
+            }
+        }
+        pq.clear();
+    }
+
+    /// Rewrite every leaf id through `old_to_new`.
+    ///
+    /// ### Params
+    ///
+    /// * `old_to_new` - New id for each old id
+    fn remap(&mut self, old_to_new: &[u32]) {
+        self.leaf_indices
+            .par_iter_mut()
+            .for_each(|id| *id = old_to_new[*id as usize]);
+    }
+
+    /// Returns the size of the forest in bytes
+    ///
+    /// ### Returns
+    ///
+    /// Forest size in bytes
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.nodes.capacity() * std::mem::size_of::<FlatNode>()
+            + self.roots.capacity() * std::mem::size_of::<u32>()
+            + self.split_data.capacity() * std::mem::size_of::<T>()
+            + self.leaf_indices.capacity() * std::mem::size_of::<u32>()
+    }
 }
 
 /////////////////
@@ -93,18 +659,12 @@ pub struct AnnoyIndex<T> {
     norms: Vec<T>,
     /// Distance metric (Euclidean or Cosine)
     metric: Dist,
-    /// Flattened tree structure containing all split and leaf nodes
-    nodes: Vec<FlatNode>,
-    /// Starting indices for each tree in the forest
-    roots: Vec<u32>,
-    /// Hyperplane coefficients and offsets for split nodes
-    split_data: Vec<T>,
-    /// Actual data indices stored in leaf nodes
-    leaf_indices: Vec<usize>,
+    /// The forest, in the reordered id space of `vectors_flat`
+    trees: AnnoyTrees<T>,
     /// Number of trees in the forest
     pub n_trees: usize,
     /// Orignal indices
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -163,6 +723,8 @@ where
     ///   slower build)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `seed` - Random seed for reproducibility
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds the
+    ///   tree build and the memory reorder
     ///
     /// ### Returns
     ///
@@ -172,11 +734,13 @@ where
         n_trees: usize,
         metric: Dist,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
-        let mut rng = StdRng::seed_from_u64(seed as u64);
+
+        let log = BuildLog::new("Annoy index", verbosity);
 
         let (vectors_flat, n, dim) = data.into_row_major();
 
@@ -192,335 +756,41 @@ where
             Vec::new()
         };
 
-        let seeds: Vec<u64> = (0..n_trees).map(|_| rng.random()).collect();
-
-        let forest: Vec<Vec<BuildNode<T>>> = seeds
-            .into_par_iter()
-            .map(|tree_seed| {
-                let mut tree_rng = StdRng::seed_from_u64(tree_seed);
-                Self::build_tree_recursive(
-                    &vectors_flat,
-                    dim,
-                    (0..n).collect(),
-                    &mut tree_rng,
-                    metric,
-                )
-            })
-            .collect();
-
-        let total_nodes: usize = forest.iter().map(|t| t.len()).sum();
-        let mut nodes = Vec::with_capacity(total_nodes);
-        let mut roots = Vec::with_capacity(n_trees);
-        let mut split_data = Vec::new();
-        let mut leaf_indices = Vec::new();
-
-        for tree in forest {
-            let root_offset = nodes.len() as u32;
-            roots.push(root_offset);
-
-            for node in tree {
-                match node {
-                    BuildNode::Split {
-                        hyperplane,
-                        offset,
-                        left,
-                        right,
-                    } => {
-                        let split_idx = (split_data.len() / (dim + 1)) as u32;
-                        split_data.extend(hyperplane);
-                        split_data.push(offset);
-
-                        nodes.push(FlatNode {
-                            n_descendants: 2,
-                            child_a: root_offset + left as u32,
-                            child_b: root_offset + right as u32,
-                            split_idx,
-                        });
-                    }
-                    BuildNode::Leaf { items } => {
-                        let start = leaf_indices.len() as u32;
-                        let len = items.len() as u32;
-                        leaf_indices.extend(items);
-
-                        nodes.push(FlatNode {
-                            n_descendants: 1,
-                            child_a: start,
-                            child_b: len,
-                            split_idx: 0,
-                        });
-                    }
-                }
-            }
+        let start = Instant::now();
+        let trees = AnnoyTrees::build(&vectors_flat, n, dim, n_trees, metric, seed);
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Built {} trees over {} samples in {:.2?}",
+                n_trees,
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
         }
 
         let mut idx = AnnoyIndex {
-            nodes,
-            roots,
-            split_data,
-            leaf_indices,
+            trees,
             vectors_flat,
             dim,
             n_trees,
             n,
             norms,
             metric,
-            original_ids: (0..n).collect(),
+            original_ids: (0..n as u32).collect(),
         };
 
+        let start = Instant::now();
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Reordered vectors to tree-0 leaf order in {:.2?}",
+                start.elapsed()
+            );
+        }
+
+        log.finish();
 
         Ok(idx)
-    }
-
-    /// Build a single tree recursively
-    ///
-    /// Wrapper that initialises the node vector and starts the recursive
-    /// splitting process.
-    ///
-    /// ### Params
-    ///
-    /// * `vectors_flat` - Flattened vector data
-    /// * `dim` - Dimensionality of vectors
-    /// * `items` - Indices of items to partition
-    /// * `rng` - Random number generator for this tree
-    ///
-    /// ### Returns
-    ///
-    /// Vector of BuildNodes representing the complete tree
-    fn build_tree_recursive(
-        vectors_flat: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        rng: &mut StdRng,
-        metric: Dist,
-    ) -> Vec<BuildNode<T>> {
-        let mut nodes = Vec::with_capacity(items.len());
-        Self::build_node(vectors_flat, dim, items, &mut nodes, rng, metric);
-        nodes
-    }
-
-    /// Angular split normal from two-means over the node's items
-    ///
-    /// Spotify Annoy's angular split. Starts from two unit-normalised seed
-    /// rows and moves each centroid towards the sampled items closer to it
-    /// in angle, for `TWO_MEANS_STEPS` samples. The normal is the difference
-    /// of the two unit centroids, so the plane passes through the origin. A
-    /// random pair alone splits on whichever two points were drawn; on hubby
-    /// cosine data such as word embeddings that leaves poor leaves.
-    ///
-    /// ### Params
-    ///
-    /// * `vectors_flat` - Flattened vector data
-    /// * `dim` - Dimensionality of vectors
-    /// * `items` - Indices in this node to sample from
-    /// * `seed_a` - First seed row, non-zero
-    /// * `seed_b` - Second seed row, non-zero
-    /// * `rng` - Random number generator for this tree
-    ///
-    /// ### Returns
-    ///
-    /// The hyperplane normal, length `dim`.
-    fn angular_two_means(
-        vectors_flat: &[T],
-        dim: usize,
-        items: &[usize],
-        seed_a: &[T],
-        seed_b: &[T],
-        rng: &mut StdRng,
-    ) -> Vec<T> {
-        let unit = |v: &[T]| -> Vec<T> {
-            let n = T::calculate_l2_norm(v);
-            v.iter().map(|&x| x / n).collect()
-        };
-        let mut p = unit(seed_a);
-        let mut q = unit(seed_b);
-        let (mut pc, mut qc) = (T::one(), T::one());
-        let (mut p_norm, mut q_norm) = (T::one(), T::one());
-
-        for _ in 0..TWO_MEANS_STEPS {
-            let item = items[rng.random_range(0..items.len())];
-            let row = &vectors_flat[item * dim..(item + 1) * dim];
-            let row_norm = T::calculate_l2_norm(row);
-            if row_norm == T::zero() {
-                continue;
-            }
-            // Cosine distance to each centroid, weighted by its size as in
-            // Spotify's two_means, so a big cluster does not swallow the node.
-            let dp = pc * cosine_from_dot(T::dot_simd(&p, row), p_norm * row_norm);
-            let dq = qc * cosine_from_dot(T::dot_simd(&q, row), q_norm * row_norm);
-            let (c, cnt, c_norm) = if dp < dq {
-                (&mut p, &mut pc, &mut p_norm)
-            } else if dq < dp {
-                (&mut q, &mut qc, &mut q_norm)
-            } else {
-                continue;
-            };
-            let next = *cnt + T::one();
-            for k in 0..dim {
-                c[k] = (c[k] * *cnt + row[k] / row_norm) / next;
-            }
-            *cnt = next;
-            *c_norm = T::calculate_l2_norm(c);
-        }
-
-        let p = unit(&p);
-        let q = unit(&q);
-        (0..dim).map(|k| p[k] - q[k]).collect()
-    }
-
-    /// Recursively build a node (split or leaf)
-    ///
-    /// Attempts up to 10 random hyperplane splits. For each split, picks two
-    /// random points and uses their difference as the hyperplane normal.
-    /// Accepts splits where both sides contain 5-95% of items. Falls back
-    /// to a leaf if no good split is found or if items ≤ 64.
-    ///
-    /// ### Params
-    ///
-    /// * `vectors_flat` - Flattened vector data
-    /// * `dim` - Dimensionality of vectors
-    /// * `items` - Indices to partition in this node
-    /// * `nodes` - Accumulator for built nodes
-    /// * `rng` - Random number generator
-    ///
-    /// ### Returns
-    ///
-    /// Index of the created node in `nodes`
-    fn build_node(
-        vectors_flat: &[T],
-        dim: usize,
-        items: Vec<usize>,
-        nodes: &mut Vec<BuildNode<T>>,
-        rng: &mut StdRng,
-        metric: Dist,
-    ) -> usize {
-        if items.len() <= LEAF_MIN_MEMBERS {
-            let node_idx = nodes.len();
-            nodes.push(BuildNode::Leaf { items });
-            return node_idx;
-        }
-
-        for _ in 0..10 {
-            let idx1 = items[rng.random_range(0..items.len())];
-            let idx2 = items[rng.random_range(0..items.len())];
-            if idx1 == idx2 {
-                continue;
-            }
-
-            let v1_start = idx1 * dim;
-            let v2_start = idx2 * dim;
-            let v1 = &vectors_flat[v1_start..v1_start + dim];
-            let v2 = &vectors_flat[v2_start..v2_start + dim];
-
-            let (hyperplane, threshold) = match metric {
-                Dist::Cosine => {
-                    let norm1 = v1
-                        .iter()
-                        .map(|&x| x * x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt();
-                    let norm2 = v2
-                        .iter()
-                        .map(|&x| x * x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt();
-
-                    if norm1 == T::zero() || norm2 == T::zero() {
-                        continue;
-                    }
-
-                    let hp = Self::angular_two_means(vectors_flat, dim, &items, v1, v2, rng);
-
-                    (hp, T::zero())
-                }
-                Dist::SquaredEuclidean => {
-                    let mut hp = Vec::with_capacity(dim);
-                    let mut dot_v1 = T::zero();
-                    let mut dot_v2 = T::zero();
-
-                    for k in 0..dim {
-                        let val1 = v1[k];
-                        let val2 = v2[k];
-                        hp.push(val1 - val2);
-                        dot_v1 += val1 * val1;
-                        dot_v2 += val2 * val2;
-                    }
-
-                    let thresh = (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap();
-                    (hp, thresh)
-                }
-                Dist::Manhattan => unreachable!(),
-            };
-
-            let mut left_items = Vec::new();
-            let mut right_items = Vec::new();
-
-            for &item in &items {
-                let vec_start = item * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-                let dot = T::dot_simd(vec, &hyperplane);
-
-                if dot > threshold {
-                    left_items.push(item);
-                } else {
-                    right_items.push(item);
-                }
-            }
-
-            if left_items.is_empty() || right_items.is_empty() {
-                continue;
-            }
-
-            let ratio = left_items.len() as f64 / items.len() as f64;
-            if (0.05..=0.95).contains(&ratio) {
-                let node_idx = nodes.len();
-                nodes.push(BuildNode::Split {
-                    hyperplane,
-                    offset: threshold,
-                    left: 0,
-                    right: 0,
-                });
-
-                let left_idx = Self::build_node(vectors_flat, dim, left_items, nodes, rng, metric);
-                let right_idx =
-                    Self::build_node(vectors_flat, dim, right_items, nodes, rng, metric);
-
-                if let BuildNode::Split {
-                    ref mut left,
-                    ref mut right,
-                    ..
-                } = nodes[node_idx]
-                {
-                    *left = left_idx;
-                    *right = right_idx;
-                }
-                return node_idx;
-            }
-        }
-
-        let node_idx = nodes.len();
-        nodes.push(BuildNode::Leaf { items });
-        node_idx
-    }
-
-    /// Calculate signed distance (margin) from query to hyperplane
-    ///
-    /// Computes dot(query, normal) - offset. Positive means query is on
-    /// the "left" side of the split, negative means "right".
-    ///
-    /// ### Params
-    ///
-    /// * `v1` - Query vector
-    /// * `v2` - Hyperplane data (first dim elements = normal, last = offset)
-    /// * `dim` - Dimensionality
-    ///
-    /// ### Returns
-    ///
-    /// Signed margin (distance to hyperplane along normal direction)
-    #[inline(always)]
-    fn get_margin(v1: &[T], v2: &[T], dim: usize) -> T {
-        T::dot_simd(v1, &v2[..dim]) - v2[dim]
     }
 
     /// Reorders vectors in memory to match the leaf layout of Tree 0, for
@@ -529,44 +799,17 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
-        if self.roots.is_empty() || self.n == 0 {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
+        if self.n_trees == 0 || self.n == 0 {
             return Vec::new();
         }
 
-        let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![usize::MAX; self.n];
-        let mut visited = vec![false; self.n];
-
-        // DFS over tree 0 assigns new ids in leaf order
-        let mut stack = vec![self.roots[0]];
-        while let Some(node_idx) = stack.pop() {
-            let node = unsafe { self.nodes.get_unchecked(node_idx as usize) };
-
-            if node.n_descendants == 1 {
-                let start = node.child_a as usize;
-                let len = node.child_b as usize;
-                let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                for &old_id in leaf_items {
-                    if !visited[old_id] {
-                        visited[old_id] = true;
-                        old_to_new[old_id] = new_to_old.len();
-                        new_to_old.push(old_id);
-                    }
-                }
-            } else {
-                stack.push(node.child_b);
-                stack.push(node.child_a);
-            }
-        }
-
-        // Any items missing from tree 0 are appended
-        for old_id in 0..self.n {
-            if !visited[old_id] {
-                old_to_new[old_id] = new_to_old.len();
-                new_to_old.push(old_id);
-            }
+        // Tree 0's permutation is its leaves in DFS order and covers every
+        // item exactly once.
+        let new_to_old: Vec<u32> = self.trees.leaf_indices[..self.n].to_vec();
+        let mut old_to_new = vec![0u32; self.n];
+        for (new_id, &old_id) in new_to_old.iter().enumerate() {
+            old_to_new[old_id as usize] = new_id as u32;
         }
 
         let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
@@ -577,6 +820,7 @@ where
         };
 
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * self.dim;
             let end = start + self.dim;
 
@@ -587,11 +831,7 @@ where
             }
         }
 
-        // 4. Rewrite ALL leaves in ALL trees to use the new IDs
-        for id_ref in self.leaf_indices.iter_mut() {
-            *id_ref = old_to_new[*id_ref];
-        }
-
+        self.trees.remap(&old_to_new);
         self.vectors_flat = new_vectors_flat;
         self.norms = new_norms;
 
@@ -607,40 +847,8 @@ where
         std::mem::size_of_val(self)
             + self.vectors_flat.capacity() * std::mem::size_of::<T>()
             + self.norms.capacity() * std::mem::size_of::<T>()
-            + self.nodes.capacity() * std::mem::size_of::<FlatNode>()
-            + self.roots.capacity() * std::mem::size_of::<u32>()
-            + self.split_data.capacity() * std::mem::size_of::<T>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
-    }
-
-    /// Leaves of one tree, as original ids.
-    ///
-    /// The leaves of a tree partition the points, which is what lets a caller
-    /// process them in parallel while writing per-point state.
-    ///
-    /// ### Params
-    ///
-    /// * `tree` - Tree index, below `n_trees`
-    ///
-    /// ### Returns
-    ///
-    /// One id list per leaf
-    pub(crate) fn tree_leaves(&self, tree: usize) -> Vec<Vec<u32>> {
-        let mut leaves = Vec::new();
-        let mut stack = vec![self.roots[tree]];
-        while let Some(idx) = stack.pop() {
-            let node = &self.nodes[idx as usize];
-            if node.n_descendants == 1 {
-                let start = node.child_a as usize;
-                let items = &self.leaf_indices[start..start + node.child_b as usize];
-                leaves.push(items.iter().map(|&i| self.original_ids[i] as u32).collect());
-            } else {
-                stack.push(node.child_a);
-                stack.push(node.child_b);
-            }
-        }
-        leaves
+            + self.trees.memory_usage_bytes()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -765,15 +973,12 @@ where
         self.check_dim(query_vec.len())?;
 
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
-        let mut visited_count = 0;
 
         if scratch.visited.len() < self.n {
             scratch.visited.grow(self.n);
         }
         scratch.candidates.clear();
         scratch.candidates.reserve(limit);
-        scratch.pq.clear();
-        scratch.pq.reserve(self.n_trees * 2);
 
         let query_norm = if self.metric == Dist::Cosine {
             query_vec
@@ -791,81 +996,29 @@ where
             pq,
         } = scratch;
 
-        for &root in &self.roots {
-            pq.push(BacktrackEntry {
-                margin: f64::MAX,
-                node_idx: root,
-            });
-        }
-
-        while visited_count < limit {
-            let Some(entry) = pq.pop() else { break };
-
-            let mut current_idx = entry.node_idx;
-
-            loop {
-                // SAFETY: Tree structure is static and verified at build
-                let node = unsafe { self.nodes.get_unchecked(current_idx as usize) };
-
-                if node.n_descendants == 1 {
-                    let start = node.child_a as usize;
-                    let len = node.child_b as usize;
-                    visited_count += len;
-
-                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                    for &item in leaf_items {
-                        if visited.contains(item) {
-                            continue;
-                        }
-                        visited.insert(item);
-
-                        let dist = match self.metric {
-                            Dist::SquaredEuclidean => {
-                                self.euclidean_distance_to_query(item, query_vec)
-                            }
-                            Dist::Cosine => {
-                                self.cosine_distance_to_query(item, query_vec, query_norm)
-                            }
-                            Dist::Manhattan => unreachable!(),
-                        };
-
-                        candidates.push((dist, item));
-                    }
-                    break;
-                } else {
-                    let split_offset = node.split_idx as usize * (self.dim + 1);
-                    let plane = unsafe {
-                        self.split_data
-                            .get_unchecked(split_offset..split_offset + self.dim + 1)
-                    };
-
-                    let margin = Self::get_margin(query_vec, plane, self.dim)
-                        .to_f64()
-                        .unwrap();
-
-                    let (closer, farther) = if margin > 0.0 {
-                        (node.child_a, node.child_b)
-                    } else {
-                        (node.child_b, node.child_a)
-                    };
-
-                    pq.push(BacktrackEntry {
-                        margin: -margin.abs(),
-                        node_idx: farther,
-                    });
-
-                    current_idx = closer;
+        self.trees.visit(query_vec, limit, pq, |leaf_items| {
+            for &item in leaf_items {
+                let item = item as usize;
+                if visited.contains(item) {
+                    continue;
                 }
+                visited.insert(item);
+
+                let dist = match self.metric {
+                    Dist::SquaredEuclidean => self.euclidean_distance_to_query(item, query_vec),
+                    Dist::Cosine => self.cosine_distance_to_query(item, query_vec, query_norm),
+                    Dist::Manhattan => unreachable!(),
+                };
+
+                candidates.push((dist, item));
             }
-        }
+        });
 
         // Clear only the visited bits touched; every scored item is in
         // `candidates`.
         for &(_, item) in candidates.iter() {
             visited.remove(item);
         }
-        pq.clear();
 
         // O(N) selection of the top K elements
         if candidates.len() > k {
@@ -879,7 +1032,7 @@ where
             .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         for entry in candidates.iter_mut() {
-            entry.1 = self.original_ids[entry.1];
+            entry.1 = self.original_ids[entry.1] as usize;
         }
 
         Ok(())
@@ -927,7 +1080,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `search_k` - Search budget (defaults to k * n_trees * 20 if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity of the function
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -938,9 +1091,9 @@ where
         k: usize,
         search_k: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("Annoy index", self.n, true, verbosity);
 
         // collect unordered results, tagging them with their ORIGINAL id
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
@@ -950,24 +1103,16 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query_into(vec, k, search_k, scratch)?;
                 let (indices, dists) = scratch.results().iter().map(|&(d, i)| (i, d)).unzip();
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -1018,7 +1163,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1062,15 +1207,51 @@ mod tests {
     #[test]
     fn test_annoy_index_creation() {
         let mat = create_simple_matrix();
-        let _ = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42);
+        let _ = AnnoyIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        );
 
         // just verify it doesn't panic
     }
 
     #[test]
+    fn test_annoy_trees_leaves_partition_every_tree() {
+        let (n, dim) = (3000, 8);
+        let mut rng = StdRng::seed_from_u64(3);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random::<f32>() - 0.5).collect();
+        for metric in [Dist::SquaredEuclidean, Dist::Cosine] {
+            let trees = AnnoyTrees::<f32>::build(&data, n, dim, 4, metric, 7);
+            assert_eq!(trees.n_trees(), 4);
+            for tree in 0..4 {
+                let mut seen = vec![false; n];
+                let mut total = 0;
+                for leaf in trees.tree_leaves(tree) {
+                    for &id in leaf {
+                        assert!(!seen[id as usize], "id {id} in two leaves of tree {tree}");
+                        seen[id as usize] = true;
+                    }
+                    total += leaf.len();
+                }
+                assert_eq!(total, n);
+            }
+        }
+    }
+
+    #[test]
     fn test_annoy_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -1084,7 +1265,14 @@ mod tests {
     #[test]
     fn test_annoy_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1104,7 +1292,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42).unwrap();
+        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1119,7 +1307,14 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -1134,7 +1329,14 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            4,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -1151,8 +1353,22 @@ mod tests {
         let mat = create_simple_matrix();
 
         // More trees should give better recall
-        let index_few = AnnoyIndex::new(mat.as_ref(), 2, Dist::SquaredEuclidean, 42).unwrap();
-        let index_many = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42).unwrap();
+        let index_few = AnnoyIndex::new(
+            mat.as_ref(),
+            2,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let index_many = AnnoyIndex::new(
+            mat.as_ref(),
+            16,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.9, 0.1, 0.0];
         let (indices1, _) = index_few.query(&query, 3, None).unwrap();
@@ -1165,7 +1381,14 @@ mod tests {
     #[test]
     fn test_annoy_query_row() {
         let mat = create_simple_matrix();
-        let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
@@ -1179,8 +1402,22 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Same seed should give same results
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
+        let index1 = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let index2 = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, None).unwrap();
@@ -1194,8 +1431,22 @@ mod tests {
         let mat = create_simple_matrix();
 
         // Different seeds might give different tree structures
-        let index1 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = AnnoyIndex::new(mat.as_ref(), 8, Dist::SquaredEuclidean, 123).unwrap();
+        let index1 = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let index2 = AnnoyIndex::new(
+            mat.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            123,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1221,7 +1472,14 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 16, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            16,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
@@ -1236,7 +1494,7 @@ mod tests {
         use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42).unwrap();
+        let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, None).unwrap();
@@ -1257,7 +1515,14 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = AnnoyIndex::new(mat.as_ref(), 32, Dist::SquaredEuclidean, 42).unwrap();
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            32,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None).unwrap();

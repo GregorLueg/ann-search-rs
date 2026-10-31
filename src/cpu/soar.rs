@@ -26,13 +26,13 @@ use faer::RowRef;
 use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+use std::time::Instant;
 
 //////////////////////////
 // Thread-local buffers //
@@ -74,7 +74,7 @@ pub struct SoarIndex<T> {
     centroids_norm: Vec<T>,
     /// Primary lists. Cell `c` owns rows `offsets[c]..offsets[c + 1]` of
     /// `vectors_flat` directly, so no member array is needed for them
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Spilled entries per cell, as internal row ids. `n` entries total, one
     /// per point
     spill_members: Vec<u32>,
@@ -83,13 +83,13 @@ pub struct SoarIndex<T> {
     /// read instead of a random gather
     spill_primary: Vec<u32>,
     /// Offsets into `spill_members` / `spill_primary`, `nlist + 1` entries
-    spill_offsets: Vec<usize>,
+    spill_offsets: Vec<u32>,
     /// Number of clusters in the index
     nlist: usize,
     /// Rule used for the secondary assignment, kept for introspection
     rule: SoarRule,
     /// Internal row -> caller-facing id
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -213,7 +213,8 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed for reproducibility
-    /// * `verbose` - Print training progress
+    /// * `verbosity` - `Normal` prints start and end, `Detailed` adds timed
+    ///   stages
     ///
     /// ### Returns
     ///
@@ -230,8 +231,9 @@ where
         rule: Option<SoarRule>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("SOAR index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -255,13 +257,11 @@ where
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
-        if verbose {
-            println!(
-                "  Generating SOAR index with {} Voronoi cells, rule {:?}.",
-                nlist, rule
-            );
+        if verbosity.detailed_verbosity() {
+            println!(" Spilling rule {:?}", rule);
         }
 
+        let start = Instant::now();
         let centroids = train_centroids(
             &training_data,
             dim,
@@ -270,8 +270,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -290,6 +298,7 @@ where
             vec![T::one(); n]
         };
 
+        let start = Instant::now();
         let assignments = assign_all_parallel(
             &vectors_flat,
             &data_norms_for_assignment,
@@ -300,6 +309,13 @@ where
             nlist,
             &metric,
         );
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Assigned {} vectors in {:.2?}",
+                n.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         // Secondary assignment reads the primary one, so it has to run before
         // `assignments` is consumed by the CSR build.
@@ -321,9 +337,11 @@ where
         // Reorder vectors into primary-cluster order. `new_to_old` doubles as
         // `original_ids`; nothing needs the inverse map, because the spill
         // lists are built by walking the new order directly.
-        let mut new_to_old: Vec<usize> = Vec::with_capacity(n);
+        let mut new_to_old: Vec<u32> = Vec::with_capacity(n);
         for cluster in 0..nlist {
-            new_to_old.extend_from_slice(&all_indices[offsets[cluster]..offsets[cluster + 1]]);
+            new_to_old.extend_from_slice(
+                &all_indices[offsets[cluster] as usize..offsets[cluster + 1] as usize],
+            );
         }
 
         let mut reordered = Vec::with_capacity(vectors_flat.len());
@@ -333,6 +351,7 @@ where
             Vec::with_capacity(n)
         };
         for &old_id in &new_to_old {
+            let old_id = old_id as usize;
             let start = old_id * dim;
             reordered.extend_from_slice(&vectors_flat[start..start + dim]);
             if !norms.is_empty() {
@@ -342,13 +361,16 @@ where
 
         // Spill lists index the *reordered* rows, so translate the secondary
         // assignment out of caller-id space on the way in.
-        let spill_assign: Vec<u32> = new_to_old.iter().map(|&old| secondary[old]).collect();
+        let spill_assign: Vec<u32> = new_to_old
+            .iter()
+            .map(|&old| secondary[old as usize])
+            .collect();
         let (spill_members, spill_offsets) = invert_assignments_csr(&spill_assign, n, 1, nlist);
 
         // Primary cell of every reordered row, from the contiguous ranges.
         let mut row_primary = vec![0u32; n];
         for cluster in 0..nlist {
-            for row in offsets[cluster]..offsets[cluster + 1] {
+            for row in offsets[cluster] as usize..offsets[cluster + 1] as usize {
                 row_primary[row] = cluster as u32;
             }
         }
@@ -356,6 +378,8 @@ where
             .iter()
             .map(|&row| row_primary[row as usize])
             .collect();
+
+        log.finish();
 
         Ok(Self {
             vectors_flat: reordered,
@@ -396,10 +420,10 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.centroids.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
             + self.spill_members.capacity() * std::mem::size_of::<u32>()
             + self.spill_primary.capacity() * std::mem::size_of::<u32>()
-            + self.spill_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.spill_offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -472,8 +496,8 @@ where
 
             // Primary pass: contiguous rows, identical to a plain IVF scan.
             for &cluster_idx in &probed {
-                let start = self.offsets[cluster_idx];
-                let end = self.offsets[cluster_idx + 1];
+                let start = self.offsets[cluster_idx] as usize;
+                let end = self.offsets[cluster_idx + 1] as usize;
                 for vec_idx in start..end {
                     buffer.insert((OrderedFloat(dist_to(vec_idx)), vec_idx), k);
                 }
@@ -481,8 +505,8 @@ where
 
             // Spill pass: gather, skipping anything the primary pass already saw.
             for &cluster_idx in &probed {
-                let start = self.spill_offsets[cluster_idx];
-                let end = self.spill_offsets[cluster_idx + 1];
+                let start = self.spill_offsets[cluster_idx] as usize;
+                let end = self.spill_offsets[cluster_idx + 1] as usize;
                 for pos in start..end {
                     if probed_mask.contains(self.spill_primary[pos] as usize) {
                         continue;
@@ -499,7 +523,7 @@ where
             let (distances, indices) = buffer
                 .data()
                 .iter()
-                .map(|(d, i)| (d.0, self.original_ids[*i]))
+                .map(|(d, i)| (d.0, self.original_ids[*i] as usize))
                 .unzip();
 
             Ok((indices, distances))
@@ -548,7 +572,7 @@ where
     /// * `k` - Number of neighbours per vector
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist) if None)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -559,32 +583,24 @@ where
         k: usize,
         nprobe: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("SOAR index", self.n, true, verbosity);
 
         let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let start = i * self.dim;
                 let vec = &self.vectors_flat[start..start + self.dim];
-                let orig_id = self.original_ids[i];
+                let orig_id = self.original_ids[i] as usize;
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 let (indices, dists) = self.query(vec, k, nprobe)?;
                 Ok((orig_id, indices, dists))
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         let mut final_indices = vec![Vec::new(); self.n];
         let mut final_dists = if return_dist {
@@ -633,7 +649,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -704,7 +720,7 @@ mod tests {
             11.2, 0.0, // c2 = cB, anti-aligned
         ];
         let k = 3;
-        let primary = vec![0usize];
+        let primary = vec![0u32];
         let norms = vec![1.0f32];
         let centroid_norms = vec![1.0f32; k];
 
@@ -830,11 +846,7 @@ mod tests {
                 &Dist::SquaredEuclidean,
             );
             for i in 0..n {
-                assert_ne!(
-                    sec[i] as usize, primary[i],
-                    "rule {:?} collided at {}",
-                    rule, i
-                );
+                assert_ne!(sec[i], primary[i], "rule {:?} collided at {}", rule, i);
             }
         }
     }
@@ -851,7 +863,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -877,13 +889,13 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
         assert_eq!(index.spill_members.len(), n);
         assert_eq!(index.spill_primary.len(), n);
-        assert_eq!(index.spill_offsets[nlist], n);
+        assert_eq!(index.spill_offsets[nlist] as usize, n);
         let unique: HashSet<u32> = index.spill_members.iter().copied().collect();
         assert_eq!(
             unique.len(),
@@ -906,7 +918,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -928,7 +940,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -953,7 +965,7 @@ mod tests {
             None,
             None,
             4,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let b = SoarIndex::build(
@@ -963,7 +975,7 @@ mod tests {
             None,
             None,
             4,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -984,7 +996,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1010,7 +1022,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1027,9 +1039,16 @@ mod tests {
         let (n, dim) = (50, 4);
         let data = clustered_data(n, dim, 2, 1);
         let mat = as_mat(&data, n, dim);
-        assert!(
-            SoarIndex::build(mat.as_ref(), Dist::Manhattan, None, None, None, 1, false).is_err()
-        );
+        assert!(SoarIndex::build(
+            mat.as_ref(),
+            Dist::Manhattan,
+            None,
+            None,
+            None,
+            1,
+            Verbosity::Quiet
+        )
+        .is_err());
     }
 
     #[test]
@@ -1044,7 +1063,7 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1064,11 +1083,13 @@ mod tests {
             None,
             None,
             1,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, dists) = index.generate_knn(7, Some(nlist), true, false).unwrap();
+        let (indices, dists) = index
+            .generate_knn(7, Some(nlist), true, Verbosity::Quiet)
+            .unwrap();
         assert_eq!(indices.len(), n);
         assert!(indices.iter().all(|row| row.len() == 7));
         assert!(dists.unwrap().iter().all(|row| row.len() == 7));

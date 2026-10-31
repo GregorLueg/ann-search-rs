@@ -6,12 +6,15 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 
-use thousands::*;
-
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::tree_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
+
+////////////
+// Consts //
+////////////
 
 /// Sequential Lloyd passes on a small node's two-way split (an in-place
 /// 2-means). `train_centroids` is avoided because it fans out over rayon
@@ -38,7 +41,7 @@ const BALL_SMALL_NODE: usize = 500;
 /// ### Return
 ///
 /// Furthest data point from the pivot
-fn find_furthest_from<T>(pivot: &[T], data: &[T], indices: &[usize], dim: usize) -> usize
+fn find_furthest_from<T>(pivot: &[T], data: &[T], indices: &[u32], dim: usize) -> u32
 where
     T: Float + SimdDistance,
 {
@@ -46,7 +49,8 @@ where
     let mut furthest = indices[0];
 
     for &idx in indices {
-        let vec = &data[idx * dim..(idx + 1) * dim];
+        let i = idx as usize;
+        let vec = &data[i * dim..(i + 1) * dim];
         let dist = euclidean_distance_static(pivot, vec);
         if dist > max_dist {
             max_dist = dist;
@@ -75,11 +79,11 @@ where
 fn sample_by_distance<T>(
     pivot: &[T],
     data: &[T],
-    indices: &[usize],
+    indices: &[u32],
     dim: usize,
     metric: &Dist,
     rng: &mut StdRng,
-) -> usize
+) -> u32
 where
     T: Float + SimdDistance,
 {
@@ -87,7 +91,8 @@ where
     let weights: Vec<f64> = indices
         .iter()
         .map(|&idx| {
-            let vec = &data[idx * dim..(idx + 1) * dim];
+            let i = idx as usize;
+            let vec = &data[i * dim..(i + 1) * dim];
             let d = match metric {
                 Dist::SquaredEuclidean => euclidean_distance_static(pivot, vec),
                 Dist::Cosine => {
@@ -124,29 +129,31 @@ where
 /// * `pivot_1` - The left pivot point
 /// * `pivot_2` - The right pivot point
 /// * `metric` - The distance metric
-///
-/// ### Return
-///
-/// `(indices left, indices right)`
+/// * `left` - Cleared, then filled with the indices nearer `pivot_1` (ties
+///   included), in input order
+/// * `right` - Cleared, then filled with the rest, in input order
+#[allow(clippy::too_many_arguments)]
 fn partition_by_nearest<T>(
     data: &[T],
-    indices: &[usize],
+    indices: &[u32],
     dim: usize,
     pivot_1: &[T],
     pivot_2: &[T],
     metric: &Dist,
-) -> (Vec<usize>, Vec<usize>)
-where
+    left: &mut Vec<u32>,
+    right: &mut Vec<u32>,
+) where
     T: Float + SimdDistance,
 {
-    let mut left: Vec<usize> = Vec::new();
-    let mut right: Vec<usize> = Vec::new();
+    left.clear();
+    right.clear();
 
     let norm_pivot_1 = T::calculate_l2_norm(pivot_1);
     let norm_pivot_2 = T::calculate_l2_norm(pivot_2);
 
     for &idx in indices {
-        let vec = &data[idx * dim..(idx + 1) * dim];
+        let i = idx as usize;
+        let vec = &data[i * dim..(i + 1) * dim];
         let vec_norm = match metric {
             Dist::SquaredEuclidean => T::zero(),
             Dist::Cosine => T::calculate_l2_norm(vec),
@@ -170,8 +177,6 @@ where
             right.push(idx);
         }
     }
-
-    (left, right)
 }
 
 /// Compute the centroid
@@ -185,7 +190,7 @@ where
 /// ### Returns
 ///
 /// The centroid of the data
-fn compute_centroid<T>(data: &[T], indices: &[usize], dim: usize) -> Vec<T>
+fn compute_centroid<T>(data: &[T], indices: &[u32], dim: usize) -> Vec<T>
 where
     T: Float,
 {
@@ -193,7 +198,8 @@ where
     let n = T::from(indices.len()).unwrap();
 
     for &idx in indices {
-        let vec = &data[idx * dim..(idx + 1) * dim];
+        let i = idx as usize;
+        let vec = &data[i * dim..(i + 1) * dim];
         for d in 0..dim {
             centroid[d] = centroid[d] + vec[d];
         }
@@ -219,7 +225,7 @@ where
 /// ### Return
 ///
 /// The maximum distance of the data against the center
-fn ball_radius<T>(center: &[T], data: &[T], indices: &[usize], dim: usize, metric: &Dist) -> T
+fn ball_radius<T>(center: &[T], data: &[T], indices: &[u32], dim: usize, metric: &Dist) -> T
 where
     T: Float + SimdDistance,
 {
@@ -227,7 +233,8 @@ where
     let center_norm = T::calculate_l2_norm(center);
 
     for &idx in indices {
-        let vec = &data[idx * dim..(idx + 1) * dim];
+        let i = idx as usize;
+        let vec = &data[i * dim..(i + 1) * dim];
         let dist = match metric {
             Dist::SquaredEuclidean => euclidean_distance_static(center, vec),
             Dist::Cosine => {
@@ -256,8 +263,8 @@ where
 /// ### Fields
 ///
 /// * `n_descendants` - 1 for leaf, 2 for split node
-/// * `child_a` - For split: left child index; For leaf: start index in
-///   leaf_indices
+/// * `child_a` - For split: left child index; For leaf: start row of the leaf
+///   (rows are stored in leaf order)
 /// * `child_b` - For split: right child index; For leaf: count of items
 /// * `center_idx` - Index into split_data (only used for split nodes)
 #[derive(Clone, Copy, Debug)]
@@ -288,8 +295,10 @@ enum BuildNode<T> {
         right: usize,
     },
     Leaf {
-        /// Original data indices in this leaf
-        items: Vec<usize>,
+        /// Start of this leaf's range in the build permutation
+        start: usize,
+        /// Number of points in this leaf
+        len: usize,
     },
 }
 
@@ -320,10 +329,8 @@ pub struct BallTreeIndex<T> {
     centers_data: Vec<T>,
     /// Norms of the centers
     centers_data_norm: Vec<T>,
-    /// Actual data indices stored in leaf nodes
-    leaf_indices: Vec<usize>,
     /// Original index of each stored row; rows are kept in leaf order
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
 }
 
 ////////////////////
@@ -375,6 +382,7 @@ where
     /// * `data` - Data matrix (rows = samples, columns = dimensions)
     /// * `metric` - Distance metric (Euclidean or Cosine)
     /// * `seed` - Random seed for reproducibility
+    /// * `verbosity` - Prints start and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -383,7 +391,9 @@ where
         data: impl AnnMatrix<T>,
         metric: Dist,
         seed: usize,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("BallTree index", verbosity);
         if metric == Dist::Manhattan {
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
@@ -405,10 +415,11 @@ where
         let max_parallel_depth = (rayon::current_num_threads() as f32).log2().ceil() as usize;
         let mut rng = StdRng::seed_from_u64(seed as u64);
 
+        let mut perm: Vec<u32> = (0..n as u32).collect();
         let tree = Self::build_tree_parallel(
             &vectors_flat,
             dim,
-            (0..n).collect(),
+            &mut perm,
             &mut rng,
             metric,
             max_parallel_depth,
@@ -416,13 +427,12 @@ where
 
         let mut nodes = Vec::new();
         let mut centers_data = Vec::new();
-        let mut leaf_indices = Vec::new();
 
         let root = Self::flatten_tree(
             tree,
             &mut nodes,
             &mut centers_data,
-            &mut leaf_indices,
+            &perm,
             &vectors_flat,
             &metric,
             dim,
@@ -430,19 +440,19 @@ where
 
         // Store the vectors in leaf order so every leaf scan reads one
         // contiguous block. A single tree holds each item exactly once, so the
-        // leaf list is itself the new-to-old permutation.
-        let original_ids = leaf_indices;
+        // permutation is itself the new-to-old map.
         let mut reordered = Vec::with_capacity(vectors_flat.len());
-        for &old in &original_ids {
+        for &old in &perm {
+            let old = old as usize;
             reordered.extend_from_slice(&vectors_flat[old * dim..(old + 1) * dim]);
         }
         let vectors_flat = reordered;
         let norms: Vec<T> = if norms.is_empty() {
             norms
         } else {
-            original_ids.iter().map(|&old| norms[old]).collect()
+            perm.iter().map(|&old| norms[old as usize]).collect()
         };
-        let leaf_indices: Vec<usize> = (0..n).collect();
+        let original_ids = perm;
 
         let centers_data_norm = if metric == Dist::Cosine {
             (0..centers_data.len() / dim)
@@ -456,12 +466,13 @@ where
             Vec::new()
         };
 
+        log.finish();
+
         Ok(BallTreeIndex {
             nodes,
             root,
             centers_data,
             centers_data_norm,
-            leaf_indices,
             vectors_flat,
             dim,
             n,
@@ -477,7 +488,8 @@ where
     ///
     /// * `vector_flat` - Flat data representation
     /// * `dim` - Dimensionality of the data
-    /// * `items` - Which data points are in that node
+    /// * `perm` - Identity permutation of the points, partitioned in place into
+    ///   leaf order
     /// * `rng` - Random number generator
     /// * `metric` - The distance metric
     /// * `max_parallel_depth` - Maximum depth until which to execute parallel
@@ -489,7 +501,7 @@ where
     fn build_tree_parallel(
         vectors_flat: &[T],
         dim: usize,
-        items: Vec<usize>,
+        perm: &mut [u32],
         rng: &mut StdRng,
         metric: Dist,
         max_parallel_depth: usize,
@@ -498,7 +510,8 @@ where
         Self::build_node_local(
             vectors_flat,
             dim,
-            items,
+            perm,
+            0,
             &mut nodes,
             rng,
             metric,
@@ -514,7 +527,9 @@ where
     ///
     /// * `vector_flat` - Flat data representation
     /// * `dim` - Dimensionality of the data
-    /// * `items` - Which data points are in that node
+    /// * `items` - This node's slice of the build permutation; reordered so the
+    ///   left child's points come first
+    /// * `base` - Offset of `items` within the whole permutation
     /// * `rng` - Random number generator
     /// * `metric` - The distance metric
     /// * `depth` - The current depth
@@ -524,7 +539,8 @@ where
     fn build_node_local(
         vectors_flat: &[T],
         dim: usize,
-        items: Vec<usize>,
+        items: &mut [u32],
+        base: usize,
         nodes: &mut Vec<BuildNode<T>>,
         rng: &mut StdRng,
         metric: Dist,
@@ -533,26 +549,40 @@ where
     ) -> Result<usize, AnnSearchErrors> {
         if items.len() <= LEAF_MIN_MEMBERS {
             let node_idx = nodes.len();
-            nodes.push(BuildNode::Leaf { items });
+            nodes.push(BuildNode::Leaf {
+                start: base,
+                len: items.len(),
+            });
             return Ok(node_idx);
         }
 
-        let p1_idx = items[rng.random_range(0..items.len())];
+        let p1_idx = items[rng.random_range(0..items.len())] as usize;
         let p1 = &vectors_flat[p1_idx * dim..(p1_idx + 1) * dim];
         let p2_idx = if items.len() > BALL_SMALL_NODE {
-            find_furthest_from(p1, vectors_flat, &items, dim)
+            find_furthest_from(p1, vectors_flat, items, dim)
         } else {
-            sample_by_distance(p1, vectors_flat, &items, dim, &metric, rng)
-        };
+            sample_by_distance(p1, vectors_flat, items, dim, &metric, rng)
+        } as usize;
         let p2 = &vectors_flat[p2_idx * dim..(p2_idx + 1) * dim];
 
-        let (mut left, mut right) =
-            partition_by_nearest(vectors_flat, &items, dim, p1, p2, &metric);
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        partition_by_nearest(
+            vectors_flat,
+            items,
+            dim,
+            p1,
+            p2,
+            &metric,
+            &mut left,
+            &mut right,
+        );
 
         if left.is_empty() || right.is_empty() {
             let mid = items.len() / 2;
-            left = items[..mid].to_vec();
-            right = items[mid..].to_vec();
+            left.clear();
+            right.clear();
+            left.extend_from_slice(&items[..mid]);
+            right.extend_from_slice(&items[mid..]);
         }
 
         let iters = if items.len() > BALL_SMALL_NODE {
@@ -560,20 +590,29 @@ where
         } else {
             BALL_SPLIT_ITERS
         };
+        let (mut l, mut r) = (Vec::new(), Vec::new());
         for _ in 0..iters {
             let c1 = compute_centroid(vectors_flat, &left, dim);
             let c2 = compute_centroid(vectors_flat, &right, dim);
-            let (l, r) = partition_by_nearest(vectors_flat, &items, dim, &c1, &c2, &metric);
+            partition_by_nearest(vectors_flat, items, dim, &c1, &c2, &metric, &mut l, &mut r);
             if l.is_empty() || r.is_empty() {
                 break;
             }
-            (left, right) = (l, r);
+            std::mem::swap(&mut left, &mut l);
+            std::mem::swap(&mut right, &mut r);
         }
-        let (left_items, right_items) = (left, right);
 
-        let center = compute_centroid(vectors_flat, &items, dim);
+        // Centroid and radius sum in the pre-partition order, so they come
+        // before the permutation is rewritten.
+        let center = compute_centroid(vectors_flat, items, dim);
 
-        let radius = ball_radius(&center, vectors_flat, &items, dim, &metric);
+        let radius = ball_radius(&center, vectors_flat, items, dim, &metric);
+
+        let n_left = left.len();
+        items[..n_left].copy_from_slice(&left);
+        items[n_left..].copy_from_slice(&right);
+        drop((left, right, l, r));
+        let (left_items, right_items) = items.split_at_mut(n_left);
 
         let node_idx = nodes.len();
         nodes.push(BuildNode::Split {
@@ -596,6 +635,7 @@ where
                         vectors_flat,
                         dim,
                         left_items,
+                        base,
                         &mut left_rng,
                         metric,
                         depth + 1,
@@ -608,6 +648,7 @@ where
                         vectors_flat,
                         dim,
                         right_items,
+                        base + n_left,
                         &mut right_rng,
                         metric,
                         depth + 1,
@@ -633,6 +674,7 @@ where
                 vectors_flat,
                 dim,
                 left_items,
+                base,
                 nodes,
                 &mut StdRng::seed_from_u64(seed_left),
                 metric,
@@ -643,6 +685,7 @@ where
                 vectors_flat,
                 dim,
                 right_items,
+                base + n_left,
                 nodes,
                 &mut StdRng::seed_from_u64(seed_right),
                 metric,
@@ -671,16 +714,19 @@ where
     ///
     /// * `vector_flat` - Flat data representation
     /// * `dim` - Dimensionality of the data
-    /// * `items` - Which data points are in that node
+    /// * `items` - This subtree's slice of the build permutation
+    /// * `base` - Offset of `items` within the whole permutation
     /// * `rng` - Random number generator
     /// * `metric` - The distance metric
     /// * `depth` - The current depth
     /// * `max_parallel_depth` - Maximum depth until which to execute parallel
     ///   threading
+    #[allow(clippy::too_many_arguments)]
     fn build_subtree(
         vectors_flat: &[T],
         dim: usize,
-        items: Vec<usize>,
+        items: &mut [u32],
+        base: usize,
         rng: &mut StdRng,
         metric: Dist,
         depth: usize,
@@ -691,6 +737,7 @@ where
             vectors_flat,
             dim,
             items,
+            base,
             &mut nodes,
             rng,
             metric,
@@ -710,13 +757,13 @@ where
     /// * `centers_data` - Mutable vector of the centroids of each node in the
     ///   tree.
     /// * `radii_data` - Mutable vector of the radii of each node in the tree.
-    /// * `leaf_indices` - Mutable vector of leaf indices of the tree.
+    /// * `perm` - The build permutation; leaves are ranges into it.
     #[allow(clippy::too_many_arguments)]
     fn flatten_tree(
         tree: Vec<BuildNode<T>>,
         nodes: &mut Vec<BallNode<T>>,
         centers_data: &mut Vec<T>,
-        leaf_indices: &mut Vec<usize>,
+        perm: &[u32],
         vectors_flat: &[T],
         metric: &Dist,
         dim: usize,
@@ -746,20 +793,17 @@ where
                         radius,
                     });
                 }
-                BuildNode::Leaf { items } => {
-                    let center = compute_centroid(vectors_flat, &items, dim);
-                    let radius = ball_radius(&center, vectors_flat, &items, dim, metric); // Compute actual radius
+                BuildNode::Leaf { start, len } => {
+                    let items = &perm[start..start + len];
+                    let center = compute_centroid(vectors_flat, items, dim);
+                    let radius = ball_radius(&center, vectors_flat, items, dim, metric);
                     let center_idx = (centers_data.len() / dim) as u32;
                     centers_data.extend(center);
 
-                    let start = leaf_indices.len() as u32;
-                    let len = items.len() as u32;
-                    leaf_indices.extend(items);
-
                     nodes.push(BallNode {
                         n_descendants: 1,
-                        child_a: start,
-                        child_b: len,
+                        child_a: start as u32,
+                        child_b: len as u32,
                         center_idx,
                         radius,
                     });
@@ -796,8 +840,7 @@ where
             + self.norms.capacity() * std::mem::size_of::<T>()
             + self.nodes.capacity() * std::mem::size_of::<BallNode<T>>()
             + self.centers_data.capacity() * std::mem::size_of::<T>()
-            + self.leaf_indices.capacity() * std::mem::size_of::<usize>()
-            + self.original_ids.capacity() * std::mem::size_of::<usize>()
+            + self.original_ids.capacity() * std::mem::size_of::<u32>()
     }
 }
 
@@ -867,9 +910,7 @@ where
                     let len = node.child_b as usize;
                     visited_count += len;
 
-                    let leaf_items = unsafe { self.leaf_indices.get_unchecked(start..start + len) };
-
-                    for &item in leaf_items {
+                    for item in start..start + len {
                         if visited.mark(item) {
                             continue;
                         }
@@ -972,7 +1013,7 @@ where
         let results: Vec<(usize, T)> = top_k
             .data()
             .iter()
-            .map(|(OrderedFloat(dist), idx)| (self.original_ids[*idx], *dist))
+            .map(|(OrderedFloat(dist), idx)| (self.original_ids[*idx] as usize, *dist))
             .collect();
 
         Ok(results.into_iter().unzip())
@@ -1017,7 +1058,7 @@ where
     /// * `search_k` - The budget. How many nodes to maximally visit per given
     ///   query.
     /// * `return_dist` - Return the distances.
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -1027,14 +1068,9 @@ where
         k: usize,
         search_k: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("BallTree index", self.n, true, verbosity);
 
         let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
             .into_par_iter()
@@ -1043,25 +1079,17 @@ where
                 let end = start + self.dim;
                 let vec = &self.vectors_flat[start..end];
 
-                if verbose {
-                    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count.is_multiple_of(100_000) {
-                        println!(
-                            "  Processed {} / {} samples.",
-                            count.separate_with_underscores(),
-                            self.n.separate_with_underscores()
-                        );
-                    }
-                }
+                progress.tick();
 
                 self.query(vec, k, search_k)
             })
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+        progress.finish();
 
         // Rows come out in storage order; put them back in original order.
         let mut ordered = vec![(Vec::new(), Vec::new()); self.n];
         for (internal, res) in results.into_iter().enumerate() {
-            ordered[self.original_ids[internal]] = res;
+            ordered[self.original_ids[internal] as usize] = res;
         }
 
         Ok(pack_knn_results(ordered, return_dist))
@@ -1097,7 +1125,7 @@ where
         self.metric
     }
 
-    fn original_ids(&self) -> &[usize] {
+    fn original_ids(&self) -> &[u32] {
         &self.original_ids
     }
 }
@@ -1141,13 +1169,14 @@ mod tests {
     #[test]
     fn test_ball_tree_index_creation() {
         let mat = create_simple_matrix();
-        let _ = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42);
+        let _ = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet);
     }
 
     #[test]
     fn test_ball_tree_query_finds_self() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
@@ -1161,7 +1190,8 @@ mod tests {
     #[test]
     fn test_ball_tree_query_euclidean() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
@@ -1181,7 +1211,7 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(5)).unwrap();
@@ -1196,7 +1226,8 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
@@ -1211,7 +1242,8 @@ mod tests {
         use crate::prelude::*;
 
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
 
@@ -1225,7 +1257,8 @@ mod tests {
     #[test]
     fn test_ball_tree_query_row() {
         let mat = create_simple_matrix();
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         // Query using a row from the matrix
         let (indices, distances) = index.query_row(mat.row(0), 1, Some(5)).unwrap();
@@ -1238,8 +1271,10 @@ mod tests {
     fn test_ball_tree_reproducibility() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index1 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
+        let index2 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
         let (indices1, _) = index1.query(&query, 3, Some(5)).unwrap();
@@ -1252,8 +1287,11 @@ mod tests {
     fn test_ball_tree_different_seeds() {
         let mat = create_simple_matrix();
 
-        let index1 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
-        let index2 = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 123).unwrap();
+        let index1 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
+        let index2 =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 123, Verbosity::Quiet)
+                .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
 
@@ -1277,7 +1315,8 @@ mod tests {
         }
 
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 5, None).unwrap();
@@ -1291,7 +1330,7 @@ mod tests {
         use crate::prelude::*;
         let data = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         let mat = Mat::from_fn(3, 3, |i, j| data[i * 3 + j]);
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42).unwrap();
+        let index = BallTreeIndex::new(mat.as_ref(), Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let (indices, distances) = index.query(&query, 3, Some(3)).unwrap();
@@ -1309,7 +1348,8 @@ mod tests {
         let data: Vec<f32> = (0..n * dim).map(|i| i as f32).collect();
         let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
 
-        let index = BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42).unwrap();
+        let index =
+            BallTreeIndex::new(mat.as_ref(), Dist::SquaredEuclidean, 42, Verbosity::Quiet).unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
         let (indices, _) = index.query(&query, 3, None).unwrap(); // 5% of 50 is 2.5 -> 2. Safe-ish.

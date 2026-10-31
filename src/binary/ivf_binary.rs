@@ -7,8 +7,6 @@ use faer_traits::ComplexField;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use thousands::Separable;
 
 use crate::binary::binariser::*;
@@ -16,6 +14,8 @@ use crate::binary::dist_binary::*;
 use crate::binary::vec_store::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::verbosity::{BuildLog, QueryProgress};
+use std::time::Instant;
 
 ////////////////////
 // IvfIndexBinary //
@@ -51,25 +51,26 @@ pub struct IvfIndexBinary<T> {
     /// distances
     centroids_norm: Vec<T>,
     /// Vector indices for each cluster (CSR format)
-    all_indices: Vec<usize>,
+    all_indices: Vec<u32>,
     /// Offsets for CSR access
-    offsets: Vec<usize>,
+    offsets: Vec<u32>,
     /// Number of clusters/lists in this index
     nlist: usize,
     /// Optional vector store that is saved in binary on disk
     #[cfg_attr(feature = "serialise", serde(skip))]
-    vector_store: Option<MmapVectorStore<T>>,
-    /// Shape of `vector_store`, so it can be re-opened after a load. Only
+    vector_store: Option<VectorStore<T>>,
+    /// Fingerprint of `vector_store`, checked when it is re-opened after a
+    /// load. Only
     /// read by the `serialise` feature; the field is kept unconditionally so
     /// the constructors stay free of `cfg`.
     #[cfg_attr(not(feature = "serialise"), allow(dead_code))]
-    store_meta: Option<StoreMeta>,
+    store_fingerprint: Option<u64>,
     /// New to old mapping
-    original_ids: Vec<usize>,
+    original_ids: Vec<u32>,
     /// Old to new mapping. Read by the asymmetric query path, which gets
     /// original ids back from [`IvfIndexBinary::query`] and has to reach the
     /// physical code slot they live in.
-    old_to_new: Vec<usize>,
+    old_to_new: Vec<u32>,
 }
 
 //////////////////////////
@@ -138,7 +139,7 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -152,8 +153,9 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -165,18 +167,12 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!(
-                "  Generating IVF-Binary index with {} Voronoi cells.",
-                nlist
-            );
-        }
-
         // 1. subsample for training if needed
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
+        let start = Instant::now();
         let centroids_float = train_centroids(
             &training_data,
             dim,
@@ -185,8 +181,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             (0..nlist)
@@ -261,13 +265,15 @@ where
             offsets,
             nlist,
             vector_store: None,
-            store_meta: None,
+            store_fingerprint: None,
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
         };
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -290,8 +296,9 @@ where
     ///   [KMeansTrainingParams]. If not provided, will default to sensible
     ///   defaults.
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     /// * `save_path` - Directory to save vector store files
+    /// * `store_encoding` - Precision the store keeps the rows at
     ///
     /// ### Returns
     ///
@@ -305,9 +312,11 @@ where
         nlist: Option<usize>,
         k_means_params: Option<KMeansTrainingParams>,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
         save_path: impl AsRef<Path>,
+        store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
+        let log = BuildLog::new("IVF-Binary index", verbosity);
         if !n_bits.is_multiple_of(8) {
             return Err(AnnSearchErrors::NBitsMustBe8Multiple { n_bits });
         }
@@ -319,18 +328,12 @@ where
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
-        if verbose {
-            println!(
-                "  Generating IVF-Binary index with {} Voronoi cells.",
-                nlist
-            );
-        }
-
         // 1. subsample for training if needed
         let n_train = (256 * nlist).min(250_000).min(n).max(1);
         let (training_data, _) = sample_vectors(&vectors_flat, dim, n, n_train, seed);
 
         // 2. train float centroids
+        let start = Instant::now();
         let centroids_float = train_centroids(
             &training_data,
             dim,
@@ -339,8 +342,16 @@ where
             &metric,
             k_means_params,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
+        if verbosity.detailed_verbosity() {
+            println!(
+                " Trained k-means ({} centroids, {} samples) in {:.2?}",
+                nlist.separate_with_underscores(),
+                n_train.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
 
         let centroids_norm = if metric == Dist::Cosine {
             centroids_float
@@ -399,7 +410,6 @@ where
         binariser.encode_all(&vectors_flat, n, &mut vectors_flat_binarised)?;
 
         // Save vector store
-        std::fs::create_dir_all(&save_path)?;
 
         // Cosine already computed exactly these for the assignment step; the
         // other metrics filled `data_norms` with ones and need the real thing.
@@ -412,11 +422,9 @@ where
                 .collect()
         };
 
-        let (vectors_path, norms_path) = MmapVectorStore::<T>::paths_in(&save_path);
-
-        MmapVectorStore::save(&vectors_flat, &norms, dim, n, &vectors_path, &norms_path)?;
-
-        let vector_store = MmapVectorStore::new(vectors_path, norms_path, dim, n)?;
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
+        let store_fingerprint = Some(vector_store.fingerprint());
 
         let mut idx = Self {
             vectors_flat_binarised,
@@ -432,13 +440,15 @@ where
             offsets,
             nlist,
             vector_store: Some(vector_store),
-            store_meta: Some(StoreMeta { dim, n }),
+            store_fingerprint,
             original_ids: Vec::new(),
             old_to_new: Vec::new(),
         };
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+
+        log.finish();
 
         Ok(idx)
     }
@@ -496,8 +506,8 @@ where
         let mut block = [0u32; HAMMING_BLOCK];
 
         for cluster_idx in probed {
-            let start = self.offsets[cluster_idx];
-            let end = self.offsets[cluster_idx + 1];
+            let start = self.offsets[cluster_idx] as usize;
+            let end = self.offsets[cluster_idx + 1] as usize;
 
             let mut vec_idx = start;
             while vec_idx < end {
@@ -527,7 +537,7 @@ where
 
         let (distances, indices): (Vec<_>, Vec<_>) = results
             .into_iter()
-            .map(|(d, i)| (d, self.original_ids[i]))
+            .map(|(d, i)| (d, self.original_ids[i] as usize))
             .unzip();
 
         Ok((indices, distances))
@@ -606,7 +616,7 @@ where
         let mut scored: Vec<(usize, T)> = candidates
             .iter()
             .map(|&idx| {
-                let start_i = self.old_to_new[idx] * self.n_bytes;
+                let start_i = self.old_to_new[idx] as usize * self.n_bytes;
                 let vec_i = unsafe {
                     self.vectors_flat_binarised
                         .get_unchecked(start_i..start_i + self.n_bytes)
@@ -789,7 +799,7 @@ where
     /// * `nprobe` - Number of clusters to search (defaults to sqrt(nlist))
     /// * `rerank_factor` - Multiplier for candidate set (only used if vector_store available)
     /// * `return_dist` - Whether to return distances
-    /// * `verbose` - Controls verbosity
+    /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
     /// ### Returns
     ///
@@ -800,32 +810,24 @@ where
         nprobe: Option<usize>,
         rerank_factor: Option<usize>,
         return_dist: bool,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let counter = Arc::new(AtomicUsize::new(0));
+        let progress = QueryProgress::new("IVF-Binary index", self.n, true, verbosity);
 
         if let Some(vector_store) = &self.vector_store {
             let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
-                    let orig_id = self.original_ids[i];
-                    let vec = vector_store.load_vector(orig_id);
+                    let orig_id = self.original_ids[i] as usize;
+                    let vec = vector_store.row(orig_id);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
-                    let (indices, dists) = self.query_reranking(vec, k, nprobe, rerank_factor)?;
+                    let (indices, dists) = self.query_reranking(&vec, k, nprobe, rerank_factor)?;
                     Ok((orig_id, indices, dists))
                 })
                 .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+            progress.finish();
 
             let mut final_indices = vec![Vec::new(); self.n];
             let mut final_dists = if return_dist {
@@ -847,28 +849,19 @@ where
             let unordered_results: Vec<(usize, Vec<usize>, Vec<u32>)> = (0..self.n)
                 .into_par_iter()
                 .map(|i| {
-                    let orig_id = self.original_ids[i];
+                    let orig_id = self.original_ids[i] as usize;
                     let start = i * self.n_bytes;
                     let query_binary = &self.vectors_flat_binarised[start..start + self.n_bytes];
                     let k = k.min(self.n);
 
-                    if verbose {
-                        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100_000) {
-                            println!(
-                                "  Processed {} / {} samples.",
-                                count.separate_with_underscores(),
-                                self.n.separate_with_underscores()
-                            );
-                        }
-                    }
+                    progress.tick();
 
                     let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(k + 1);
                     let mut block = [0u32; HAMMING_BLOCK];
 
                     for cluster_idx in 0..self.nlist {
-                        let start_idx = self.offsets[cluster_idx];
-                        let end_idx = self.offsets[cluster_idx + 1];
+                        let start_idx = self.offsets[cluster_idx] as usize;
+                        let end_idx = self.offsets[cluster_idx + 1] as usize;
 
                         let mut vec_idx = start_idx;
                         while vec_idx < end_idx {
@@ -898,11 +891,12 @@ where
                     }
 
                     let mut results: Vec<_> = heap.into_iter().collect();
+                    progress.finish();
                     results.sort_unstable_by_key(|&(dist, _)| dist);
 
                     let (distances, indices): (Vec<_>, Vec<_>) = results
                         .into_iter()
-                        .map(|(d, i)| (d, self.original_ids[i]))
+                        .map(|(d, i)| (d, self.original_ids[i] as usize))
                         .unzip();
 
                     (orig_id, indices, distances)
@@ -938,8 +932,8 @@ where
             + self.binariser.memory_usage_bytes()
             + self.centroids_float.capacity() * std::mem::size_of::<T>()
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
-            + self.all_indices.capacity() * std::mem::size_of::<usize>()
-            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.all_indices.capacity() * std::mem::size_of::<u32>()
+            + self.offsets.capacity() * std::mem::size_of::<u32>()
     }
 
     /// Returns whether the index supports asymmetric queries
@@ -957,15 +951,15 @@ where
     /// ### Returns
     ///
     /// New to old mapping
-    fn optimise_memory_layout(&mut self) -> Vec<usize> {
+    fn optimise_memory_layout(&mut self) -> Vec<u32> {
         let mut new_to_old = Vec::with_capacity(self.n);
-        let mut old_to_new = vec![0usize; self.n];
+        let mut old_to_new = vec![0u32; self.n];
 
         for cluster in 0..self.nlist {
-            let start = self.offsets[cluster];
-            let end = self.offsets[cluster + 1];
+            let start = self.offsets[cluster] as usize;
+            let end = self.offsets[cluster + 1] as usize;
             for &old_id in &self.all_indices[start..end] {
-                old_to_new[old_id] = new_to_old.len();
+                old_to_new[old_id as usize] = new_to_old.len() as u32;
                 new_to_old.push(old_id);
             }
         }
@@ -976,7 +970,7 @@ where
             .par_chunks_mut(n_bytes)
             .zip(new_to_old.par_iter())
             .for_each(|(slot, &old_id)| {
-                let start = old_id * n_bytes;
+                let start = old_id as usize * n_bytes;
                 slot.copy_from_slice(&self.vectors_flat_binarised[start..start + n_bytes]);
             });
 
@@ -1003,7 +997,7 @@ use crate::utils::staging::StagedFiles;
 #[cfg(feature = "serialise")]
 impl<T> IndexIo for IvfIndexBinary<T>
 where
-    T: AnnSearchFloat,
+    T: AnnSearchFloat + Pod,
 {
     type Elem = T;
 
@@ -1017,10 +1011,7 @@ where
     }
 
     fn load_aux(&mut self, dir: &Path) -> Result<(), AnnSearchErrors> {
-        if let Some(meta) = self.store_meta {
-            meta.check(self.n, self.dim)?;
-        }
-        self.vector_store = MmapVectorStore::open_in_dir(dir, self.store_meta)?;
+        self.vector_store = VectorStore::open_for(dir, self.store_fingerprint, self.n, self.dim)?;
 
         Ok(())
     }
@@ -1090,7 +1081,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1125,11 +1116,13 @@ mod tests {
             Some(8),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (indices, _) = index.generate_knn(k, Some(4), None, false, false).unwrap();
+        let (indices, _) = index
+            .generate_knn(k, Some(4), None, false, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(indices.len(), n);
         for (row, neighbours) in indices.iter().enumerate() {
@@ -1156,8 +1149,9 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1281,8 +1275,9 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1332,8 +1327,9 @@ mod tests {
             Some(8),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1386,7 +1382,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1415,7 +1411,7 @@ mod tests {
                 Some(4),
                 get_default_k_means(),
                 42,
-                false,
+                Verbosity::Quiet,
             )
             .unwrap();
 
@@ -1435,7 +1431,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1457,7 +1453,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1479,7 +1475,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1502,7 +1498,7 @@ mod tests {
             Some(20),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1525,7 +1521,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1547,12 +1543,13 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
-        let (knn_indices, knn_distances) =
-            index.generate_knn(5, Some(10), None, true, false).unwrap();
+        let (knn_indices, knn_distances) = index
+            .generate_knn(5, Some(10), None, true, Verbosity::Quiet)
+            .unwrap();
 
         assert_eq!(knn_indices.len(), 100);
         assert!(knn_distances.is_some());
@@ -1575,8 +1572,9 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1599,8 +1597,9 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1630,8 +1629,9 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
@@ -1657,13 +1657,14 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
             temp_dir.path(),
+            StoreEncoding::Full,
         )
         .unwrap();
 
         let (knn_indices, knn_distances) = index
-            .generate_knn(5, Some(10), Some(10), true, false)
+            .generate_knn(5, Some(10), Some(10), true, Verbosity::Quiet)
             .unwrap();
 
         assert_eq!(knn_indices.len(), 100);
@@ -1685,7 +1686,7 @@ mod tests {
             Some(10),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
         let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
@@ -1707,7 +1708,7 @@ mod tests {
             Some(16),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -1730,7 +1731,7 @@ mod tests {
             Some(40),
             get_default_k_means(),
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 

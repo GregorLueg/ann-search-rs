@@ -148,7 +148,7 @@ where
     /// * `metric` - Distance metric (for k-means clustering)
     /// * `max_iters` - Maximum k-means iterations
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints one line per codebook at `Detailed`
     ///
     /// ### Returns
     ///
@@ -171,7 +171,7 @@ where
         _metric: &Dist,
         max_iters: usize,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         let n_centroids = n_centroids.unwrap_or(N_CLUSTERS_PQ);
         // checks
@@ -201,8 +201,8 @@ where
 
         let codebooks: Vec<Vec<T>> = (0..m)
             .map(|subspace| {
-                if verbose {
-                    println!("  Training codebook {} / {}", subspace + 1, m);
+                if verbosity.detailed_verbosity() {
+                    println!("  Codebook {} / {}", subspace + 1, m);
                 }
                 let mut subvectors = Vec::with_capacity(n * subvec_dim);
                 for vec_idx in 0..n {
@@ -219,10 +219,6 @@ where
                 )
             })
             .collect();
-
-        if verbose {
-            println!("  Product quantiser training complete");
-        }
 
         Ok(Self {
             codebooks,
@@ -430,7 +426,7 @@ where
     /// * `n_centroids` - Optional number of centroids per subspace (defaults to 256)
     /// * `max_iters` - Maximum k-means iterations
     /// * `seed` - Random seed
-    /// * `verbose` - Print progress
+    /// * `verbosity` - Prints one line per rotation iteration at `Detailed`
     ///
     /// ### Returns
     ///
@@ -444,7 +440,7 @@ where
         n_iter: Option<usize>,
         max_iters: usize,
         seed: usize,
-        verbose: bool,
+        verbosity: Verbosity,
     ) -> Result<Self, AnnSearchErrors> {
         let n = vectors_flat.len() / dim;
 
@@ -472,13 +468,13 @@ where
             &Dist::SquaredEuclidean,
             max_iters,
             seed,
-            false,
+            Verbosity::Quiet,
         )?;
 
         let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
 
         for iter in 0..rotation_iter {
-            if verbose {
+            if verbosity.detailed_verbosity() {
                 println!("  OPQ iteration {} / {}", iter + 1, rotation_iter);
             }
 
@@ -494,7 +490,7 @@ where
                 &Dist::SquaredEuclidean,
                 max_iters,
                 seed + iter,
-                false,
+                Verbosity::Quiet,
             )?;
 
             // encode and reconstruct
@@ -521,7 +517,7 @@ where
             &Dist::SquaredEuclidean,
             max_iters,
             seed,
-            verbose,
+            Verbosity::Quiet,
         )?;
 
         Ok(Self {
@@ -938,9 +934,17 @@ mod tests {
             }
         }
 
-        let pq =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
-                .unwrap();
+        let pq = ProductQuantiser::train(
+            &data,
+            32,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(pq.m(), 2);
         assert_eq!(pq.subvec_dim(), 16);
@@ -967,7 +971,7 @@ mod tests {
             &Dist::SquaredEuclidean,
             10,
             42,
-            false,
+            Verbosity::Quiet,
         )
         .unwrap();
 
@@ -988,13 +992,29 @@ mod tests {
             }
         }
 
-        let pq1 =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
-                .unwrap();
+        let pq1 = ProductQuantiser::train(
+            &data,
+            32,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let pq2 =
-            ProductQuantiser::train(&data, 32, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false)
-                .unwrap();
+        let pq2 = ProductQuantiser::train(
+            &data,
+            32,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let vec: Vec<f32> = (16..48).map(|x| x as f32).collect();
         let codes1 = pq1.encode(&vec);
@@ -1006,8 +1026,16 @@ mod tests {
     #[test]
     fn test_product_quantiser_invalid_m() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let result =
-            ProductQuantiser::train(&data, 5, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        let result = ProductQuantiser::train(
+            &data,
+            5,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            5,
+            42,
+            Verbosity::Quiet,
+        );
         assert!(matches!(
             result,
             Err(AnnSearchErrors::DimensionNotDivisibleByM { dim: 5, m: 2 })
@@ -1017,8 +1045,16 @@ mod tests {
     #[test]
     fn test_product_quantiser_dim_too_small() {
         let data = vec![1.0, 2.0, 3.0, 4.0];
-        let result =
-            ProductQuantiser::train(&data, 16, 2, Some(2), &Dist::SquaredEuclidean, 5, 42, false);
+        let result = ProductQuantiser::train(
+            &data,
+            16,
+            2,
+            Some(2),
+            &Dist::SquaredEuclidean,
+            5,
+            42,
+            Verbosity::Quiet,
+        );
         assert!(matches!(
             result,
             Err(AnnSearchErrors::DimensionTooSmallForPQ { dim: 16 })
@@ -1034,8 +1070,17 @@ mod tests {
             }
         }
 
-        let opq =
-            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
+        let opq = OptimisedProductQuantiser::train(
+            &data,
+            32,
+            4,
+            Some(4),
+            Some(1),
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         assert_eq!(opq.m(), 4);
         assert_eq!(opq.subvec_dim(), 8);
@@ -1051,8 +1096,17 @@ mod tests {
             }
         }
 
-        let opq =
-            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
+        let opq = OptimisedProductQuantiser::train(
+            &data,
+            32,
+            4,
+            Some(4),
+            Some(1),
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes = opq.encode(&vec);
@@ -1064,8 +1118,17 @@ mod tests {
     fn test_opq_rotate() {
         let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
 
-        let opq =
-            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
+        let opq = OptimisedProductQuantiser::train(
+            &data,
+            32,
+            4,
+            Some(4),
+            Some(1),
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let rotated = opq.rotate(&vec);
@@ -1077,11 +1140,29 @@ mod tests {
     fn test_opq_deterministic() {
         let data: Vec<f32> = (0..320).map(|x| x as f32).collect();
 
-        let opq1 =
-            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
+        let opq1 = OptimisedProductQuantiser::train(
+            &data,
+            32,
+            4,
+            Some(4),
+            Some(1),
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
-        let opq2 =
-            OptimisedProductQuantiser::train(&data, 32, 4, Some(4), Some(1), 5, 42, false).unwrap();
+        let opq2 = OptimisedProductQuantiser::train(
+            &data,
+            32,
+            4,
+            Some(4),
+            Some(1),
+            5,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
 
         let vec: Vec<f32> = (0..32).map(|x| x as f32).collect();
         let codes1 = opq1.encode(&vec);

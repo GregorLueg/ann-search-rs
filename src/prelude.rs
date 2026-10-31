@@ -4,6 +4,7 @@
 //! use ann_search_rs::prelude::*;
 //! ```
 
+pub use crate::cpu::nndescent::NNDescentKnnParams;
 pub use crate::errors::AnnSearchErrors;
 pub use crate::utils::dist::*;
 pub use crate::utils::graph_utils::ThreadLocalSearchState;
@@ -11,12 +12,16 @@ pub use crate::utils::heap_structs::*;
 pub use crate::utils::input::AnnMatrix;
 pub use crate::utils::k_means_utils::{KMeansInit, KMeansTrainingParams, LloydPath, SoarRule};
 pub use crate::utils::matrix_to_flat;
+pub use crate::utils::nndescent_utils::{KnnGraph, KNN_GRAPH_EMPTY};
 pub use crate::utils::parallelism::StripedLocks;
 pub use crate::utils::prefetch_read;
 pub use crate::utils::traits::AnnSearchFloat;
+pub use crate::utils::verbosity::{parse_annsearch_verbosity, Verbosity};
 pub use crate::utils::DimensionValidation;
 pub use crate::utils::FlattenData;
 
+#[cfg(feature = "binary")]
+pub use crate::binary::vec_store::{parse_store_encoding, StoreEncoding};
 #[cfg(feature = "gpu")]
 pub use crate::gpu::cagra_gpu_search::CagraGpuSearchParams;
 #[cfg(mlx_available)]
@@ -33,7 +38,7 @@ pub use crate::gpu::k_means_gpu::KMeansGpuParams;
 // `extract_knn_graph_gpu`, so leaving it out forces callers to name the module
 // path by hand.
 #[cfg(feature = "gpu")]
-pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu};
+pub use crate::gpu::nndescent_gpu::{KnnGraphGpu, NNDescentGpu, NNDescentGpuKnnParams};
 #[cfg(feature = "gpu")]
 pub use cubecl_utils_rs::CubeclFloat;
 
