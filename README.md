@@ -33,6 +33,13 @@ the [CHANGELOG](https://github.com/GregorLueg/ann-search-rs/blob/main/CHANGELOG.
 
 Distances: squared Euclidean, cosine, and Manhattan on a subset of the indices.
 
+Exhaustive and IVF RaBitQ can do without the on-disk store: with `ex_bits`
+(`1..=8`) every vector keeps a wider code, and candidates the one-bit estimate
+cannot rule out are re-scored on that instead. With a store,
+`rerank_factor: None` reads exact distances only for candidates whose error
+bound still overlaps the current k-th distance; `Some(f)` keeps the fixed
+`k * f` shortlist.
+
 Every index has a `query_*_self` path for the full self-kNN graph, and most take
 a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
 re-entering, NN-Descent hands back the graph it built anyway.

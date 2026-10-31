@@ -35,6 +35,19 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `StoreEncoding::Full`. Halves the store file. Rows decode in chunks through
   `half` (F16C or the aarch64 fp16 conversion, picked at runtime) into the
   existing SIMD kernels, so re-ranking runs at f32 speed.
+- Exhaustive and IVF RaBitQ follow the upstream RaBitQ-Library estimator: one
+  lookup table per query instead of one per probed cluster, the
+  `f_add`/`f_rescale`/`f_error` factor form, and a lower bound per candidate.
+  One-bit IVF queries run about 2.5x faster, and builds encode in parallel.
+- `ex_bits` on exhaustive and IVF RaBitQ: magnitude bits on top of the sign
+  bit. Candidates the one-bit bound cannot rule out are re-scored on the wider
+  code, so high recall works without the on-disk store.
+- `rerank_factor: None` on exhaustive and IVF RaBitQ is the bound-gated
+  rerank: exact distances only for candidates whose lower bound still beats
+  the current k-th distance. `Some(f)` keeps the fixed `k * f` shortlist.
+- Quantised Graph stops at the first empty FastScan batch, and fills empty
+  slots of the scanned batches with the nearest 2-hop neighbours at build.
+  Higher recall at the same `ef`.
 
 **Memory**
 
@@ -96,6 +109,16 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `Cow<[T]>`. The old `VectorStore` trait and `StoreMeta` are gone.
   `AnnSearchErrors::SizeMismatch` is replaced by `StoreInvalid { path, reason }`.
 - The `binary` feature pulls in `half`.
+- `build_ivf_index_rabitq` takes `ex_bits` after `k_means_params`,
+  `build_exhaustive_index_rabitq` after `n_clust_rabitq`. The IVF and
+  exhaustive RaBitQ constructors and `RaBitQQuantiser::new` /
+  `with_rotator_kind` follow.
+- `rerank_factor: None` on exhaustive and IVF RaBitQ no longer means
+  `Some(20)`, see above.
+- `RaBitQEncoder::encode_query` takes the normalised query and `ex_bits`, and
+  builds one lookup table per query. `encode_query_prerotated`, the
+  quantiser's `encode_query` wrappers and `RaBitQStorage::cluster_dist_to_centroid`
+  / `cluster_dot_corrections` are gone.
 - Save format bumped from 6 to 7: the Annoy, Kd, NN-Descent, ball tree,
   IVF-family and binary-index layouts changed. Older indices error on load.
 
