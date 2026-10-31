@@ -2441,11 +2441,18 @@ index is query speed, since the approximate distance is more work than a popcoun
 - *n_probe*: `ExhaustiveRaBitQ` is exhaustive only in the sense that there is no
   IVF above it. The query still probes a share of its own `sqrt(n)` centroids,
   25% of them when left at `None`, which is what the grid runs. It is not swept.
-- *reranking_factor (rf)*: As for the binary indices. The RaBitQ estimate picks
-  the candidates, then the on-disk vectors are loaded and re-scored exactly.
-  `10` means `10 * k` vectors get re-scored. The exhaustive grid runs `rf0` (the
-  estimate alone, no re-ranking), `5`, `10` and `20`; the IVF grid runs `rf0`,
-  `10` and `20`.
+- *reranking_factor (rf)*: The RaBitQ estimate picks the candidates, then the
+  on-disk vectors are loaded and re-scored exactly. `10` means `10 * k` vectors
+  get re-scored. `rfB` is the default (`None`): every estimate carries an error
+  bound, and only candidates whose lower bound still beats the current k-th
+  distance are re-scored, so the shortlist sizes itself per query. The
+  exhaustive grid runs `rf0` (the estimate alone, no re-ranking), `5`, `10`,
+  `20` and `B`; the IVF grid runs `rf0`, `10`, `20` and `B`.
+- *ex_bits (ex)*: Magnitude bits per coordinate on top of the sign bit, `0` by
+  default. With `ex_bits > 0` the candidates the one-bit bound cannot rule out
+  are re-scored on the wider code instead of from disk, so there is no store at
+  all. The `ex` rows run `2`, `4` and `8` at `nl = sqrt(n)` with `np` at
+  `sqrt(nlist)` and 5% of `nlist`.
 
 **Tunable parameters *(IVF-specific)*:**
 
@@ -2455,7 +2462,7 @@ index is query speed, since the approximate distance is more work than a popcoun
   deduplicated.
 
 Self queries run at `reranking_factor = 10` for the exhaustive index and at the
-default `20` for IVF, the latter at `np = sqrt(2 * nlist)`.
+bound-gated default for IVF, the latter at `np = sqrt(2 * nlist)`.
 
 #### Correlated data
 
@@ -3105,9 +3112,11 @@ HNSW-RaBitQ below or at `IVF-RaBitQ` above.
 
 The graph is not from the paper. SymphonyQG builds its own topology with
 random init, repeated search-prune-reverse rounds and a cosine-threshold refill
-to force exact-degree regularity; `VamanaIndex` already yields a fixed-degree
-graph, so it builds the topology here and what is kept from the paper is the
-storage layout and the estimator.
+to force exact degree; here `VamanaIndex` builds the topology and what is kept
+from the paper is the storage layout and the estimator. Vamana's pruning leaves
+slots empty, and an empty fast-scan lane costs the same as a full one, so the
+build fills the empty slots of every partly filled batch with the nearest 2-hop
+neighbours, and the query stops at the first batch that is empty throughout.
 
 **Tunable parameters *(QG)*:**
 
