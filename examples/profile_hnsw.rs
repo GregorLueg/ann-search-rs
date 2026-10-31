@@ -151,7 +151,9 @@ fn load_data(cli: &Cli) -> (Vec<f32>, usize, usize) {
 
     let bytes = std::fs::read(path).expect("could not read --data-file");
     let mut flat: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 

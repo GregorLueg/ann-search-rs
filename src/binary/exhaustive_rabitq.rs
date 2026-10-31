@@ -170,6 +170,7 @@ where
     /// ### Returns
     ///
     /// Initialised index
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_vector_store(
         data: impl AnnMatrix<T>,
         metric: &Dist,

@@ -3,6 +3,12 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.12.1
+
+**Misc**
+
+- Missed clippy warnings with new version
+
 ## 0.12.0
 
 **Features**

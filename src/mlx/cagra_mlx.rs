@@ -1340,7 +1340,9 @@ mod tests {
     fn latent(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let proj = uniform(8, dim, 999);
         let z = uniform(n, 8, seed);
-        z.chunks_exact(8)
+        z.as_chunks::<8>()
+            .0
+            .iter()
             .flat_map(|zr| {
                 (0..dim)
                     .map(|j| (0..8).map(|l| zr[l] * proj[l * dim + j]).sum::<f32>() / 10.0)
