@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.6.1
+
+Requires `ann-search-rs` 0.12.2
+
+- Takes in the faster GPU k-means from `ann-search-rs` without any impact on the
+  Python API.
+
 ## 0.6.0
 
 Requires `ann-search-rs` 0.12.0

@@ -3,6 +3,13 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.12.2
+
+**Performance**
+
+- GPU k-means on wgpu is faster above 96 dimensions, with the same results: 22.0 s
+  to 12.2 s at 885k x 100, k = 4096 on an M1 Max. Tuned on Apple Silicon only.
+
 ## 0.12.1
 
 **Misc**
