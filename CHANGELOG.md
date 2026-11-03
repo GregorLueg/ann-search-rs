@@ -7,8 +7,7 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Performance**
 
-- GPU k-means on wgpu is faster above 96 dimensions, with the same results: 22.0 s
-  to 12.2 s at 885k x 100, k = 4096 on an M1 Max. Tuned on Apple Silicon only.
+- GPU k-means on wgpu is faster above 96 dimensions, with the same results.
 
 ## 0.12.1
 
