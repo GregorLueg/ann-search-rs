@@ -46,8 +46,41 @@ const SEGMENT_UNROLL: usize = 8;
 /// accumulator type.
 const SEGMENTED_SMEM_LEN: usize = WORKGROUP_128 as usize;
 
-/// Centroids scored per unrolled step in the assignment kernels.
+/// Centroids scored per unrolled step in the assignment kernels, up to
+/// [`CENTROID_UNROLL_MAX_LINES`] lines per row.
 const CENTROID_UNROLL: usize = 8;
+
+/// Centroids scored per unrolled step above [`CENTROID_UNROLL_MAX_LINES`].
+///
+/// Yes, 11 on Apple Silicon. It works around how Apple's shader compiler
+/// allocates registers, and nothing about the algorithm asks for it.
+///
+/// naga always tags a compute kernel with
+/// `[[max_total_threads_per_threadgroup(N)]]`, N being the workgroup size. With
+/// that cap in place, the compiler picks a register budget that moves in steps
+/// as the unroll grows, with two or more unrolls sharing a step. When the
+/// accumulators outgrow the budget, it spills them to threadgroup memory: a
+/// load, multiply-add and store inside the per-line loop, plus a chain of
+/// register moves. That is enough to halve the speed of the kernel, so speed
+/// zigzags with the unroll. 11 is the first unroll on a much larger step, so it
+/// spills nothing, whereas 8 spills at this row length and the same kernel with
+/// the attribute removed, or at workgroup 160, does not.
+///
+/// This was read from the disassembly on one M1-generation GPU, so another chip
+/// or compiler may land elsewhere. Other platforms stay on [`CENTROID_UNROLL`],
+/// as nothing was tested there. If the kernel body changes, sweep the unroll
+/// again and look for `threadgroup_load` and `threadgroup_store` in the hot
+/// loop: serialise the pipeline with `MTLBinaryArchive` and disassemble its
+/// `__text` with `dougallj/applegpu`.
+const CENTROID_UNROLL_WIDE: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    11
+} else {
+    CENTROID_UNROLL
+};
+
+/// Row length in lines where the assignment kernels move to
+/// [`CENTROID_UNROLL_WIDE`].
+const CENTROID_UNROLL_MAX_LINES: usize = 24;
 
 /// Oversampling factor for [`kmeans_parallel_init_gpu`]. Each round samples
 /// `k * KMEANSPP_OVERSAMPLING` candidates. Matches the upstream CPU
@@ -134,6 +167,23 @@ impl Default for KMeansGpuParams {
     }
 }
 
+/// Centroids to score per unrolled step in the assignment kernels.
+///
+/// ### Params
+///
+/// * `dim_lines` - Row length in lines
+///
+/// ### Returns
+///
+/// The unroll to launch with.
+fn centroid_unroll(dim_lines: usize) -> usize {
+    if dim_lines <= CENTROID_UNROLL_MAX_LINES {
+        CENTROID_UNROLL
+    } else {
+        CENTROID_UNROLL_WIDE
+    }
+}
+
 /////////////
 // Kernels //
 /////////////
@@ -177,6 +227,8 @@ impl Default for KMeansGpuParams {
 /// * `dim_lines` - Vectorised dimension (`dim / LINE_SIZE`); comptime
 /// * `wg_size` - Workgroup size; comptime
 /// * `use_cosine` - Cosine instead of squared Euclidean; comptime
+/// * `unroll` - Centroids scored per unrolled step, see `centroid_unroll`;
+///   comptime
 ///
 /// ### Grid mapping
 ///
@@ -194,6 +246,7 @@ pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
     #[comptime] use_cosine: bool,
+    #[comptime] unroll: usize,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -220,19 +273,19 @@ pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
     let mut best_dist = A::new(f32::MAX);
     let mut best_idx = 0u32;
 
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
+    let cu = unroll as u32;
+    let mut accs = Array::<Vector<A, N>>::new(unroll);
 
     let mut c = 0u32;
     while c + cu <= k {
         #[unroll]
-        for u in 0..CENTROID_UNROLL {
+        for u in 0..unroll {
             accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
         }
         for i in 0..dim_lines {
             let pv = p[i];
             #[unroll]
-            for u in 0..CENTROID_UNROLL {
+            for u in 0..unroll {
                 if use_cosine {
                     accs[u] += pv * centroids[(c as usize + u) * dim_lines + i];
                 } else {
@@ -242,7 +295,7 @@ pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
             }
         }
         #[unroll]
-        for u in 0..CENTROID_UNROLL {
+        for u in 0..unroll {
             let av = accs[u];
             let mut sum = A::new(0.0_f32);
             #[unroll]
@@ -260,7 +313,7 @@ pub fn flash_assign_vec<S: Float, A: Float, N: Size>(
         c += cu;
     }
 
-    // Tail for `k` not divisible by CENTROID_UNROLL.
+    // Tail for `k` not divisible by `unroll`.
     while c < k {
         let cbase = c as usize * dim_lines;
         let mut acc = Vector::<A, N>::new(A::new(0.0_f32));
@@ -363,6 +416,7 @@ where
             dim_lines,
             WORKGROUP_128,
             use_cosine,
+            centroid_unroll(dim_lines),
         );
     }
 
@@ -418,6 +472,7 @@ pub fn min_dist_vec<S: Float, A: Float, N: Size>(
     #[comptime] dim_lines: usize,
     #[comptime] wg_size: u32,
     #[comptime] use_cosine: bool,
+    #[comptime] unroll: usize,
 ) {
     let point_idx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
     if point_idx >= n_samples {
@@ -442,19 +497,19 @@ pub fn min_dist_vec<S: Float, A: Float, N: Size>(
 
     let mut best = A::new(f32::MAX);
 
-    let cu = CENTROID_UNROLL as u32;
-    let mut accs = Array::<Vector<A, N>>::new(CENTROID_UNROLL);
+    let cu = unroll as u32;
+    let mut accs = Array::<Vector<A, N>>::new(unroll);
 
     let mut c = 0u32;
     while c + cu <= k {
         #[unroll]
-        for u in 0..CENTROID_UNROLL {
+        for u in 0..unroll {
             accs[u] = Vector::<A, N>::new(A::new(0.0_f32));
         }
         for i in 0..dim_lines {
             let pv = p[i];
             #[unroll]
-            for u in 0..CENTROID_UNROLL {
+            for u in 0..unroll {
                 if use_cosine {
                     accs[u] += pv * cands[(c as usize + u) * dim_lines + i];
                 } else {
@@ -464,7 +519,7 @@ pub fn min_dist_vec<S: Float, A: Float, N: Size>(
             }
         }
         #[unroll]
-        for u in 0..CENTROID_UNROLL {
+        for u in 0..unroll {
             let av = accs[u];
             let mut sum = A::new(0.0_f32);
             #[unroll]
@@ -583,6 +638,7 @@ where
             dim_lines,
             WORKGROUP_128,
             use_cosine,
+            centroid_unroll(dim_lines),
         );
     }
 
