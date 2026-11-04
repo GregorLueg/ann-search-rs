@@ -7,7 +7,8 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
 **Performance**
 
-- GPU k-means on wgpu is faster above 96 dimensions, with the same results.
+- GPU k-means on wgpu is faster above 96 dimensions on Mac OS, with the same
+  results. Other platforms unchanged.
 
 ## 0.12.1
 
