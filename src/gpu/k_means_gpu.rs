@@ -52,29 +52,26 @@ const CENTROID_UNROLL: usize = 8;
 
 /// Centroids scored per unrolled step above [`CENTROID_UNROLL_MAX_LINES`].
 ///
-/// Yes, 11 on Apple Silicon. It works around how Apple's shader compiler allocates
-/// registers, and nothing about the algorithm asks for it.
+/// Yes, 11 on Apple Silicon. It works around how Apple's shader compiler
+/// allocates registers, and nothing about the algorithm asks for it.
 ///
 /// naga always tags a compute kernel with
-/// `[[max_total_threads_per_threadgroup(N)]]`, N being the workgroup size. With that
-/// cap in place, the compiler picks a register budget that moves in steps as the unroll
-/// grows, with two or more unrolls sharing a step. When the accumulators outgrow the
-/// budget, it spills them to threadgroup memory: a load, multiply-add and store inside
-/// the per-line loop, plus a chain of register moves. That is enough to halve the speed
-/// of the kernel, so speed zigzags with the unroll. 11 is the first unroll on a much
-/// larger step, so it spills nothing, whereas 8 spills at this row length and the same
-/// kernel with the attribute removed, or at workgroup 160, does not.
+/// `[[max_total_threads_per_threadgroup(N)]]`, N being the workgroup size. With
+/// that cap in place, the compiler picks a register budget that moves in steps
+/// as the unroll grows, with two or more unrolls sharing a step. When the
+/// accumulators outgrow the budget, it spills them to threadgroup memory: a
+/// load, multiply-add and store inside the per-line loop, plus a chain of
+/// register moves. That is enough to halve the speed of the kernel, so speed
+/// zigzags with the unroll. 11 is the first unroll on a much larger step, so it
+/// spills nothing, whereas 8 spills at this row length and the same kernel with
+/// the attribute removed, or at workgroup 160, does not.
 ///
-/// Row length barely matters past the limit, as the point lives on the stack and does
-/// not compete for those registers. Why the cap picks a given step is not visible from
-/// here, and it does not change steadily with the cap: 160 and 320 are lean, 192 and
-/// 384 are not.
-///
-/// This was read from the disassembly on one M1-generation GPU, so another chip or
-/// compiler may land elsewhere. Other platforms stay on [`CENTROID_UNROLL`], as nothing
-/// was tested there. If the kernel body changes, sweep the unroll again and look for
-/// `threadgroup_load` and `threadgroup_store` in the hot loop: serialise the pipeline
-/// with `MTLBinaryArchive` and disassemble its `__text` with `dougallj/applegpu`.
+/// This was read from the disassembly on one M1-generation GPU, so another chip
+/// or compiler may land elsewhere. Other platforms stay on [`CENTROID_UNROLL`],
+/// as nothing was tested there. If the kernel body changes, sweep the unroll
+/// again and look for `threadgroup_load` and `threadgroup_store` in the hot
+/// loop: serialise the pipeline with `MTLBinaryArchive` and disassemble its
+/// `__text` with `dougallj/applegpu`.
 const CENTROID_UNROLL_WIDE: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
     11
 } else {
