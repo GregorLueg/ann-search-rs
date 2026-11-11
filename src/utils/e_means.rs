@@ -17,10 +17,10 @@ use std::time::Instant;
 use thousands::*;
 
 use crate::errors::AnnSearchErrors;
+use crate::prelude::AnnSearchFloat;
 use crate::utils::k_means_utils::{assign_all_parallel, fast_random_init};
 use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
-use crate::prelude::AnnSearchFloat;
 
 ////////////
 // Consts //
@@ -320,11 +320,13 @@ pub(crate) fn resolve_e_means_recipe(
         return Err(invalid("epochs", epochs, "rounds to zero training rows"));
     }
     let total_steps = epoch_rows.iter().map(|r| r.div_ceil(batch_size)).sum();
-    let unused_threshold = params.unused_threshold.unwrap_or(if dim <= NO_REVIVAL_MAX_D {
-        0.0
-    } else {
-        UNUSED_THRESHOLD
-    });
+    let unused_threshold = params
+        .unused_threshold
+        .unwrap_or(if dim <= NO_REVIVAL_MAX_D {
+            0.0
+        } else {
+            UNUSED_THRESHOLD
+        });
 
     Ok(EMeansRecipe {
         batch_size,
@@ -365,8 +367,13 @@ pub(crate) struct BatchStats<T> {
 /// * `stats` - The batch statistics
 /// * `alpha` - Step for this update
 /// * `dim` - Row length
-fn apply_ema<T>(centroids: &mut [T], usage: &mut [f64], stats: &BatchStats<T>, alpha: f64, dim: usize)
-where
+fn apply_ema<T>(
+    centroids: &mut [T],
+    usage: &mut [f64],
+    stats: &BatchStats<T>,
+    alpha: f64,
+    dim: usize,
+) where
     T: Float + Send + Sync,
 {
     let decay = 1.0 - alpha;
@@ -479,7 +486,10 @@ where
 ///
 /// The epoch seed
 fn epoch_seed(seed: usize, epoch: usize) -> u64 {
-    ((seed as u64).wrapping_mul(1_000_003).wrapping_add(epoch as u64)) % (1u64 << 32)
+    ((seed as u64)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(epoch as u64))
+        % (1u64 << 32)
 }
 
 /// Run e-means (Algorithm 1) around a backend's batch statistics.
@@ -580,7 +590,7 @@ where
             let alpha = scheduled_alpha(recipe.alpha0, step, recipe.total_steps);
             apply_ema(&mut centroids, &mut usage, &stats, alpha, dim);
             step += 1;
-            if step % CHECK_UNUSED_EVERY == 0 && recipe.unused_threshold > 0.0 {
+            if step.is_multiple_of(CHECK_UNUSED_EVERY) && recipe.unused_threshold > 0.0 {
                 revived += revive_unused(
                     &mut centroids,
                     &mut usage,
@@ -726,7 +736,7 @@ where
                     }
                     let inv = T::one() / T::from(e - s).unwrap();
                     for m in mean.iter_mut() {
-                        *m = *m * inv;
+                        *m *= inv;
                     }
                 });
 
@@ -768,11 +778,43 @@ mod tests {
     fn test_e_means_recipe_matches_reference() {
         #[allow(clippy::type_complexity)]
         let cases: [(usize, usize, usize, f64, usize, f64, Vec<usize>); 8] = [
-            (250_000, 500, 128, 5.0, 16384, 0.917046289720882, vec![250_000; 5]),
-            (250_000, 500, 8, 5.0, 2048, 0.1410390398649467, vec![250_000; 5]),
+            (
+                250_000,
+                500,
+                128,
+                5.0,
+                16384,
+                0.917046289720882,
+                vec![250_000; 5],
+            ),
+            (
+                250_000,
+                500,
+                8,
+                5.0,
+                2048,
+                0.1410390398649467,
+                vec![250_000; 5],
+            ),
             (1_000_000, 1024, 64, 5.0, 65536, 1.0, vec![1_000_000; 5]),
-            (100_000, 64, 3, 3.0, 512, 0.1667050355062096, vec![100_000; 3]),
-            (10_000, 1000, 32, 2.5, 512, 0.13456479993966902, vec![10_000, 5_000, 10_000]),
+            (
+                100_000,
+                64,
+                3,
+                3.0,
+                512,
+                0.1667050355062096,
+                vec![100_000; 3],
+            ),
+            (
+                10_000,
+                1000,
+                32,
+                2.5,
+                512,
+                0.13456479993966902,
+                vec![10_000, 5_000, 10_000],
+            ),
             (1000, 10, 2, 5.0, 8, 0.06985681308367728, vec![1000; 5]),
             (60_000, 256, 512, 10.0, 8192, 1.0, vec![60_000; 10]),
             (500, 100, 16, 1.0, 2, 0.011213949093399305, vec![500]),
@@ -834,14 +876,26 @@ mod tests {
     #[test]
     fn test_e_means_revival_defaults_off_at_low_dim() {
         let p = EMeansParams::default();
-        assert_eq!(resolve_e_means_recipe(1000, 10, 2, &p).unwrap().unused_threshold, 0.0);
-        assert_eq!(resolve_e_means_recipe(1000, 10, 3, &p).unwrap().unused_threshold, 0.1);
+        assert_eq!(
+            resolve_e_means_recipe(1000, 10, 2, &p)
+                .unwrap()
+                .unused_threshold,
+            0.0
+        );
+        assert_eq!(
+            resolve_e_means_recipe(1000, 10, 3, &p)
+                .unwrap()
+                .unused_threshold,
+            0.1
+        );
     }
 
     #[test]
     fn test_revive_splits_heaviest_into_dead() {
         let dim = 4;
-        let mut cents = vec![1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0, 5.0];
+        let mut cents = vec![
+            1.0f32, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0, 5.0,
+        ];
         let mut usage = vec![10.0, 0.0, 0.0];
         let mut rng = StdRng::seed_from_u64(1);
         let n = revive_unused(&mut cents, &mut usage, 0.1, dim, &mut rng);
@@ -916,9 +970,19 @@ mod tests {
         let data = blobs(200, &[[0.0, 0.0], [3.0, 1.0], [-2.0, 4.0]], 9);
         let p = EMeansParams::default();
         let run = |k| {
-            e_means_cpu(&data, 2, 600, k, &Dist::SquaredEuclidean, &p, 7, false, Verbosity::Quiet)
-                .unwrap()
-                .0
+            e_means_cpu(
+                &data,
+                2,
+                600,
+                k,
+                &Dist::SquaredEuclidean,
+                &p,
+                7,
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap()
+            .0
         };
         assert_eq!(run(3), run(3));
         // k = 1 closes on the exact data mean.
