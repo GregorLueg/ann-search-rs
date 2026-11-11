@@ -18,6 +18,8 @@ use thousands::*;
 
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
+use crate::utils::e_means::e_means_cpu;
+pub use crate::utils::e_means::{EMeansBatchLaw, EMeansParams, KMeansAlgorithm};
 use crate::utils::dist::*;
 use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
@@ -372,6 +374,10 @@ pub struct KMeansTrainingParams {
     /// Off by default: it changes the partition, so turning it on shifts the
     /// results of every index built on top of this k-means.
     pub balanced: bool,
+    /// Lloyd's or e-means. Under [`KMeansAlgorithm::EMeans`], `iters`, `init`,
+    /// `path` and `balanced` are ignored: e-means seeds at random, runs its
+    /// own epoch budget and revives starved clusters itself.
+    pub algorithm: KMeansAlgorithm,
 }
 
 impl KMeansTrainingParams {
@@ -397,6 +403,7 @@ impl KMeansTrainingParams {
             init,
             path,
             balanced: false,
+            algorithm: KMeansAlgorithm::Lloyd,
         }
     }
 
@@ -417,9 +424,24 @@ impl KMeansTrainingParams {
         self.balanced = balanced;
         self
     }
+
+    /// Pick the clustering algorithm
+    ///
+    /// ### Params
+    ///
+    /// * `algorithm` - [`KMeansAlgorithm::Lloyd`] (the default) or
+    ///   [`KMeansAlgorithm::EMeans`]
+    ///
+    /// ### Returns
+    ///
+    /// `self` with the algorithm set, for chaining off `new` or `default`.
+    pub fn with_algorithm(mut self, algorithm: KMeansAlgorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
 }
 
-/// Default implementation for CagraGpuSearchParams
+/// Default implementation for KMeansTrainingParams
 impl Default for KMeansTrainingParams {
     fn default() -> Self {
         Self::new(30, None, None)
@@ -3249,7 +3271,8 @@ where
 
 /// Train k-means centroids
 ///
-/// Unless a [LloydPath] is forced, uses GEMM assignment from
+/// Runs Lloyd's or e-means as `params_k_means.algorithm` says. For Lloyd's,
+/// unless a [LloydPath] is forced, uses GEMM assignment from
 /// `GEMM_DIM_THRESHOLD` dimensions up (with Hamerly's bounds for Euclidean)
 /// and SIMD Lloyd's below it.
 ///
@@ -3303,6 +3326,22 @@ where
     }
 
     let params = params_k_means.unwrap_or_default();
+
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        let start = Instant::now();
+        if verbosity.normal_verbosity() {
+            println!(
+                "Training e-means ({} centroids) ...",
+                n_centroids.separate_with_underscores()
+            );
+        }
+        let (centroids, _) =
+            e_means_cpu(data, dim, n, n_centroids, metric, &em, seed, false, verbosity)?;
+        if verbosity.normal_verbosity() {
+            println!("... trained e-means in {:.2?}", start.elapsed());
+        }
+        return Ok(centroids);
+    }
 
     let data_norms: Vec<T> = match metric {
         Dist::SquaredEuclidean => (0..n)
