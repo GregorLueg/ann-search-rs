@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use crate::mlx::exhaustive_mlx::RowTopK;
 use crate::mlx::ffi::*;
 use crate::prelude::*;
+use crate::utils::e_means::{print_recipe, resolve_e_means_recipe, run_e_means};
 use crate::utils::k_means_utils::*;
 use std::time::Instant;
 use thousands::*;
@@ -238,6 +239,21 @@ pub fn train_centroids_mlx(
     }
     let params = params.unwrap_or_default();
 
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        if verbosity.normal_verbosity() {
+            println!(
+                "Training e-means on MLX ({} centroids) ...",
+                n_centroids.separate_with_underscores()
+            );
+        }
+        let (centroids, _) =
+            e_means_mlx(data, dim, n, n_centroids, metric, &em, seed, s, verbosity)?;
+        if verbosity.normal_verbosity() {
+            println!("... trained e-means in {:.2?}", start.elapsed());
+        }
+        return Ok(centroids);
+    }
+
     let init = params.init.unwrap_or(if n_centroids > 200 {
         KMeansInit::Random
     } else {
@@ -341,6 +357,104 @@ pub fn train_centroids_mlx(
         println!("... trained k-means in {:.2?}", start.elapsed());
     }
     Ok(centroids)
+}
+
+/// e-means on MLX: GEMM assignment and coordinate scatter on the device, the
+/// EMA and revival on the host through [`run_e_means`].
+///
+/// The data is uploaded once. Per batch the rows are gathered with `take`,
+/// assigned through [`CentroidOperands`] in score tiles, and their coordinates
+/// scatter-added per cluster; the labels come back with the sums and the
+/// counts are taken from them on the host, so no scatter of ones is needed.
+///
+/// ### Params
+///
+/// * `data` - Flattened row-major training data, `n * dim`
+/// * `dim` - Embedding dimensionality
+/// * `n` - Number of training points
+/// * `n_centroids` - Number of centroids
+/// * `metric` - Euclidean or Cosine
+/// * `em` - e-means parameters
+/// * `seed` - Seed for the initialisation, shuffles and revival
+/// * `s` - Stream to run on
+/// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
+///
+/// ### Returns
+///
+/// `(centroids, last-pass labels)`
+#[allow(clippy::too_many_arguments)]
+fn e_means_mlx(
+    data: &[f32],
+    dim: usize,
+    n: usize,
+    n_centroids: usize,
+    metric: &Dist,
+    em: &EMeansParams,
+    seed: usize,
+    s: &Stream,
+    verbosity: Verbosity,
+) -> Result<(Vec<f32>, Vec<u32>), AnnSearchErrors> {
+    let recipe = resolve_e_means_recipe(n, n_centroids, dim, em)?;
+    if verbosity.detailed_verbosity() {
+        print_recipe(&recipe);
+    }
+    let init = fast_random_init(data, dim, n, n_centroids, seed);
+    let x = Array::from_f32(data, &[n as i32, dim as i32]);
+    let argmin = argmin_kernel();
+    let tile = score_tile_rows(n_centroids);
+    let (k, d) = (n_centroids as i32, dim as i32);
+
+    run_e_means(
+        n,
+        dim,
+        n_centroids,
+        init,
+        &recipe,
+        seed,
+        false,
+        verbosity,
+        |rows, cents, _, out| {
+            let c = Array::from_f32(cents, &[k, d]);
+            let ops = CentroidOperands::new(&c, n_centroids, metric, s)?;
+            let mut acc = Array::zeros(&[k, d], MLX_FLOAT32, s)?;
+            let mut assigns = Vec::with_capacity(rows.len().div_ceil(tile));
+            for chunk in rows.chunks(tile) {
+                let m = chunk.len();
+                let idx = Array::from_u32(chunk, &[m as i32]);
+                let xb = x.take_rows(&idx, s)?;
+                let a = ops.assign(&xb, m, n_centroids, &argmin, s)?;
+                acc = acc.scatter_add_rows(&a, &xb.reshape(&[m as i32, 1, d], s)?, s)?;
+                assigns.push(a);
+            }
+            let mut wait: Vec<&Array> = vec![&acc];
+            wait.extend(assigns.iter());
+            eval_all(&wait, false)?;
+
+            out.labels.clear();
+            for a in &assigns {
+                out.labels.extend_from_slice(a.as_u32()?);
+            }
+            out.counts.fill(0);
+            for &l in &out.labels {
+                out.counts[l as usize] += 1;
+            }
+            let sums = acc.as_f32()?;
+            for ((mean, sum), &cnt) in out
+                .means
+                .chunks_exact_mut(dim)
+                .zip(sums.chunks_exact(dim))
+                .zip(&out.counts)
+            {
+                if cnt > 0 {
+                    let inv = 1.0 / cnt as f32;
+                    for (m, &v) in mean.iter_mut().zip(sum) {
+                        *m = v * inv;
+                    }
+                }
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Assign every point to its nearest centroid on MLX.
@@ -489,11 +603,10 @@ mod tests {
     /// ### Params
     ///
     /// * `metric` - Metric under test
-    /// * `init` - Initialisation under test
-    fn check_inertia(metric: Dist, init: KMeansInit) {
+    /// * `params` - Parameters under test
+    fn check_inertia(metric: Dist, params: KMeansTrainingParams) {
         let (n, dim, k) = (4_000, 16, 40);
         let data = blobs(n, dim, 25, 11);
-        let params = KMeansTrainingParams::new(15, Some(init), None);
         let s = Stream::default_gpu();
 
         let mlx = train_centroids_mlx(
@@ -535,13 +648,32 @@ mod tests {
 
     #[test]
     fn test_mlx_kmeans_inertia_matches_cpu_euclidean() {
-        check_inertia(Dist::SquaredEuclidean, KMeansInit::KMeansParallel);
-        check_inertia(Dist::SquaredEuclidean, KMeansInit::Random);
+        check_inertia(
+            Dist::SquaredEuclidean,
+            KMeansTrainingParams::new(15, Some(KMeansInit::KMeansParallel), None),
+        );
+        check_inertia(
+            Dist::SquaredEuclidean,
+            KMeansTrainingParams::new(15, Some(KMeansInit::Random), None),
+        );
     }
 
     #[test]
     fn test_mlx_kmeans_inertia_matches_cpu_cosine() {
-        check_inertia(Dist::Cosine, KMeansInit::KMeansParallel);
+        check_inertia(
+            Dist::Cosine,
+            KMeansTrainingParams::new(15, Some(KMeansInit::KMeansParallel), None),
+        );
+    }
+
+    #[test]
+    fn test_mlx_e_means_matches_cpu() {
+        for epochs in [2.5, 5.0] {
+            let params = KMeansTrainingParams::default()
+                .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(epochs)));
+            check_inertia(Dist::SquaredEuclidean, params);
+            check_inertia(Dist::Cosine, params);
+        }
     }
 
     #[test]

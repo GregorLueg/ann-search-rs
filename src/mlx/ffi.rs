@@ -510,6 +510,13 @@ unsafe extern "C" {
         strides_num: usize,
         s: mlx_stream,
     ) -> c_int;
+    fn mlx_take_axis(
+        res: *mut mlx_array,
+        a: mlx_array,
+        indices: mlx_array,
+        axis: c_int,
+        s: mlx_stream,
+    ) -> c_int;
     fn mlx_scatter_add(
         res: *mut mlx_array,
         a: mlx_array,
@@ -795,6 +802,22 @@ impl Array {
                 strides.len(),
                 s.raw,
             )
+        })
+    }
+
+    /// Rows of `self` at `indices`, along axis 0.
+    ///
+    /// ### Params
+    ///
+    /// * `indices` - Row ids, shape `[m]`
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) gathered rows, shape `[m, rest of self's shape...]`
+    pub fn take_rows(&self, indices: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_take_axis", |out| unsafe {
+            mlx_take_axis(out, self.raw, indices.raw, 0, s.raw)
         })
     }
 
