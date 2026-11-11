@@ -32,6 +32,7 @@ use std::time::Instant;
 use crate::gpu::topk_gpu::atomic_u32_add_supported;
 use crate::gpu::{WORKGROUP_128, WORKGROUP_SIZE_X};
 use crate::prelude::*;
+use crate::utils::e_means::{print_recipe, resolve_e_means_recipe, run_e_means};
 use crate::utils::k_means_utils::*;
 use thousands::*;
 
@@ -117,6 +118,9 @@ pub struct KMeansGpuParams {
     pub quantise_to_f16: bool,
     /// Reseed starved centroids each iteration, RAFT-style.
     pub balanced: bool,
+    /// Lloyd's or e-means. Under [`KMeansAlgorithm::EMeans`], `iters`, `init`,
+    /// `fixed` and `balanced` are ignored; `quantise_to_f16` still applies.
+    pub algorithm: KMeansAlgorithm,
 }
 
 impl KMeansGpuParams {
@@ -139,6 +143,7 @@ impl KMeansGpuParams {
             fixed,
             quantise_to_f16,
             balanced: false,
+            algorithm: KMeansAlgorithm::Lloyd,
         }
     }
 
@@ -156,6 +161,21 @@ impl KMeansGpuParams {
     /// `self` with the flag set, for chaining off `new` or `default`.
     pub fn with_balancing(mut self, balanced: bool) -> Self {
         self.balanced = balanced;
+        self
+    }
+
+    /// Pick the clustering algorithm
+    ///
+    /// ### Params
+    ///
+    /// * `algorithm` - [`KMeansAlgorithm::Lloyd`] (the default) or
+    ///   [`KMeansAlgorithm::EMeans`]
+    ///
+    /// ### Returns
+    ///
+    /// `self` with the algorithm set, for chaining off `new` or `default`.
+    pub fn with_algorithm(mut self, algorithm: KMeansAlgorithm) -> Self {
+        self.algorithm = algorithm;
         self
     }
 }
@@ -1981,7 +2001,250 @@ where
     Ok((assignments, final_cents))
 }
 
-/// Initialise the centroids, then run the device-resident Lloyd's loop.
+/////////////
+// e-means //
+/////////////
+
+/// Gather a batch of rows (and optionally their norms) into a dense buffer.
+///
+/// One thread per output element, so consecutive threads read consecutive
+/// coordinates of the same source row.
+///
+/// ### Params
+///
+/// * `data` - Source rows `[n, dim]` in storage precision `S`
+/// * `norms` - Source L2 norms `[n]`; read only with `with_norms`
+/// * `rows` - Source row id per batch row `[b]`
+/// * `out` - Destination `[>= b, dim]`
+/// * `out_norms` - Destination norms `[>= b]`; written only with `with_norms`
+/// * `b` - Batch rows
+/// * `dim` - Row length, padded; comptime
+/// * `wg_size` - Workgroup size; comptime
+/// * `with_norms` - Also gather the norms; comptime
+///
+/// ### Grid mapping
+///
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> flat
+///   output element
+#[cube(launch_unchecked)]
+pub fn gather_rows<S: Float, A: Float>(
+    data: &Tensor<S>,
+    norms: &Tensor<A>,
+    rows: &Tensor<u32>,
+    out: &mut Tensor<S>,
+    out_norms: &mut Tensor<A>,
+    b: u32,
+    #[comptime] dim: usize,
+    #[comptime] wg_size: u32,
+    #[comptime] with_norms: bool,
+) {
+    let pos = ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X) as usize;
+    if pos >= b as usize * dim {
+        terminate!();
+    }
+    let i = pos / dim;
+    let e = pos % dim;
+    let r = rows[i] as usize;
+    out[pos] = data[r * dim + e];
+    // Kept nested: the outer test is comptime and drops out of the kernel.
+    #[allow(clippy::collapsible_if)]
+    if with_norms {
+        if e == 0 {
+            out_norms[i] = norms[r];
+        }
+    }
+}
+
+/// e-means on the device: the assignment and per-cluster means run on the
+/// GPU, the EMA and revival on the host through [`run_e_means`].
+///
+/// Per batch: upload the row ids, gather the rows into a dense buffer,
+/// FlashAssign against the current centroids, privatised CSR plus segmented
+/// reduction for the batch means, then read back means and counts. The host
+/// side is `k * dim` per update, against `batch * k * dim` for the assignment.
+///
+/// ### Type parameters
+///
+/// * `S` - Storage precision of the data buffer
+/// * `A` - Accumulator and centroid precision
+///
+/// ### Params
+///
+/// * `client` - CubeCL compute client
+/// * `data_gpu` - Data on device `[n, dim_padded]` in `S`
+/// * `data_host` - The same data on the host in `A`, for the initialisation
+/// * `pnorm_gpu` - Point L2 norms `[n]` under cosine, a dummy otherwise
+/// * `n` - Number of data points
+/// * `n_centroids` - Number of centroids
+/// * `dim` - Unpadded dimension; picks the batch law and revival default
+/// * `dim_padded` - Padded dimension, a multiple of `LINE_SIZE`
+/// * `dist` - Distance metric
+/// * `em` - e-means parameters
+/// * `seed` - Seed for the initialisation, shuffles and revival
+/// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
+///
+/// ### Returns
+///
+/// `(last-pass labels, centroids [n_centroids, dim_padded] in A)`
+#[allow(clippy::too_many_arguments)]
+fn run_e_means_gpu<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    data_host: &[A],
+    pnorm_gpu: &GpuTensor<A>,
+    n: usize,
+    n_centroids: usize,
+    dim: usize,
+    dim_padded: usize,
+    dist: &Dist,
+    em: &EMeansParams,
+    seed: usize,
+    verbosity: Verbosity,
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
+where
+    S: Float + cubecl::CubeElement,
+    A: Float + cubecl::CubeElement + AnnSearchFloat,
+{
+    let recipe = resolve_e_means_recipe(n, n_centroids, dim, em)?;
+    if verbosity.detailed_verbosity() {
+        print_recipe(&recipe);
+    }
+    let init = fast_random_init(data_host, dim_padded, n, n_centroids, seed);
+
+    let limits = GpuLimits::from_client(client);
+    let cosine = *dist == Dist::Cosine;
+    let bsz = recipe.batch_size;
+    let cube_count = 512usize;
+    let batch_data = GpuTensor::<S>::empty(vec![bsz, dim_padded], client)?;
+    let batch_norms = GpuTensor::<A>::empty(vec![if cosine { bsz } else { 1 }], client)?;
+    let batch_assign = GpuTensor::<u32>::empty(vec![bsz], client)?;
+    let privatised_counts = GpuTensor::<u32>::empty(vec![cube_count, n_centroids], client)?;
+    let counts = GpuTensor::<u32>::empty(vec![n_centroids], client)?;
+    let offsets = GpuTensor::<u32>::empty(vec![n_centroids + 1], client)?;
+    let all_indices = GpuTensor::<u32>::empty(vec![bsz], client)?;
+    let means_gpu = GpuTensor::<A>::empty(vec![n_centroids, dim_padded], client)?;
+
+    let (centroids, mut labels) = run_e_means(
+        n,
+        dim_padded,
+        n_centroids,
+        init,
+        &recipe,
+        seed,
+        true,
+        verbosity,
+        |rows, cents, want, out| {
+            let b = rows.len();
+            let rows_gpu = GpuTensor::<u32>::from_slice(rows, vec![b], client)?;
+            let (gx, gy) = grid_2d(((b * dim_padded) as u32).div_ceil(WORKGROUP_128), &limits)?;
+            unsafe {
+                gather_rows::launch_unchecked::<S, A>(
+                    client,
+                    CubeCount::Static(gx, gy, 1),
+                    CubeDim::new_1d(WORKGROUP_128),
+                    data_gpu.clone().into_tensor_arg(),
+                    pnorm_gpu.clone().into_tensor_arg(),
+                    rows_gpu.into_tensor_arg(),
+                    batch_data.clone().into_tensor_arg(),
+                    batch_norms.clone().into_tensor_arg(),
+                    b as u32,
+                    dim_padded,
+                    WORKGROUP_128,
+                    cosine,
+                );
+            }
+
+            let cent_gpu =
+                GpuTensor::<A>::from_slice(cents, vec![n_centroids, dim_padded], client)?;
+            let cnorm_gpu = if cosine {
+                let cn: Vec<A> = cents
+                    .chunks_exact(dim_padded)
+                    .map(A::calculate_l2_norm)
+                    .collect();
+                GpuTensor::<A>::from_slice(&cn, vec![n_centroids], client)?
+            } else {
+                GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
+            };
+
+            flash_assign_device::<S, A>(
+                client,
+                &batch_data,
+                &cent_gpu,
+                &batch_norms,
+                &cnorm_gpu,
+                &batch_assign,
+                b,
+                n_centroids,
+                dim_padded,
+                dist,
+            )?;
+            build_csr_gpu_privatised(
+                &batch_assign,
+                b,
+                n_centroids,
+                cube_count,
+                &privatised_counts,
+                &counts,
+                &offsets,
+                &all_indices,
+                client,
+            )?;
+            segmented_update::<S, A>(
+                &batch_data,
+                &all_indices,
+                &offsets,
+                &means_gpu,
+                n_centroids,
+                dim_padded,
+                client,
+            )?;
+
+            out.means = means_gpu.clone().read(client)?;
+            out.counts = counts.clone().read(client)?;
+            if want {
+                let mut l = batch_assign.clone().read(client)?;
+                l.truncate(b);
+                out.labels = l;
+            }
+            Ok(())
+        },
+    )?;
+
+    // Below one epoch some rows were never seen; label them against the final
+    // centroids so the contract of one label per point holds.
+    if labels.contains(&u32::MAX) {
+        let cent_gpu =
+            GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
+        let cnorm_gpu = if cosine {
+            let cn: Vec<A> = centroids
+                .chunks_exact(dim_padded)
+                .map(A::calculate_l2_norm)
+                .collect();
+            GpuTensor::<A>::from_slice(&cn, vec![n_centroids], client)?
+        } else {
+            GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
+        };
+        let assign_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
+        flash_assign_device::<S, A>(
+            client,
+            data_gpu,
+            &cent_gpu,
+            pnorm_gpu,
+            &cnorm_gpu,
+            &assign_gpu,
+            n,
+            n_centroids,
+            dim_padded,
+            dist,
+        )?;
+        labels = assign_gpu.read(client)?;
+    }
+
+    Ok((labels, centroids))
+}
+
+/// Initialise the centroids, then run the device-resident Lloyd's loop, or
+/// hand over to [`run_e_means_gpu`] under [`KMeansAlgorithm::EMeans`].
 ///
 /// Split out of [`k_means_clusters_gpu`] so both storage precisions share it.
 /// Initialisation runs after the data upload because the k-means|| path needs
@@ -2003,6 +2266,7 @@ where
 ///   metric is not cosine
 /// * `n` - Number of data points
 /// * `n_centroids` - Number of centroids
+/// * `dim` - Unpadded vector dimension, for the e-means recipe
 /// * `dim_padded` - Padded vector dimension
 /// * `dist` - Distance metric
 /// * `params` - GPU k-means parameters
@@ -2027,6 +2291,7 @@ fn init_and_run<S, A>(
     pnorm_gpu: &GpuTensor<A>,
     n: usize,
     n_centroids: usize,
+    dim: usize,
     dim_padded: usize,
     dist: &Dist,
     params: &KMeansGpuParams,
@@ -2038,6 +2303,23 @@ where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
 {
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        return run_e_means_gpu::<S, A>(
+            client,
+            data_gpu,
+            data_host,
+            pnorm_gpu,
+            n,
+            n_centroids,
+            dim,
+            dim_padded,
+            dist,
+            &em,
+            seed,
+            verbosity,
+        );
+    }
+
     let centroids = match init_method {
         KMeansInit::Random => fast_random_init(data_host, dim_padded, n, n_centroids, seed),
         KMeansInit::KMeansParallel => kmeans_parallel_init_gpu::<S, A>(
@@ -2212,8 +2494,9 @@ fn kmeans_cpu_fallback<T>(
 where
     T: AnnSearchFloat,
 {
-    let cpu_params =
-        KMeansTrainingParams::new(params.iters, params.init, None).with_balancing(params.balanced);
+    let cpu_params = KMeansTrainingParams::new(params.iters, params.init, None)
+        .with_balancing(params.balanced)
+        .with_algorithm(params.algorithm);
 
     let centroids = train_centroids(
         data,
@@ -2350,11 +2633,16 @@ where
         data.to_vec()
     };
 
-    let init_method = params.init.unwrap_or(if n_centroids > 200 {
+    let e_means = matches!(params.algorithm, KMeansAlgorithm::EMeans(_));
+    let init_method = if e_means {
         KMeansInit::Random
     } else {
-        KMeansInit::KMeansParallel
-    });
+        params.init.unwrap_or(if n_centroids > 200 {
+            KMeansInit::Random
+        } else {
+            KMeansInit::KMeansParallel
+        })
+    };
 
     // Norms are needed by the cosine assignment kernel and by the k-means||
     // initialisation, so compute them once. They depend only on the data, so
@@ -2373,7 +2661,7 @@ where
         GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?
     };
 
-    if verbosity.detailed_verbosity() {
+    if verbosity.detailed_verbosity() && !e_means {
         println!(
             " Running Lloyd's iterations ({}, {})",
             if params.fixed {
@@ -2414,6 +2702,7 @@ where
             &pnorm_gpu,
             n,
             n_centroids,
+            dim,
             dim_padded,
             metric,
             &params,
@@ -2436,6 +2725,7 @@ where
             &pnorm_gpu,
             n,
             n_centroids,
+            dim,
             dim_padded,
             metric,
             &params,
@@ -2656,6 +2946,118 @@ mod entry_point_tests {
         assert_eq!(centroids.len(), k * dim);
         assert_eq!(assignments.len(), n);
         assert!(assignments.iter().all(|&c| (c as usize) < k));
+    }
+
+    /// Gaussian blobs, row-major.
+    fn e_means_blobs(n: usize, dim: usize, n_blobs: usize, seed: u64) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let centres: Vec<f32> = (0..n_blobs * dim)
+            .map(|_| rng.random::<f32>() * 20.0 - 10.0)
+            .collect();
+        (0..n)
+            .flat_map(|i| {
+                let b = i % n_blobs;
+                (0..dim)
+                    .map(|d| centres[b * dim + d] + rng.random::<f32>() - 0.5)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Mean squared distance to the nearest centroid, scored on the CPU.
+    fn e_means_error(data: &[f32], dim: usize, cents: &[f32]) -> f64 {
+        let n = data.len() / dim;
+        let k = cents.len() / dim;
+        let a = assign_all_parallel(data, &[], dim, n, cents, &[], k, &Dist::SquaredEuclidean);
+        data.chunks(dim)
+            .zip(&a)
+            .map(|(x, &c)| {
+                f32::euclidean_simd(x, &cents[c as usize * dim..(c as usize + 1) * dim]) as f64
+            })
+            .sum::<f64>()
+            / n as f64
+    }
+
+    #[test]
+    fn test_e_means_gpu_tracks_cpu() {
+        let Some(device) = try_device() else {
+            return;
+        };
+        let client = cubecl::Device::from(device).client();
+        // dim 30 pads to 32, so the padding columns ride through the EMA.
+        let (n, dim, k) = (20_000usize, 30usize, 64usize);
+        let data = e_means_blobs(n, dim, 40, 5);
+        let alg = KMeansAlgorithm::EMeans(EMeansParams::default());
+
+        let gpu = train_centroids_gpu::<f32>(
+            &data,
+            dim,
+            n,
+            k,
+            &Dist::SquaredEuclidean,
+            Some(KMeansGpuParams::default().with_algorithm(alg)),
+            3,
+            &client,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let cpu = train_centroids::<f32>(
+            &data,
+            dim,
+            n,
+            k,
+            &Dist::SquaredEuclidean,
+            Some(KMeansTrainingParams::default().with_algorithm(alg)),
+            3,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+
+        assert_eq!(gpu.len(), k * dim);
+        let (eg, ec) = (
+            e_means_error(&data, dim, &gpu),
+            e_means_error(&data, dim, &cpu),
+        );
+        assert!((eg - ec).abs() / ec < 0.01, "gpu {eg} vs cpu {ec}");
+    }
+
+    #[test]
+    fn test_e_means_gpu_labels_cosine_f16_and_partial_epoch() {
+        let Some(device) = try_device() else {
+            return;
+        };
+        let client = cubecl::Device::from(device).client();
+        let (n, dim, k) = (5_000usize, 16usize, 20usize);
+        let data = e_means_blobs(n, dim, 10, 8);
+
+        for (metric, f16, epochs) in [
+            (Dist::SquaredEuclidean, false, 5.0),
+            (Dist::Cosine, false, 2.5),
+            (Dist::SquaredEuclidean, true, 3.0),
+            (Dist::SquaredEuclidean, false, 0.5),
+        ] {
+            let params = KMeansGpuParams::new(10, None, true, f16)
+                .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(epochs)));
+            let (cents, labels) = k_means_gpu_flat::<f32>(
+                &data,
+                dim,
+                n,
+                k,
+                &metric,
+                Some(params),
+                11,
+                &client,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            assert_eq!(cents.len(), k * dim);
+            assert!(cents.iter().all(|v| v.is_finite()));
+            assert_eq!(labels.len(), n);
+            assert!(
+                labels.iter().all(|&l| (l as usize) < k),
+                "{metric:?} {epochs}"
+            );
+        }
     }
 
     #[test]
