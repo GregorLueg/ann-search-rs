@@ -471,6 +471,8 @@ impl Array {
 //////////////////////////
 
 unsafe extern "C" {
+    fn mlx_add(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_subtract(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_multiply(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_divide(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_maximum(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
@@ -603,6 +605,38 @@ impl Array {
     pub fn ones(shape: &[i32], dtype: mlx_dtype, s: &Stream) -> Result<Array, AnnSearchErrors> {
         op_into("mlx_ones", |out| unsafe {
             mlx_ones(out, shape.as_ptr(), shape.len(), dtype, s.raw)
+        })
+    }
+
+    /// Elementwise `self + b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn add(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_add", |out| unsafe {
+            mlx_add(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise `self - b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn subtract(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_subtract", |out| unsafe {
+            mlx_subtract(out, self.raw, b.raw, s.raw)
         })
     }
 

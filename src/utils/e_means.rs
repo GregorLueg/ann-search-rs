@@ -492,6 +492,7 @@ where
 /// ### Returns
 ///
 /// `true` if some cluster is below the cut and some other is a donor
+#[cfg(any(feature = "gpu", mlx_available))]
 pub(crate) fn needs_revival(usage: &[f64], threshold: f64) -> bool {
     let cut = usage.iter().sum::<f64>() * threshold / usage.len() as f64;
     usage.iter().any(|&u| u < cut) && usage.iter().any(|&u| u >= cut && u > 0.0)

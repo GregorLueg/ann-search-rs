@@ -19,8 +19,14 @@ use rayon::prelude::*;
 use crate::mlx::exhaustive_mlx::RowTopK;
 use crate::mlx::ffi::*;
 use crate::prelude::*;
-use crate::utils::e_means::{print_recipe, resolve_e_means_recipe, run_e_means};
+use crate::utils::e_means::{
+    epoch_seed, needs_revival, print_recipe, resolve_e_means_recipe, revive_unused,
+    scheduled_alpha, split_rng, CHECK_UNUSED_EVERY, INIT_USAGE,
+};
 use crate::utils::k_means_utils::*;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use std::time::Instant;
 use thousands::*;
 
@@ -246,8 +252,7 @@ pub fn train_centroids_mlx(
                 n_centroids.separate_with_underscores()
             );
         }
-        let (centroids, _) =
-            e_means_mlx(data, dim, n, n_centroids, metric, &em, seed, s, verbosity)?;
+        let centroids = e_means_mlx(data, dim, n, n_centroids, metric, &em, seed, s, verbosity)?;
         if verbosity.normal_verbosity() {
             println!("... trained e-means in {:.2?}", start.elapsed());
         }
@@ -359,13 +364,17 @@ pub fn train_centroids_mlx(
     Ok(centroids)
 }
 
-/// e-means on MLX: GEMM assignment and coordinate scatter on the device, the
-/// EMA and revival on the host through [`run_e_means`].
+/// e-means on MLX with the whole update kept lazy on the device.
 ///
-/// The data is uploaded once. Per batch the rows are gathered with `take`,
-/// assigned through [`CentroidOperands`] in score tiles, and their coordinates
-/// scatter-added per cluster; the labels come back with the sums and the
-/// counts are taken from them on the host, so no scatter of ones is needed.
+/// The data goes up once, each row carrying a trailing 1 so a single
+/// `scatter_add` yields the batch sums and counts. Per batch the rows are
+/// taken through this epoch's permutation (uploaded once per epoch), assigned
+/// through [`CentroidOperands`] in score tiles, and the EMA runs as elementwise
+/// ops on `[k, dim]` arrays. Nothing comes back to the host inside an epoch
+/// except the `k` masses every `CHECK_UNUSED_EVERY` updates, for the revival
+/// check; the centroids round-trip through [`revive_unused`] only when a split
+/// is due. Every other update is submitted with a non-blocking eval so the
+/// graph stays bounded without stalling the queue.
 ///
 /// ### Params
 ///
@@ -381,7 +390,7 @@ pub fn train_centroids_mlx(
 ///
 /// ### Returns
 ///
-/// `(centroids, last-pass labels)`
+/// Flat `n_centroids * dim` row-major centroids
 #[allow(clippy::too_many_arguments)]
 fn e_means_mlx(
     data: &[f32],
@@ -393,68 +402,110 @@ fn e_means_mlx(
     seed: usize,
     s: &Stream,
     verbosity: Verbosity,
-) -> Result<(Vec<f32>, Vec<u32>), AnnSearchErrors> {
+) -> Result<Vec<f32>, AnnSearchErrors> {
+    let start = Instant::now();
     let recipe = resolve_e_means_recipe(n, n_centroids, dim, em)?;
     if verbosity.detailed_verbosity() {
         print_recipe(&recipe);
     }
-    let init = fast_random_init(data, dim, n, n_centroids, seed);
-    let x = Array::from_f32(data, &[n as i32, dim as i32]);
-    let argmin = argmin_kernel();
+    let (k, d, d1) = (n_centroids as i32, dim as i32, dim as i32 + 1);
     let tile = score_tile_rows(n_centroids);
-    let (k, d) = (n_centroids as i32, dim as i32);
+    let argmin = argmin_kernel();
+    let zero = Array::scalar_f32(0.0);
+    let one = Array::scalar_f32(1.0);
 
-    run_e_means(
-        n,
-        dim,
-        n_centroids,
-        init,
-        &recipe,
-        seed,
-        false,
-        verbosity,
-        |rows, cents, _, out| {
-            let c = Array::from_f32(cents, &[k, d]);
+    let mut aug = Vec::with_capacity(n * (dim + 1));
+    for row in data.chunks_exact(dim) {
+        aug.extend_from_slice(row);
+        aug.push(1.0);
+    }
+    let xa = Array::from_f32(&aug, &[n as i32, d1]);
+    drop(aug);
+
+    let mut c = Array::from_f32(&fast_random_init(data, dim, n, n_centroids, seed), &[k, d]);
+    let mut usage = Array::from_f32(&vec![INIT_USAGE as f32; n_centroids], &[k, 1]);
+    let mut pass = Array::zeros(&[k, d1], MLX_FLOAT32, s)?;
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    let mut rng = split_rng(seed);
+    let n_epochs = recipe.epoch_rows.len();
+    let mut step = 0usize;
+
+    for (epoch, &rows) in recipe.epoch_rows.iter().enumerate() {
+        perm.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
+        let perm_arr = Array::from_u32(&perm[..rows], &[rows as i32]);
+        let last = epoch + 1 == n_epochs;
+        let mut revived = 0usize;
+
+        for b0 in (0..rows).step_by(recipe.batch_size) {
+            let b_end = (b0 + recipe.batch_size).min(rows);
             let ops = CentroidOperands::new(&c, n_centroids, metric, s)?;
-            let mut acc = Array::zeros(&[k, d], MLX_FLOAT32, s)?;
-            let mut assigns = Vec::with_capacity(rows.len().div_ceil(tile));
-            for chunk in rows.chunks(tile) {
-                let m = chunk.len();
-                let idx = Array::from_u32(chunk, &[m as i32]);
-                let xb = x.take_rows(&idx, s)?;
-                let a = ops.assign(&xb, m, n_centroids, &argmin, s)?;
-                acc = acc.scatter_add_rows(&a, &xb.reshape(&[m as i32, 1, d], s)?, s)?;
-                assigns.push(a);
+            let mut acc = Array::zeros(&[k, d1], MLX_FLOAT32, s)?;
+            for t0 in (b0..b_end).step_by(tile) {
+                let m = tile.min(b_end - t0) as i32;
+                let idx = perm_arr.slice(&[t0 as i32], &[t0 as i32 + m], s)?;
+                let xb = xa.take_rows(&idx, s)?;
+                let x = xb.slice(&[0, 0], &[m, d], s)?;
+                let a = ops.assign(&x, m as usize, n_centroids, &argmin, s)?;
+                acc = acc.scatter_add_rows(&a, &xb.reshape(&[m, 1, d1], s)?, s)?;
             }
-            let mut wait: Vec<&Array> = vec![&acc];
-            wait.extend(assigns.iter());
-            eval_all(&wait, false)?;
 
-            out.labels.clear();
-            for a in &assigns {
-                out.labels.extend_from_slice(a.as_u32()?);
+            // EMA (Algorithm 1, line 8); untouched clusters keep their position
+            // and only lose mass.
+            let alpha = scheduled_alpha(recipe.alpha0, step, recipe.total_steps) as f32;
+            let sums = acc.slice(&[0, 0], &[k, d], s)?;
+            let cnt = acc.slice(&[0, d], &[k, d1], s)?;
+            let added = cnt.multiply(&Array::scalar_f32(alpha), s)?;
+            let mass = usage
+                .multiply(&Array::scalar_f32(1.0 - alpha), s)?
+                .add(&added, s)?;
+            let mean = sums.divide(&cnt.maximum(&one, s)?, s)?;
+            let w = added.divide(&mass, s)?;
+            let moved = c.add(&w.multiply(&mean.subtract(&c, s)?, s)?, s)?;
+            c = Array::select(&cnt.greater(&zero, s)?, &moved, &c, s)?;
+            usage = mass;
+            if last {
+                pass = pass.add(&acc, s)?;
             }
-            out.counts.fill(0);
-            for &l in &out.labels {
-                out.counts[l as usize] += 1;
-            }
-            let sums = acc.as_f32()?;
-            for ((mean, sum), &cnt) in out
-                .means
-                .chunks_exact_mut(dim)
-                .zip(sums.chunks_exact(dim))
-                .zip(&out.counts)
-            {
-                if cnt > 0 {
-                    let inv = 1.0 / cnt as f32;
-                    for (m, &v) in mean.iter_mut().zip(sum) {
-                        *m = v * inv;
-                    }
+
+            step += 1;
+            if step.is_multiple_of(CHECK_UNUSED_EVERY) && recipe.unused_threshold > 0.0 {
+                eval_all(&[&usage, &c, &pass], false)?;
+                let mut u: Vec<f64> = usage.as_f32()?.iter().map(|&v| v as f64).collect();
+                if needs_revival(&u, recipe.unused_threshold) {
+                    let mut cents = c.as_f32()?.to_vec();
+                    revived +=
+                        revive_unused(&mut cents, &mut u, recipe.unused_threshold, dim, &mut rng);
+                    let u32s: Vec<f32> = u.iter().map(|&v| v as f32).collect();
+                    c = Array::from_f32(&cents, &[k, d]);
+                    usage = Array::from_f32(&u32s, &[k, 1]);
                 }
+            } else {
+                eval_all(&[&c, &usage, &pass], true)?;
             }
-            Ok(())
-        },
-    )
+        }
+
+        if verbosity.detailed_verbosity() {
+            println!(
+                "  Epoch {}/{n_epochs}: {} clusters revived ({:.2?})",
+                epoch + 1,
+                revived.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
+    }
+
+    // Closing means (Algorithm 1, line 12); clusters the last pass never
+    // touched keep their EMA position.
+    let pc = pass.slice(&[0, d], &[k, d1], s)?;
+    let ps = pass.slice(&[0, 0], &[k, d], s)?;
+    let closing = Array::select(
+        &pc.greater(&zero, s)?,
+        &ps.divide(&pc.maximum(&one, s)?, s)?,
+        &c,
+        s,
+    )?;
+    eval_all(&[&closing], false)?;
+    Ok(closing.as_f32()?.to_vec())
 }
 
 /// Assign every point to its nearest centroid on MLX.
