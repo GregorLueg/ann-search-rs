@@ -101,7 +101,7 @@ const KMEANSPP_OVERSAMPLING: usize = 2;
 /// That second difference matters when the runtime has no `u32` atomics and
 /// [`k_means_gpu_flat`] falls back to the CPU: `iters`, `init`, `balanced` and
 /// `seed` carry across, but `fixed` and `quantise_to_f16` have nothing to map
-/// onto and are dropped. A caller asking for a fixed 50 iterations may get
+/// onto and are dropped. A caller asking for a fixed 30 iterations may get
 /// fewer, because every CPU Lloyd path stops early on centroid drift.
 #[derive(Clone, Copy, Debug)]
 pub struct KMeansGpuParams {
@@ -183,7 +183,7 @@ impl KMeansGpuParams {
 /// Default implementation for [KMeansGpuParams]
 impl Default for KMeansGpuParams {
     fn default() -> Self {
-        Self::new(50, None, true, false)
+        Self::new(30, None, true, false)
     }
 }
 

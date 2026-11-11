@@ -123,8 +123,7 @@ fn train(
             use cubecl::wgpu::WgpuDevice;
             let params = match algo {
                 Algo::Lloyd(Some(i)) => KMeansGpuParams::new(i, None, true, false),
-                // 30 fixed, level with the CPU and MLX iteration budget
-                Algo::Lloyd(None) => KMeansGpuParams::new(30, None, true, false),
+                Algo::Lloyd(None) => KMeansGpuParams::default(),
                 Algo::EMeans(t) => KMeansGpuParams::default()
                     .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(t))),
             };
