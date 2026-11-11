@@ -18,9 +18,9 @@ use thousands::*;
 
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
+use crate::utils::dist::*;
 use crate::utils::e_means::e_means_cpu;
 pub use crate::utils::e_means::{EMeansBatchLaw, EMeansParams, KMeansAlgorithm};
-use crate::utils::dist::*;
 use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
 
@@ -3335,8 +3335,17 @@ where
                 n_centroids.separate_with_underscores()
             );
         }
-        let (centroids, _) =
-            e_means_cpu(data, dim, n, n_centroids, metric, &em, seed, false, verbosity)?;
+        let (centroids, _) = e_means_cpu(
+            data,
+            dim,
+            n,
+            n_centroids,
+            metric,
+            &em,
+            seed,
+            false,
+            verbosity,
+        )?;
         if verbosity.normal_verbosity() {
             println!("... trained e-means in {:.2?}", start.elapsed());
         }
