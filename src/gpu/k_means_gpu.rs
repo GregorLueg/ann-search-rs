@@ -25,6 +25,7 @@ use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use faer::Mat;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::iter::Sum;
 use std::time::Instant;
@@ -32,7 +33,10 @@ use std::time::Instant;
 use crate::gpu::topk_gpu::atomic_u32_add_supported;
 use crate::gpu::{WORKGROUP_128, WORKGROUP_SIZE_X};
 use crate::prelude::*;
-use crate::utils::e_means::{print_recipe, resolve_e_means_recipe, run_e_means};
+use crate::utils::e_means::{
+    epoch_seed, needs_revival, print_recipe, resolve_e_means_recipe, revive_unused,
+    scheduled_alpha, split_rng, CHECK_UNUSED_EVERY, INIT_USAGE,
+};
 use crate::utils::k_means_utils::*;
 use thousands::*;
 
@@ -82,6 +86,14 @@ const CENTROID_UNROLL_WIDE: usize = if cfg!(all(target_os = "macos", target_arch
 /// Row length in lines where the assignment kernels move to
 /// [`CENTROID_UNROLL_WIDE`].
 const CENTROID_UNROLL_MAX_LINES: usize = 24;
+
+/// Batch rows per privatised-histogram cube in the e-means CSR build. The
+/// column scan is serial over the cubes, so a small batch wants few of them.
+/// Speed is flat over a wide range around this value.
+const HIST_ROWS_PER_CUBE: usize = 256;
+
+/// Upper bound on the e-means histogram cubes, the count the Lloyd loop uses.
+const HIST_MAX_CUBES: usize = 512;
 
 /// Oversampling factor for [`kmeans_parallel_init_gpu`]. Each round samples
 /// `k * KMEANSPP_OVERSAMPLING` candidates. Matches the upstream CPU
@@ -2014,9 +2026,10 @@ where
 ///
 /// * `data` - Source rows `[n, dim]` in storage precision `S`
 /// * `norms` - Source L2 norms `[n]`; read only with `with_norms`
-/// * `rows` - Source row id per batch row `[b]`
+/// * `perm` - This epoch's row order `[n]`
 /// * `out` - Destination `[>= b, dim]`
 /// * `out_norms` - Destination norms `[>= b]`; written only with `with_norms`
+/// * `offset` - Position of the batch's first row in `perm`
 /// * `b` - Batch rows
 /// * `dim` - Row length, padded; comptime
 /// * `wg_size` - Workgroup size; comptime
@@ -2030,9 +2043,10 @@ where
 pub fn gather_rows<S: Float, A: Float>(
     data: &Tensor<S>,
     norms: &Tensor<A>,
-    rows: &Tensor<u32>,
+    perm: &Tensor<u32>,
     out: &mut Tensor<S>,
     out_norms: &mut Tensor<A>,
+    offset: u32,
     b: u32,
     #[comptime] dim: usize,
     #[comptime] wg_size: u32,
@@ -2044,7 +2058,7 @@ pub fn gather_rows<S: Float, A: Float>(
     }
     let i = pos / dim;
     let e = pos % dim;
-    let r = rows[i] as usize;
+    let r = perm[offset as usize + i] as usize;
     out[pos] = data[r * dim + e];
     // Kept nested: the outer test is comptime and drops out of the kernel.
     #[allow(clippy::collapsible_if)]
@@ -2055,13 +2069,167 @@ pub fn gather_rows<S: Float, A: Float>(
     }
 }
 
-/// e-means on the device: the assignment and per-cluster means run on the
-/// GPU, the EMA and revival on the host through [`run_e_means`].
+/// One e-means EMA update (Algorithm 1, line 8), in place on device.
 ///
-/// Per batch: upload the row ids, gather the rows into a dense buffer,
-/// FlashAssign against the current centroids, privatised CSR plus segmented
-/// reduction for the batch means, then read back means and counts. The host
-/// side is `k * dim` per update, against `batch * k * dim` for the assignment.
+/// A touched cluster gets `N <- (1 - a) N + a n` and moves toward its batch
+/// mean by `a n / N`; an untouched one only loses mass. In the last epoch the
+/// batch sums and counts also accumulate into the closing-mean buffers. The
+/// step comes from a per-run table so no float crosses the launch.
+///
+/// ### Params
+///
+/// * `means` - Batch means `[k, dim]`; only rows with a non-zero count are read
+/// * `counts` - Batch rows per cluster `[k]`
+/// * `alphas` - Step per update `[total_steps]`
+/// * `cent` - Centroids `[k, dim]`, updated in place
+/// * `usage` - EMA mass per cluster `[k]`, updated in place
+/// * `pass_sums` - Last-epoch coordinate sums `[k, dim]`; written only with
+///   `last`
+/// * `pass_counts` - Last-epoch counts `[k]`; written only with `last`
+/// * `step` - Index of this update
+/// * `k` - Number of clusters
+/// * `dim` - Row length, padded; comptime
+/// * `wg_size` - Workgroup size; comptime
+/// * `last` - Whether this is the last epoch; comptime
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> cluster
+/// * `UNIT_POS_X` -> dimension stride offset within the row
+#[cube(launch_unchecked)]
+pub fn e_means_ema<A: Float>(
+    means: &Tensor<A>,
+    counts: &Tensor<u32>,
+    alphas: &Tensor<A>,
+    cent: &mut Tensor<A>,
+    usage: &mut Tensor<A>,
+    pass_sums: &mut Tensor<A>,
+    pass_counts: &mut Tensor<u32>,
+    step: u32,
+    k: u32,
+    #[comptime] dim: usize,
+    #[comptime] wg_size: u32,
+    #[comptime] last: bool,
+) {
+    let c = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if c >= k {
+        terminate!();
+    }
+    let ci = c as usize;
+    let tx = UNIT_POS_X as usize;
+    let cnt = counts[ci];
+    let alpha = alphas[step as usize];
+    let added = alpha * A::cast_from(cnt);
+    let mass = usage[ci] * (A::new(1.0_f32) - alpha) + added;
+    // Every thread reads the old mass before thread 0 overwrites it.
+    sync_cube();
+    if tx == 0 {
+        usage[ci] = mass;
+        if last {
+            pass_counts[ci] += cnt;
+        }
+    }
+    if cnt == 0u32 {
+        terminate!();
+    }
+    let w = added / mass;
+    let cnt_a = A::cast_from(cnt);
+    let base = ci * dim;
+    let mut e = tx;
+    while e < dim {
+        let m = means[base + e];
+        let x = cent[base + e];
+        let mut v = x + w * (m - x);
+        if w >= A::new(1.0_f32) {
+            v = m;
+        }
+        cent[base + e] = v;
+        if last {
+            pass_sums[base + e] += m * cnt_a;
+        }
+        e += wg_size as usize;
+    }
+}
+
+/// Write a batch's labels back to the rows they belong to.
+///
+/// ### Params
+///
+/// * `assign` - Label per batch row `[>= b]`
+/// * `perm` - This epoch's row order `[n]`
+/// * `labels` - Label per data row `[n]`, written at the batch's rows
+/// * `offset` - Position of the batch's first row in `perm`
+/// * `b` - Batch rows
+/// * `wg_size` - Workgroup size; comptime
+///
+/// ### Grid mapping
+///
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> batch
+///   row
+#[cube(launch_unchecked)]
+pub fn scatter_labels(
+    assign: &Tensor<u32>,
+    perm: &Tensor<u32>,
+    labels: &mut Tensor<u32>,
+    offset: u32,
+    b: u32,
+    #[comptime] wg_size: u32,
+) {
+    let i = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
+    if i >= b {
+        terminate!();
+    }
+    labels[perm[(offset + i) as usize] as usize] = assign[i as usize];
+}
+
+/// Refresh the centroid norms the cosine assignment reads.
+///
+/// ### Params
+///
+/// * `client` - CubeCL compute client
+/// * `cent_gpu` - Centroids `[k, dim]`
+/// * `cnorm_gpu` - Output norms `[k]`
+/// * `k` - Number of centroids
+/// * `dim` - Row length, padded
+///
+/// ### Returns
+///
+/// `Ok(())`, or `CubeclUtils` if the grid is over the device limit
+fn refresh_centroid_norms<A>(
+    client: &Client,
+    cent_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
+    k: usize,
+    dim: usize,
+) -> Result<(), AnnSearchErrors>
+where
+    A: Float + cubecl::CubeElement,
+{
+    let (gx, gy) = grid_2d(k as u32, &GpuLimits::from_client(client))?;
+    unsafe {
+        centroid_norms_l2::launch_unchecked::<A>(
+            client,
+            CubeCount::Static(gx, gy, 1),
+            CubeDim::new_1d(1),
+            cent_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            k as u32,
+            dim,
+        );
+    }
+    Ok(())
+}
+
+/// e-means with the whole update on the device.
+///
+/// Per batch: gather the rows through this epoch's permutation, FlashAssign,
+/// privatised CSR plus segmented reduction for the batch means, then the EMA
+/// kernel. The permutation goes up once per epoch and the step sizes once per
+/// run, so nothing crosses the bus inside an epoch except the revival check:
+/// every `CHECK_UNUSED_EVERY` updates the `k` masses come back, and only when a
+/// split is due do the centroids round-trip through the host's
+/// [`revive_unused`]. The closing means are formed on the host from one read
+/// of the last-epoch sums.
 ///
 /// ### Type parameters
 ///
@@ -2105,38 +2273,62 @@ where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + AnnSearchFloat,
 {
+    let start = Instant::now();
     let recipe = resolve_e_means_recipe(n, n_centroids, dim, em)?;
     if verbosity.detailed_verbosity() {
         print_recipe(&recipe);
     }
-    let init = fast_random_init(data_host, dim_padded, n, n_centroids, seed);
-
+    let (k, dp) = (n_centroids, dim_padded);
+    let to_a = |v: f64| <A as num_traits::NumCast>::from(v).unwrap();
     let limits = GpuLimits::from_client(client);
     let cosine = *dist == Dist::Cosine;
     let bsz = recipe.batch_size;
-    let cube_count = 512usize;
-    let batch_data = GpuTensor::<S>::empty(vec![bsz, dim_padded], client)?;
+    let cube_count = bsz.div_ceil(HIST_ROWS_PER_CUBE).clamp(1, HIST_MAX_CUBES);
+
+    let mut cent_gpu = GpuTensor::<A>::from_slice(
+        &fast_random_init(data_host, dp, n, k, seed),
+        vec![k, dp],
+        client,
+    )?;
+    let mut usage_gpu = GpuTensor::<A>::from_slice(&vec![to_a(INIT_USAGE); k], vec![k], client)?;
+    let pass_sums = GpuTensor::<A>::from_slice(&vec![A::zero(); k * dp], vec![k, dp], client)?;
+    let pass_counts = GpuTensor::<u32>::from_slice(&vec![0u32; k], vec![k], client)?;
+    let alphas: Vec<A> = (0..recipe.total_steps)
+        .map(|s| to_a(scheduled_alpha(recipe.alpha0, s, recipe.total_steps)))
+        .collect();
+    let alphas_gpu = GpuTensor::<A>::from_slice(&alphas, vec![alphas.len()], client)?;
+    let cnorm_gpu = if cosine {
+        let c = GpuTensor::<A>::empty(vec![k], client)?;
+        refresh_centroid_norms(client, &cent_gpu, &c, k, dp)?;
+        c
+    } else {
+        GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
+    };
+
+    let batch_data = GpuTensor::<S>::empty(vec![bsz, dp], client)?;
     let batch_norms = GpuTensor::<A>::empty(vec![if cosine { bsz } else { 1 }], client)?;
     let batch_assign = GpuTensor::<u32>::empty(vec![bsz], client)?;
-    let privatised_counts = GpuTensor::<u32>::empty(vec![cube_count, n_centroids], client)?;
-    let counts = GpuTensor::<u32>::empty(vec![n_centroids], client)?;
-    let offsets = GpuTensor::<u32>::empty(vec![n_centroids + 1], client)?;
+    let privatised_counts = GpuTensor::<u32>::empty(vec![cube_count, k], client)?;
+    let counts = GpuTensor::<u32>::empty(vec![k], client)?;
+    let offsets = GpuTensor::<u32>::empty(vec![k + 1], client)?;
     let all_indices = GpuTensor::<u32>::empty(vec![bsz], client)?;
-    let means_gpu = GpuTensor::<A>::empty(vec![n_centroids, dim_padded], client)?;
+    let means_gpu = GpuTensor::<A>::empty(vec![k, dp], client)?;
+    let labels_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
+    let (ema_gx, ema_gy) = grid_2d(k as u32, &limits)?;
 
-    let (centroids, mut labels) = run_e_means(
-        n,
-        dim_padded,
-        n_centroids,
-        init,
-        &recipe,
-        seed,
-        true,
-        verbosity,
-        |rows, cents, want, out| {
-            let b = rows.len();
-            let rows_gpu = GpuTensor::<u32>::from_slice(rows, vec![b], client)?;
-            let (gx, gy) = grid_2d(((b * dim_padded) as u32).div_ceil(WORKGROUP_128), &limits)?;
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    let mut rng = split_rng(seed);
+    let n_epochs = recipe.epoch_rows.len();
+    let mut step = 0usize;
+    for (epoch, &rows) in recipe.epoch_rows.iter().enumerate() {
+        perm.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
+        let perm_gpu = GpuTensor::<u32>::from_slice(&perm, vec![n], client)?;
+        let last = epoch + 1 == n_epochs;
+        let mut revived = 0usize;
+
+        for b0 in (0..rows).step_by(bsz) {
+            let b = bsz.min(rows - b0);
+            let (gx, gy) = grid_2d(((b * dp) as u32).div_ceil(WORKGROUP_128), &limits)?;
             unsafe {
                 gather_rows::launch_unchecked::<S, A>(
                     client,
@@ -2144,28 +2336,16 @@ where
                     CubeDim::new_1d(WORKGROUP_128),
                     data_gpu.clone().into_tensor_arg(),
                     pnorm_gpu.clone().into_tensor_arg(),
-                    rows_gpu.into_tensor_arg(),
+                    perm_gpu.clone().into_tensor_arg(),
                     batch_data.clone().into_tensor_arg(),
                     batch_norms.clone().into_tensor_arg(),
+                    b0 as u32,
                     b as u32,
-                    dim_padded,
+                    dp,
                     WORKGROUP_128,
                     cosine,
                 );
             }
-
-            let cent_gpu =
-                GpuTensor::<A>::from_slice(cents, vec![n_centroids, dim_padded], client)?;
-            let cnorm_gpu = if cosine {
-                let cn: Vec<A> = cents
-                    .chunks_exact(dim_padded)
-                    .map(A::calculate_l2_norm)
-                    .collect();
-                GpuTensor::<A>::from_slice(&cn, vec![n_centroids], client)?
-            } else {
-                GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
-            };
-
             flash_assign_device::<S, A>(
                 client,
                 &batch_data,
@@ -2174,14 +2354,14 @@ where
                 &cnorm_gpu,
                 &batch_assign,
                 b,
-                n_centroids,
-                dim_padded,
+                k,
+                dp,
                 dist,
             )?;
             build_csr_gpu_privatised(
                 &batch_assign,
                 b,
-                n_centroids,
+                k,
                 cube_count,
                 &privatised_counts,
                 &counts,
@@ -2194,51 +2374,124 @@ where
                 &all_indices,
                 &offsets,
                 &means_gpu,
-                n_centroids,
-                dim_padded,
+                k,
+                dp,
                 client,
             )?;
-
-            out.means = means_gpu.clone().read(client)?;
-            out.counts = counts.clone().read(client)?;
-            if want {
-                let mut l = batch_assign.clone().read(client)?;
-                l.truncate(b);
-                out.labels = l;
+            unsafe {
+                e_means_ema::launch_unchecked::<A>(
+                    client,
+                    CubeCount::Static(ema_gx, ema_gy, 1),
+                    CubeDim::new_1d(WORKGROUP_SIZE_X),
+                    means_gpu.clone().into_tensor_arg(),
+                    counts.clone().into_tensor_arg(),
+                    alphas_gpu.clone().into_tensor_arg(),
+                    cent_gpu.clone().into_tensor_arg(),
+                    usage_gpu.clone().into_tensor_arg(),
+                    pass_sums.clone().into_tensor_arg(),
+                    pass_counts.clone().into_tensor_arg(),
+                    step as u32,
+                    k as u32,
+                    dp,
+                    WORKGROUP_SIZE_X,
+                    last,
+                );
             }
-            Ok(())
-        },
-    )?;
+            if last {
+                let (lx, ly) = grid_2d((b as u32).div_ceil(WORKGROUP_128), &limits)?;
+                unsafe {
+                    scatter_labels::launch_unchecked(
+                        client,
+                        CubeCount::Static(lx, ly, 1),
+                        CubeDim::new_1d(WORKGROUP_128),
+                        batch_assign.clone().into_tensor_arg(),
+                        perm_gpu.clone().into_tensor_arg(),
+                        labels_gpu.clone().into_tensor_arg(),
+                        b0 as u32,
+                        b as u32,
+                        WORKGROUP_128,
+                    );
+                }
+            }
 
-    // Below one epoch some rows were never seen; label them against the final
-    // centroids so the contract of one label per point holds.
-    if labels.contains(&u32::MAX) {
-        let cent_gpu =
-            GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
-        let cnorm_gpu = if cosine {
-            let cn: Vec<A> = centroids
-                .chunks_exact(dim_padded)
-                .map(A::calculate_l2_norm)
-                .collect();
-            GpuTensor::<A>::from_slice(&cn, vec![n_centroids], client)?
-        } else {
-            GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
-        };
-        let assign_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
+            step += 1;
+            if step.is_multiple_of(CHECK_UNUSED_EVERY) && recipe.unused_threshold > 0.0 {
+                let mut usage: Vec<f64> = usage_gpu
+                    .clone()
+                    .read(client)?
+                    .iter()
+                    .map(|u| num_traits::ToPrimitive::to_f64(u).unwrap())
+                    .collect();
+                if needs_revival(&usage, recipe.unused_threshold) {
+                    let mut cents = cent_gpu.clone().read(client)?;
+                    revived += revive_unused(
+                        &mut cents,
+                        &mut usage,
+                        recipe.unused_threshold,
+                        dp,
+                        &mut rng,
+                    );
+                    let usage_a: Vec<A> = usage.iter().map(|&u| to_a(u)).collect();
+                    cent_gpu = GpuTensor::<A>::from_slice(&cents, vec![k, dp], client)?;
+                    usage_gpu = GpuTensor::<A>::from_slice(&usage_a, vec![k], client)?;
+                }
+            }
+            if cosine {
+                refresh_centroid_norms(client, &cent_gpu, &cnorm_gpu, k, dp)?;
+            }
+        }
+
+        if verbosity.detailed_verbosity() {
+            println!(
+                "  Epoch {}/{n_epochs}: {} clusters revived ({:.2?})",
+                epoch + 1,
+                revived.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
+    }
+
+    // Closing means (Algorithm 1, line 12); clusters the last pass never
+    // touched keep their EMA position.
+    let mut centroids = cent_gpu.read(client)?;
+    let sums = pass_sums.read(client)?;
+    let cnts = pass_counts.read(client)?;
+    for ((row, sum), &cnt) in centroids
+        .chunks_exact_mut(dp)
+        .zip(sums.chunks_exact(dp))
+        .zip(&cnts)
+    {
+        if cnt > 0 {
+            let inv = A::one() / to_a(cnt as f64);
+            for (c, &s) in row.iter_mut().zip(sum) {
+                *c = s * inv;
+            }
+        }
+    }
+
+    // Below one full closing pass some rows were never labelled; label every
+    // row against the final centroids instead.
+    let labels = if *recipe.epoch_rows.last().unwrap() == n {
+        labels_gpu.read(client)?
+    } else {
+        let cent_final = GpuTensor::<A>::from_slice(&centroids, vec![k, dp], client)?;
+        if cosine {
+            refresh_centroid_norms(client, &cent_final, &cnorm_gpu, k, dp)?;
+        }
         flash_assign_device::<S, A>(
             client,
             data_gpu,
-            &cent_gpu,
+            &cent_final,
             pnorm_gpu,
             &cnorm_gpu,
-            &assign_gpu,
+            &labels_gpu,
             n,
-            n_centroids,
-            dim_padded,
+            k,
+            dp,
             dist,
         )?;
-        labels = assign_gpu.read(client)?;
-    }
+        labels_gpu.read(client)?
+    };
 
     Ok((labels, centroids))
 }

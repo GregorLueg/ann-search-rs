@@ -30,11 +30,11 @@ use crate::utils::Dist;
 const ALPHA_MIN_FACTOR: f64 = 0.1;
 
 /// Batch updates between two revival checks.
-const CHECK_UNUSED_EVERY: usize = 5;
+pub(crate) const CHECK_UNUSED_EVERY: usize = 5;
 
 /// Initial EMA mass of every cluster. Small enough that the first batch to
 /// touch a cluster moves it almost all the way to the batch mean.
-const INIT_USAGE: f64 = 1.0 / 65536.0;
+pub(crate) const INIT_USAGE: f64 = 1.0 / 65536.0;
 
 /// Relative coordinate perturbation separating a split donor from its child.
 const SPLIT_EPSILON: f64 = 1e-4;
@@ -420,7 +420,7 @@ fn apply_ema<T>(
 /// ### Returns
 ///
 /// Number of clusters revived
-fn revive_unused<T>(
+pub(crate) fn revive_unused<T>(
     centroids: &mut [T],
     usage: &mut [f64],
     threshold: f64,
@@ -433,6 +433,11 @@ where
     let k = usage.len();
     let cut = usage.iter().sum::<f64>() * threshold / k as f64;
     let unused: Vec<usize> = (0..k).filter(|&j| usage[j] < cut).collect();
+    // Before any draw, so a backend that skips the call when
+    // `needs_revival` is false keeps the same random stream.
+    if unused.is_empty() {
+        return 0;
+    }
     let mut donors: Vec<(f64, usize)> = (0..k)
         .filter(|&j| usage[j] >= cut && usage[j] > 0.0)
         .map(|j| {
@@ -475,6 +480,36 @@ where
     n_split
 }
 
+/// Whether [`revive_unused`] would find any cluster to revive.
+///
+/// Lets a device backend read the centroids back only when a split is due.
+///
+/// ### Params
+///
+/// * `usage` - EMA mass per cluster
+/// * `threshold` - Revival threshold
+///
+/// ### Returns
+///
+/// `true` if some cluster is below the cut and some other is a donor
+pub(crate) fn needs_revival(usage: &[f64], threshold: f64) -> bool {
+    let cut = usage.iter().sum::<f64>() * threshold / usage.len() as f64;
+    usage.iter().any(|&u| u < cut) && usage.iter().any(|&u| u >= cut && u > 0.0)
+}
+
+/// The random source for revival draws, distinct from the shuffles.
+///
+/// ### Params
+///
+/// * `seed` - Run seed
+///
+/// ### Returns
+///
+/// The seeded generator
+pub(crate) fn split_rng(seed: usize) -> StdRng {
+    StdRng::seed_from_u64(seed as u64 ^ 0x9E37_79B9_7F4A_7C15)
+}
+
 /// Derive one epoch's shuffle seed from the run seed.
 ///
 /// ### Params
@@ -485,7 +520,7 @@ where
 /// ### Returns
 ///
 /// The epoch seed
-fn epoch_seed(seed: usize, epoch: usize) -> u64 {
+pub(crate) fn epoch_seed(seed: usize, epoch: usize) -> u64 {
     ((seed as u64)
         .wrapping_mul(1_000_003)
         .wrapping_add(epoch as u64))
@@ -538,7 +573,7 @@ where
 {
     let start = Instant::now();
     let mut usage = vec![INIT_USAGE; k];
-    let mut split_rng = StdRng::seed_from_u64(seed as u64 ^ 0x9E37_79B9_7F4A_7C15);
+    let mut split_rng = split_rng(seed);
     let mut perm: Vec<u32> = (0..n as u32).collect();
     let mut stats = BatchStats {
         means: vec![T::zero(); k * dim],

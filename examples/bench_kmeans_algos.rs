@@ -147,7 +147,11 @@ fn train(
         // buffer cache, so its timings carry one extra pass over the data.
         "mlx" => {
             use ann_search_rs::mlx::k_means_mlx::k_means_clusters_mlx;
-            let dist = if *metric == Dist::Cosine { "cosine" } else { "euclidean" };
+            let dist = if *metric == Dist::Cosine {
+                "cosine"
+            } else {
+                "euclidean"
+            };
             let (mat, _) = k_means_clusters_mlx(
                 (data, n, dim),
                 dist,
