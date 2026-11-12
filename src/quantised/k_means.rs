@@ -14,84 +14,106 @@ use crate::utils::k_means_utils::*;
 /// Batch size for mini-batch k-means
 const MINI_BATCH_SIZE: usize = 10_000;
 
-/// Threshold below which we use scalar distance
-const SCALAR_DIM_THRESHOLD: usize = 8;
+/// Independent running minima in [`argmin_lanes`]. Eight covers two NEON or
+/// one AVX2 register of `f32`; not tuned.
+const ARGMIN_LANES: usize = 8;
 
-/// Scalar Euclidean distance for small dimensions
-///
-/// When SIMD overhead is likely not worth it.
+/// Transpose a row-major `k * dim` centroid buffer to dimension-major.
 ///
 /// ### Params
 ///
-/// * `a`: The first vector.
-/// * `b`: The second vector.
-///
-/// ### Returns
-///
-/// Euclidean distance between `a` and `b`.
-#[inline(always)]
-fn euclidean_scalar<T: Float>(a: &[T], b: &[T]) -> T {
-    let mut sum = T::zero();
-    for i in 0..a.len() {
-        let diff = a[i] - b[i];
-        sum = sum + diff * diff;
-    }
-    sum
-}
-
-/// Find nearest centroid - scalar version for small dim
-///
-/// ### Params
-///
-/// * `vec`: The vector to find the nearest centroid for.
-/// * `centroids`: The centroids to compare against.
-/// * `dim`: The dimensionality of the vectors.
-/// * `k`: The number of centroids.
-///
-/// ### Returns
-///
-/// The index of the nearest centroid.
-#[inline(always)]
-fn find_nearest_scalar<T: Float>(vec: &[T], centroids: &[T], dim: usize, k: usize) -> usize {
-    let mut best = 0;
-    let mut best_dist = T::infinity();
+/// * `centroids` - Row-major centroids
+/// * `dim` - Dimensionality
+/// * `k` - Number of centroids
+/// * `out` - `dim * k` output; `out[d * k + c]` is dimension `d` of centroid `c`
+fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usize, out: &mut [T]) {
     for c in 0..k {
-        let cent = &centroids[c * dim..(c + 1) * dim];
-        let dist = euclidean_scalar(vec, cent);
-        if dist < best_dist {
-            best_dist = dist;
-            best = c;
+        for d in 0..dim {
+            out[d * k + c] = centroids[c * dim + d];
         }
     }
-    best
 }
 
-/// Find nearest centroid - SIMD version
+/// Find nearest centroid against dimension-major centroids.
+///
+/// The inner loop runs over centroids with independent accumulators, so it
+/// vectorises across centroids at any `dim`. Each centroid still sums its
+/// squared differences in dimension order, so the result is bit-identical to
+/// a plain row-by-row scalar scan.
 ///
 /// ### Params
 ///
-/// * `vec`: The vector to find the nearest centroid for.
-/// * `centroids`: The centroids to compare against.
-/// * `dim`: The dimensionality of the vectors.
-/// * `k`: The number of centroids.
+/// * `vec` - The vector to find the nearest centroid for
+/// * `centroids_t` - Dimension-major centroids from [`transpose_centroids`]
+/// * `k` - Number of centroids
+/// * `dist` - Scratch of length `k`
 ///
 /// ### Returns
 ///
-/// The index of the nearest centroid.
+/// The index of the nearest centroid, the lowest index on ties.
 #[inline(always)]
-fn find_nearest_simd<T: Float + SimdDistance>(
-    vec: &[T],
-    centroids: &[T],
-    dim: usize,
-    k: usize,
-) -> usize {
+fn find_nearest_transposed<T: Float>(vec: &[T], centroids_t: &[T], k: usize, dist: &mut [T]) -> usize {
+    // seed from dimension 0 rather than zero-filling: `0 + x == x` exactly
+    let q0 = vec[0];
+    for (acc, &c) in dist.iter_mut().zip(&centroids_t[..k]) {
+        let diff = q0 - c;
+        *acc = diff * diff;
+    }
+    for (d, &q) in vec.iter().enumerate().skip(1) {
+        let row = &centroids_t[d * k..(d + 1) * k];
+        for (acc, &c) in dist.iter_mut().zip(row) {
+            let diff = q - c;
+            *acc = *acc + diff * diff;
+        }
+    }
+    argmin_lanes(dist)
+}
+
+/// Index of the smallest value, lowest index on ties.
+///
+/// Keeps [`ARGMIN_LANES`] independent running minima so the comparisons
+/// vectorise into compare-and-blend, then merges the lanes. A strict `<` per
+/// lane keeps each lane's first minimum and the merge prefers the lower index
+/// on equal values, so the result matches a plain sequential scan.
+///
+/// ### Params
+///
+/// * `dist` - Values to scan, non-empty
+///
+/// ### Returns
+///
+/// The index of the first minimum
+#[inline(always)]
+fn argmin_lanes<T: Float>(dist: &[T]) -> usize {
+    let mut best_v = [T::infinity(); ARGMIN_LANES];
+    // u32 keeps the index blend at the width of the f32 compare
+    let mut best_i = [0u32; ARGMIN_LANES];
+    let chunks = dist.chunks_exact(ARGMIN_LANES);
+    let rem_start = dist.len() - chunks.remainder().len();
+    for (ci, chunk) in chunks.enumerate() {
+        for l in 0..ARGMIN_LANES {
+            let v = chunk[l];
+            let take = v < best_v[l];
+            best_v[l] = if take { v } else { best_v[l] };
+            best_i[l] = if take {
+                (ci * ARGMIN_LANES + l) as u32
+            } else {
+                best_i[l]
+            };
+        }
+    }
     let mut best = 0;
     let mut best_dist = T::infinity();
-    for c in 0..k {
-        let cent = &centroids[c * dim..(c + 1) * dim];
-        let dist = T::euclidean_simd(vec, cent);
-        if dist < best_dist {
-            best_dist = dist;
+    for l in 0..ARGMIN_LANES {
+        let i = best_i[l] as usize;
+        if best_v[l] < best_dist || (best_v[l] == best_dist && i < best) {
+            best_dist = best_v[l];
+            best = i;
+        }
+    }
+    for (c, &v) in dist.iter().enumerate().skip(rem_start) {
+        if v < best_dist {
+            best_dist = v;
             best = c;
         }
     }
@@ -158,7 +180,8 @@ fn mini_batch_lloyd_pq<T>(
     T: AnnSearchFloat,
 {
     let batch_size = MINI_BATCH_SIZE.min(n);
-    let use_scalar = dim <= SCALAR_DIM_THRESHOLD;
+
+    let mut centroids_t = vec![T::zero(); k * dim];
 
     // Per-centroid counts for learning rate
     let mut centroid_counts = vec![0usize; k];
@@ -176,17 +199,18 @@ fn mini_batch_lloyd_pq<T>(
         let batch_start = iter * batch_size;
         let batch_indices = &all_batch_indices[batch_start..batch_start + batch_size];
 
+        transpose_centroids(centroids, dim, k, &mut centroids_t);
+
         // parallel assignment of batch
         let assignments: Vec<usize> = batch_indices
             .par_iter()
-            .map(|&i| {
-                let vec = &data[i * dim..(i + 1) * dim];
-                if use_scalar {
-                    find_nearest_scalar(vec, centroids, dim, k)
-                } else {
-                    find_nearest_simd(vec, centroids, dim, k)
-                }
-            })
+            .map_init(
+                || vec![T::zero(); k],
+                |dist, &i| {
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    find_nearest_transposed(vec, &centroids_t, k, dist)
+                },
+            )
             .collect();
 
         // sequential centroid update with per-centroid learning rate
@@ -230,21 +254,22 @@ fn full_lloyd_pq<T>(
 ) where
     T: AnnSearchFloat,
 {
-    let use_scalar = dim <= SCALAR_DIM_THRESHOLD;
     let mut prev_assignments = vec![usize::MAX; n];
+    let mut centroids_t = vec![T::zero(); k * dim];
 
     for _ in 0..max_iters {
+        transpose_centroids(centroids, dim, k, &mut centroids_t);
+
         // parallel assignment
         let assignments: Vec<usize> = (0..n)
             .into_par_iter()
-            .map(|i| {
-                let vec = &data[i * dim..(i + 1) * dim];
-                if use_scalar {
-                    find_nearest_scalar(vec, centroids, dim, k)
-                } else {
-                    find_nearest_simd(vec, centroids, dim, k)
-                }
-            })
+            .map_init(
+                || vec![T::zero(); k],
+                |dist, i| {
+                    let vec = &data[i * dim..(i + 1) * dim];
+                    find_nearest_transposed(vec, &centroids_t, k, dist)
+                },
+            )
             .collect();
 
         // early termination check
@@ -342,24 +367,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_euclidean_scalar() {
-        let a = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let b = vec![5.0_f32, 6.0, 7.0, 8.0];
-        let dist = euclidean_scalar(&a, &b);
-        // (4^2 + 4^2 + 4^2 + 4^2) = 64
-        assert!((dist - 64.0).abs() < 1e-6);
+    fn test_find_nearest_transposed_matches_row_scan() {
+        let dim = 4;
+        let k = 37;
+        let centroids: Vec<f32> = (0..k * dim).map(|x| ((x * 7919) % 101) as f32 * 0.1).collect();
+        let mut centroids_t = vec![0.0f32; k * dim];
+        transpose_centroids(&centroids, dim, k, &mut centroids_t);
+        let mut dist = vec![0.0f32; k];
+        for p in 0..50 {
+            let vec: Vec<f32> = (0..dim).map(|d| ((p * 31 + d * 17) % 53) as f32 * 0.2).collect();
+            let mut best = 0;
+            let mut best_d = f32::INFINITY;
+            for c in 0..k {
+                let mut s = 0.0f32;
+                for d in 0..dim {
+                    let diff = vec[d] - centroids[c * dim + d];
+                    s = s + diff * diff;
+                }
+                if s < best_d {
+                    best_d = s;
+                    best = c;
+                }
+            }
+            assert_eq!(find_nearest_transposed(&vec, &centroids_t, k, &mut dist), best);
+        }
     }
 
     #[test]
-    fn test_find_nearest_scalar() {
-        let vec = vec![1.0_f32, 1.0];
-        let centroids = vec![
-            0.0_f32, 0.0, // centroid 0
-            1.0, 1.0, // centroid 1
-            5.0, 5.0, // centroid 2
-        ];
-        let nearest = find_nearest_scalar(&vec, &centroids, 2, 3);
-        assert_eq!(nearest, 1);
+    fn test_argmin_lanes_ties_pick_lowest_index() {
+        let mut v = vec![5.0f32; 21];
+        v[3] = 1.0;
+        v[11] = 1.0;
+        v[19] = 1.0;
+        assert_eq!(argmin_lanes(&v), 3);
+        v[3] = 2.0;
+        assert_eq!(argmin_lanes(&v), 11);
+        let mut w = vec![5.0f32; 21];
+        w[18] = 0.5;
+        w[20] = 0.5;
+        assert_eq!(argmin_lanes(&w), 18);
     }
 
     #[test]
