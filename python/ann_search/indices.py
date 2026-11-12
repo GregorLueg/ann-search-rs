@@ -82,9 +82,14 @@ class KmknnIndex(BaseAnnIndex):
         nlist: Number of k-means clusters to partition into. ``None`` defaults
             to ``sqrt(n)``. More clusters prune harder but cost more to scan
             the centroids.
-        kmeans_iters: Lloyd iterations when training the partition. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the partition. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration. Off by
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration. Off by
             default because it changes the partition, and therefore the index
             built on it.
         seed: Fixes k-means initialisation.
@@ -102,6 +107,8 @@ class KmknnIndex(BaseAnnIndex):
         n_neighbors: int = 15,
         metric: str = "euclidean",
         nlist: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
@@ -110,6 +117,8 @@ class KmknnIndex(BaseAnnIndex):
         self.n_neighbors = n_neighbors
         self.metric = metric
         self.nlist = nlist
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.seed = seed
@@ -120,6 +129,8 @@ class KmknnIndex(BaseAnnIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             seed=self.seed,
@@ -264,11 +275,16 @@ class IvfIndex(BaseAnnIndex):
             ``sqrt(nlist)``, and anything above `nlist` is capped there.
             Search-time: override it per call as
             ``index.kneighbors(nprobe=32)``.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration. Evens out the
-            posting lists, at the cost of a partition that no longer matches an
-            unbalanced run.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each
+            iteration. Evens out the posting lists, at the cost of a partition
+            that no longer matches an unbalanced run.
         seed: Fixes k-means initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
             process stdout, not ``sys.stdout``; in Jupyter that is the
@@ -286,6 +302,8 @@ class IvfIndex(BaseAnnIndex):
         metric: str = "euclidean",
         nlist: int | None = None,
         nprobe: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
@@ -295,6 +313,8 @@ class IvfIndex(BaseAnnIndex):
         self.metric = metric
         self.nlist = nlist
         self.nprobe = nprobe
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.seed = seed
@@ -305,6 +325,8 @@ class IvfIndex(BaseAnnIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             seed=self.seed,
@@ -760,9 +782,14 @@ class SoarIndex(BaseAnnIndex):
         rule_param: ``mu`` for the shifted rule, ``lambda`` for the orthogonal
             one, ignored by ``"nearest"``. ``None`` takes the crate's values:
             ``mu = 0.5``, ``lambda = 1.0``.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         seed: Fixes k-means initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
             process stdout, not ``sys.stdout``; in Jupyter that is the
@@ -785,6 +812,8 @@ class SoarIndex(BaseAnnIndex):
         nprobe: int | None = None,
         rule: str | None = None,
         rule_param: float | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
@@ -796,6 +825,8 @@ class SoarIndex(BaseAnnIndex):
         self.nprobe = nprobe
         self.rule = rule
         self.rule_param = rule_param
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.seed = seed
@@ -813,6 +844,8 @@ class SoarIndex(BaseAnnIndex):
             nlist=self.nlist,
             rule=self.rule,
             rule_param=self.rule_param,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             seed=self.seed,

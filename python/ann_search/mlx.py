@@ -111,9 +111,14 @@ class IvfMlxIndex(_BaseMlxIndex):
             ``index.kneighbors(nprobe=32)``.
         nquery: Queries per device tile. ``None`` lets the library size it.
             Search-time.
-        kmeans_iters: Lloyd iterations. ``None`` defaults to 30. Every one
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations. ``None`` defaults to 30. Every one
             runs; MLX k-means has no early stop.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         seed: Fixes k-means initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
             process stdout, not ``sys.stdout``.
@@ -130,6 +135,8 @@ class IvfMlxIndex(_BaseMlxIndex):
         nlist: int | None = None,
         nprobe: int | None = None,
         nquery: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
@@ -140,6 +147,8 @@ class IvfMlxIndex(_BaseMlxIndex):
         self.nlist = nlist
         self.nprobe = nprobe
         self.nquery = nquery
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.seed = seed
@@ -150,6 +159,8 @@ class IvfMlxIndex(_BaseMlxIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             seed=self.seed,

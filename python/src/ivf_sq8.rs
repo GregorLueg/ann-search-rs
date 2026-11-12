@@ -25,8 +25,11 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     ///   supported and the library rejects it.
     /// * `nlist` - Voronoi cells, or `None` for the library's `sqrt(n)`
     ///   heuristic.
-    /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate default.
-    /// * `kmeans_balanced` - Reseed starved centroids each iteration.
+    /// * `kmeans_algorithm` - `"emeans"` (default) or `"lloyd"`.
+    /// * `kmeans_epochs` - e-means epochs, or `None` for the crate default.
+    /// * `kmeans_iters` - Lloyd iterations, or `None` for 30. Lloyd's only.
+    /// * `kmeans_balanced` - Reseed starved centroids each iteration. Lloyd's
+    ///   only.
     /// * `quant_drop_ratio` - Fraction trimmed from each tail of every
     ///   dimension before the range is fixed, or `None` for the crate
     ///   default.
@@ -43,7 +46,7 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
     /// unsupported-metric error.
     #[staticmethod]
     #[pyo3(signature = (
-            x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
+            x, *, metric, nlist = None, kmeans_algorithm = String::from("emeans"), kmeans_epochs = None, kmeans_iters = None, kmeans_balanced = false,
             quant_drop_ratio = None, quant_sample_rows = None, seed = 42, verbose = 0
         ))]
     #[allow(clippy::too_many_arguments)]
@@ -52,6 +55,8 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
         x: &Bound<'_, PyAny>,
         metric: String,
         nlist: Option<usize>,
+        kmeans_algorithm: String,
+        kmeans_epochs: Option<f64>,
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         quant_drop_ratio: Option<f64>,
@@ -59,7 +64,12 @@ ann_handle!(PyIvfSq8, IvfSq8Inner, IvfSq8Index, "IvfSq8", method, {
         seed: usize,
         verbose: usize,
     ) -> PyResult<Self> {
-        let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
+        let kmp = kmeans_params(
+            &kmeans_algorithm,
+            kmeans_epochs,
+            kmeans_iters,
+            kmeans_balanced,
+        )?;
         let qp = quant_params(quant_drop_ratio, quant_sample_rows, seed);
         build_dispatch!(py, x, IvfSq8Inner, |data, n, dim| build_ivf_sq8_index(
             (data, n, dim),

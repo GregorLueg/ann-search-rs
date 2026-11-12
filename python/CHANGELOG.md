@@ -3,6 +3,18 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.7.0
+
+Requires `ann-search-rs` 0.13.0
+
+- e-means is the default k-means for every IVF-family index (IVF, KMKNN, SOAR,
+  the quantised IVFs, GPU and MLX IVF). Results differ at the same seed.
+- New `kmeans_algorithm` (`"emeans"` or `"lloyd"`) and `kmeans_epochs` knobs.
+  `kmeans_iters` and `kmeans_balanced` now only apply to `"lloyd"` and raise a
+  `ValueError` otherwise; before, passing `kmeans_iters` quietly switched to
+  Lloyd's and `kmeans_balanced` alone was ignored.
+- GPU IVF Lloyd's defaults to 30 iterations instead of 50.
+
 ## 0.6.1
 
 Requires `ann-search-rs` 0.12.2

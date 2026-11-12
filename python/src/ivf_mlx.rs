@@ -20,9 +20,12 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     /// * `x` - Samples by features, C-contiguous float32.
     /// * `metric` - Already validated by the Python layer.
     /// * `nlist` - Voronoi cells, or `None` for `sqrt(n)`.
-    /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate's 30. MLX
-    ///   runs every one; there is no early stop.
-    /// * `kmeans_balanced` - Reseed starved centroids each iteration.
+    /// * `kmeans_algorithm` - `"emeans"` (default) or `"lloyd"`.
+    /// * `kmeans_epochs` - e-means epochs, or `None` for the crate default.
+    /// * `kmeans_iters` - Lloyd iterations, or `None` for 30. Lloyd's only.
+    ///   MLX runs every one; there is no early stop.
+    /// * `kmeans_balanced` - Reseed starved centroids each iteration. Lloyd's
+    ///   only.
     /// * `seed` - Fixes the k-means initialisation.
     /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
     ///   stdout, not `sys.stdout`.
@@ -32,7 +35,7 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     /// The built handle, or a clustering error.
     #[staticmethod]
     #[pyo3(signature = (
-        x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
+        x, *, metric, nlist = None, kmeans_algorithm = String::from("emeans"), kmeans_epochs = None, kmeans_iters = None, kmeans_balanced = false,
         seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -41,6 +44,8 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
         x: &Bound<'_, PyAny>,
         metric: String,
         nlist: Option<usize>,
+        kmeans_algorithm: String,
+        kmeans_epochs: Option<f64>,
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         seed: usize,
@@ -48,7 +53,12 @@ mlx_handle!(PyIvfMlx, IvfIndexMlx, "IvfMlx", {
     ) -> PyResult<Self> {
         let a = f32_array(x)?;
         let (data, n, dim) = crate::convert::flat(&a)?;
-        let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
+        let kmp = kmeans_params(
+            &kmeans_algorithm,
+            kmeans_epochs,
+            kmeans_iters,
+            kmeans_balanced,
+        )?;
         let inner = detach(py, || {
             build_ivf_index_mlx(
                 (data, n, dim),

@@ -70,8 +70,11 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     ///   heuristic.
     /// * `rule` - Spilling rule, or `None` to let the library pick per metric.
     /// * `rule_param` - `mu` for `"shifted"`, `lambda` for `"orthogonal"`.
-    /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate default.
-    /// * `kmeans_balanced` - Reseed starved centroids each iteration.
+    /// * `kmeans_algorithm` - `"emeans"` (default) or `"lloyd"`.
+    /// * `kmeans_epochs` - e-means epochs, or `None` for the crate default.
+    /// * `kmeans_iters` - Lloyd iterations, or `None` for 30. Lloyd's only.
+    /// * `kmeans_balanced` - Reseed starved centroids each iteration. Lloyd's
+    ///   only.
     /// * `seed` - Fixes the k-means initialisation.
     /// * `verbose` - `0` quiet, `1` normal, `2` detailed. Prints to the process
     ///   stdout, not `sys.stdout`.
@@ -81,7 +84,7 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
     /// The built handle, or a clustering error.
     #[staticmethod]
     #[pyo3(signature = (
-        x, *, metric, nlist = None, rule = None, rule_param = None, kmeans_iters = None,
+        x, *, metric, nlist = None, rule = None, rule_param = None, kmeans_algorithm = String::from("emeans"), kmeans_epochs = None, kmeans_iters = None,
         kmeans_balanced = false, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -92,13 +95,20 @@ ann_handle!(PySoar, SoarInner, SoarIndex, "Soar", {
         nlist: Option<usize>,
         rule: Option<&str>,
         rule_param: Option<f64>,
+        kmeans_algorithm: String,
+        kmeans_epochs: Option<f64>,
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         seed: usize,
         verbose: usize,
     ) -> PyResult<Self> {
         let rule = soar_rule(rule, rule_param).map_err(PyValueError::new_err)?;
-        let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
+        let kmp = kmeans_params(
+            &kmeans_algorithm,
+            kmeans_epochs,
+            kmeans_iters,
+            kmeans_balanced,
+        )?;
         build_dispatch!(py, x, SoarInner, |data, n, dim| build_soar_index(
             (data, n, dim),
             nlist,

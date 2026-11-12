@@ -23,8 +23,11 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     /// * `metric` - Already validated by the Python layer.
     /// * `nlist` - Voronoi cells, or `None` for the library's `sqrt(n)`
     ///   heuristic.
-    /// * `kmeans_iters` - Lloyd iterations, or `None` for the crate default.
-    /// * `kmeans_balanced` - Reseed starved centroids each iteration.
+    /// * `kmeans_algorithm` - `"emeans"` (default) or `"lloyd"`.
+    /// * `kmeans_epochs` - e-means epochs, or `None` for the crate default.
+    /// * `kmeans_iters` - Lloyd iterations, or `None` for 30. Lloyd's only.
+    /// * `kmeans_balanced` - Reseed starved centroids each iteration. Lloyd's
+    ///   only.
     /// * `quantise_to_f16` - Hold the training buffer at fp16 on the device.
     ///   Needs `shader-f16` on the adapter.
     /// * `seed` - Fixes the k-means initialisation.
@@ -36,7 +39,7 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     /// The built handle, or a clustering error.
     #[staticmethod]
     #[pyo3(signature = (
-        x, *, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
+        x, *, metric, nlist = None, kmeans_algorithm = String::from("emeans"), kmeans_epochs = None, kmeans_iters = None, kmeans_balanced = false,
         quantise_to_f16 = false, seed = 42, verbose = 0
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -45,6 +48,8 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
         x: &Bound<'_, PyAny>,
         metric: String,
         nlist: Option<usize>,
+        kmeans_algorithm: String,
+        kmeans_epochs: Option<f64>,
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         quantise_to_f16: bool,
@@ -53,7 +58,13 @@ gpu_handle!(PyIvfGpu, IvfIndexGpu, "IvfGpu", {
     ) -> PyResult<Self> {
         let a = f32_array!(x);
         let (data, n, dim) = crate::convert::flat(&a)?;
-        let kmp = kmeans_gpu_params(kmeans_iters, kmeans_balanced, quantise_to_f16);
+        let kmp = kmeans_gpu_params(
+            &kmeans_algorithm,
+            kmeans_epochs,
+            kmeans_iters,
+            kmeans_balanced,
+            quantise_to_f16,
+        )?;
         let inner = py
             .detach(|| {
                 crate::pool::run(|| {

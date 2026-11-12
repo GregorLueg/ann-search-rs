@@ -26,9 +26,12 @@ ann_handle!(PyIvfPq, IvfPqInner, IvfPqIndex, "IvfPq", method, {
     ///   supported and the library rejects it.
     /// * `nlist` - Voronoi cells, or `None` for the library's `sqrt(n)`
     ///   heuristic.
-    /// * `kmeans_iters` - Lloyd iterations for the cells, or `None` for the
-    ///   crate default.
-    /// * `kmeans_balanced` - Reseed starved centroids each iteration.
+    /// * `kmeans_algorithm` - `"emeans"` (default) or `"lloyd"`.
+    /// * `kmeans_epochs` - e-means epochs, or `None` for the crate default.
+    /// * `kmeans_iters` - Lloyd iterations for the cells, or `None` for 30.
+    ///   Lloyd's only.
+    /// * `kmeans_balanced` - Reseed starved centroids each iteration. Lloyd's
+    ///   only.
     /// * `n_pq_centroids` - Centroids per subspace, or `None` for the
     ///   crate default of 256.
     /// * `seed` - Fixes both the cell and the codebook initialisation.
@@ -41,7 +44,7 @@ ann_handle!(PyIvfPq, IvfPqInner, IvfPqIndex, "IvfPq", method, {
     /// error.
     #[staticmethod]
     #[pyo3(signature = (
-            x, *, m, metric, nlist = None, kmeans_iters = None, kmeans_balanced = false,
+            x, *, m, metric, nlist = None, kmeans_algorithm = String::from("emeans"), kmeans_epochs = None, kmeans_iters = None, kmeans_balanced = false,
             n_pq_centroids = None, seed = 42, verbose = 0
         ))]
     #[allow(clippy::too_many_arguments)]
@@ -51,13 +54,20 @@ ann_handle!(PyIvfPq, IvfPqInner, IvfPqIndex, "IvfPq", method, {
         m: usize,
         metric: String,
         nlist: Option<usize>,
+        kmeans_algorithm: String,
+        kmeans_epochs: Option<f64>,
         kmeans_iters: Option<usize>,
         kmeans_balanced: bool,
         n_pq_centroids: Option<usize>,
         seed: usize,
         verbose: usize,
     ) -> PyResult<Self> {
-        let kmp = kmeans_params(kmeans_iters, kmeans_balanced);
+        let kmp = kmeans_params(
+            &kmeans_algorithm,
+            kmeans_epochs,
+            kmeans_iters,
+            kmeans_balanced,
+        )?;
         build_dispatch!(py, x, IvfPqInner, |data, n, dim| build_ivf_pq_index(
             (data, n, dim),
             nlist,
