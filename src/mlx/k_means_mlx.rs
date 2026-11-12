@@ -804,6 +804,51 @@ mod tests {
         assert!((a - b).abs() / b < 0.02, "mlx {a} vs cpu {b}");
     }
 
+    /// Tiny inputs resolve to a one-row e-means batch, so the argmin kernel
+    /// sees a score matrix below MLX's `device` binding threshold. Every
+    /// algorithm and batch size must still train.
+    #[test]
+    fn test_mlx_e_means_tiny_input() {
+        let (n, dim, k) = (60, 5, 3);
+        let mut data = blobs(n, dim, 3, 42);
+        for row in data.chunks_mut(dim) {
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+        }
+        let em = |b: Option<usize>| {
+            KMeansAlgorithm::EMeans(EMeansParams {
+                batch_size: b,
+                ..EMeansParams::default()
+            })
+        };
+        for (label, alg) in [
+            ("lloyd", KMeansAlgorithm::Lloyd),
+            ("e-means auto", em(None)),
+            ("e-means b=1", em(Some(1))),
+            ("e-means b=2", em(Some(2))),
+            ("e-means b=3", em(Some(3))),
+            ("e-means b=8", em(Some(8))),
+        ] {
+            let params = KMeansTrainingParams::new(10, None, None).with_algorithm(alg);
+            let res = k_means_clusters_mlx(
+                (&data[..], n, dim),
+                "cosine",
+                k,
+                Some(params),
+                42,
+                Verbosity::Quiet,
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let (cent, assign) = res;
+            assert_eq!(assign.len(), n, "{label}");
+            assert!(assign.iter().all(|&a| (a as usize) < k), "{label}");
+            assert!(
+                (0..k).all(|i| (0..dim).all(|j| cent[(i, j)].is_finite())),
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn test_mlx_kmeans_balanced_runs() {
         let (n, dim, k) = (2_000, 8, 20);
