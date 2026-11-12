@@ -26,7 +26,7 @@ const ARGMIN_LANES: usize = 8;
 /// * `dim` - Dimensionality
 /// * `k` - Number of centroids
 /// * `out` - `dim * k` output; `out[d * k + c]` is dimension `d` of centroid `c`
-fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usize, out: &mut [T]) {
+pub(crate) fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usize, out: &mut [T]) {
     for c in 0..k {
         for d in 0..dim {
             out[d * k + c] = centroids[c * dim + d];
@@ -52,7 +52,7 @@ fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usize, out: &mu
 ///
 /// The index of the nearest centroid, the lowest index on ties.
 #[inline(always)]
-fn find_nearest_transposed<T: Float>(vec: &[T], centroids_t: &[T], k: usize, dist: &mut [T]) -> usize {
+pub(crate) fn find_nearest_transposed<T: Float>(vec: &[T], centroids_t: &[T], k: usize, dist: &mut [T]) -> usize {
     // seed from dimension 0 rather than zero-filling: `0 + x == x` exactly
     let q0 = vec[0];
     for (acc, &c) in dist.iter_mut().zip(&centroids_t[..k]) {

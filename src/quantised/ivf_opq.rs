@@ -305,20 +305,21 @@ where
         let mut quantised_codes = vec![0u8; n * m];
 
         quantised_codes
-            .par_chunks_mut(m)
-            .zip(assignments.par_iter())
+            .par_chunks_mut(ENCODE_ROW_TILE * m)
             .enumerate()
-            .for_each(|(vec_idx, (chunk, &cluster_id))| {
-                let vec_start = vec_idx * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-
-                let centroid =
-                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
-                let residual = T::subtract_simd(vec, centroid);
-
-                let codes = codebook.encode(&residual);
-                chunk.copy_from_slice(&codes);
-            });
+            .for_each_init(
+                || Vec::with_capacity(ENCODE_ROW_TILE * dim),
+                |tile, (t, codes)| {
+                    tile.clear();
+                    for vec_idx in t * ENCODE_ROW_TILE..t * ENCODE_ROW_TILE + codes.len() / m {
+                        let vec = &vectors_flat[vec_idx * dim..(vec_idx + 1) * dim];
+                        let c = assignments[vec_idx] as usize;
+                        let centroid = &centroids[c * dim..(c + 1) * dim];
+                        tile.extend(vec.iter().zip(centroid).map(|(&a, &b)| a - b));
+                    }
+                    codebook.encode_rows(tile, codes);
+                },
+            );
 
         // Pre-rotate once at build so the query path never pays `dim^2` per
         // probed cell.

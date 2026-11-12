@@ -418,18 +418,24 @@ where
         }
         let mut quantised_codes = vec![0u8; n_entries * m];
         quantised_codes
-            .par_chunks_mut(m)
+            .par_chunks_mut(ENCODE_ROW_TILE * m)
             .enumerate()
-            .for_each(|(pos, chunk)| {
-                let point = members[pos] as usize;
-                let cluster = pos_cluster[pos] as usize;
-                let vec = &vectors_flat[point * dim..(point + 1) * dim];
-                let centroid = &centroids[cluster * dim..(cluster + 1) * dim];
-                let residual = T::subtract_simd(vec, centroid);
-                // `encode` rotates internally, so codes land in the rotated
-                // space the codebooks were trained in.
-                chunk.copy_from_slice(&codebook.encode(&residual));
-            });
+            .for_each_init(
+                || Vec::with_capacity(ENCODE_ROW_TILE * dim),
+                |tile, (t, codes)| {
+                    tile.clear();
+                    for pos in t * ENCODE_ROW_TILE..t * ENCODE_ROW_TILE + codes.len() / m {
+                        let point = members[pos] as usize;
+                        let cluster = pos_cluster[pos] as usize;
+                        let vec = &vectors_flat[point * dim..(point + 1) * dim];
+                        let centroid = &centroids[cluster * dim..(cluster + 1) * dim];
+                        tile.extend(vec.iter().zip(centroid).map(|(&a, &b)| a - b));
+                    }
+                    // rotates internally, so codes land in the rotated space
+                    // the codebooks were trained in
+                    codebook.encode_rows(tile, codes);
+                },
+            );
 
         // Tag exactly one position per point as its primary. `seen_primary`
         // matters when nlist == 1, where the secondary assignment degenerates

@@ -5,7 +5,7 @@
 //! distance stay faithful to the metric the caller asked for.
 
 use crate::utils::gemm::gemm;
-use faer::{Accum, Mat, MatMut, MatRef, Par, Scale};
+use faer::{Accum, Mat, MatMut, MatRef, Par};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
@@ -17,6 +17,11 @@ use std::ops::AddAssign;
 use crate::prelude::*;
 use crate::quantised::k_means::*;
 use crate::utils::k_means_utils::*;
+
+/// Rows per tile when encoding many vectors. Each tile transposes every
+/// codebook once, so the transpose is amortised over this many rows while the
+/// tile itself stays small enough to keep per-thread scratch cheap. Not tuned.
+pub(crate) const ENCODE_ROW_TILE: usize = 256;
 
 /// Rows per tile of the OPQ rotation GEMM.
 ///
@@ -326,70 +331,50 @@ where
         total
     }
 
-    /// Batch encode multiple vectors - computes distances via matrix ops
+    /// Encode a tile of vectors
+    ///
+    /// Works subspace by subspace: each codebook is transposed to
+    /// dimension-major once, then every row of the tile is assigned against
+    /// it with the PQ k-means kernel, so the scan vectorises across
+    /// centroids. Sequential; callers parallelise over tiles.
     ///
     /// ### Params
     ///
-    /// * `vectors` - The vectors
-    /// * `n` - Size of the data set
+    /// * `rows` - Row-major vectors, `t * dim` elements
+    /// * `codes` - Output, `t * m` codes, row-major
+    pub fn encode_rows(&self, rows: &[T], codes: &mut [u8]) {
+        let m = self.m;
+        let sd = self.subvec_dim;
+        let k = self.n_centroids;
+        let dim = m * sd;
+        let mut book_t = vec![T::zero(); k * sd];
+        let mut dist = vec![T::zero(); k];
+        for (s, book) in self.codebooks.iter().enumerate() {
+            transpose_centroids(book, sd, k, &mut book_t);
+            for (r, row) in rows.chunks_exact(dim).enumerate() {
+                let sub = &row[s * sd..(s + 1) * sd];
+                codes[r * m + s] = find_nearest_transposed(sub, &book_t, k, &mut dist) as u8;
+            }
+        }
+    }
+
+    /// Encode many vectors in parallel tiles of [`ENCODE_ROW_TILE`] rows
+    ///
+    /// ### Params
+    ///
+    /// * `vectors` - The vectors, row-major
+    /// * `n` - Number of vectors
     ///
     /// ### Returns
     ///
-    /// Returns the assignments
+    /// Row-major `n * m` codes
     pub fn encode_batch(&self, vectors: &[T], n: usize) -> Vec<u8> {
-        let dim = self.m() * self.subvec_dim();
-        let mut all_codes = vec![0u8; n * self.m()];
-
-        for subspace in 0..self.m() {
-            let subvec_start = subspace * self.subvec_dim();
-
-            // extract all subvectors for this subspace (n x subvec_dim)
-            let mut subvecs = Mat::<T>::zeros(n, self.subvec_dim());
-            for i in 0..n {
-                for j in 0..self.subvec_dim() {
-                    subvecs[(i, j)] = vectors[i * dim + subvec_start + j];
-                }
-            }
-
-            // centroids matrix (n_centroids x subvec_dim)
-            let mut centroids = Mat::<T>::zeros(self.n_centroids(), self.subvec_dim());
-            for i in 0..self.n_centroids() {
-                for j in 0..self.subvec_dim() {
-                    centroids[(i, j)] = self.codebooks()[subspace][i * self.subvec_dim() + j];
-                }
-            }
-
-            // Compute squared distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x@c^T
-            // Precompute ||c||^2 for all centroids
-            let centroid_norms: Vec<T> = (0..self.n_centroids())
-                .map(|i| {
-                    (0..self.subvec_dim())
-                        .map(|j| centroids[(i, j)].powi(2))
-                        .sum()
-                })
-                .collect();
-
-            let dot_products = Scale(-T::from_f32(2.0).unwrap()) * &subvecs * centroids.transpose();
-
-            all_codes
-                .par_chunks_mut(self.m())
-                .enumerate()
-                .for_each(|(vec_idx, codes)| {
-                    let mut best_idx = 0;
-                    let mut best_dist = T::infinity();
-
-                    for c in 0..self.n_centroids() {
-                        let dist = centroid_norms[c] + dot_products[(vec_idx, c)];
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_idx = c;
-                        }
-                    }
-
-                    codes[subspace] = best_idx as u8;
-                });
-        }
-
+        let dim = self.m * self.subvec_dim;
+        let mut all_codes = vec![0u8; n * self.m];
+        all_codes
+            .par_chunks_mut(ENCODE_ROW_TILE * self.m)
+            .zip(vectors[..n * dim].par_chunks(ENCODE_ROW_TILE * dim))
+            .for_each(|(codes, rows)| self.encode_rows(rows, codes));
         all_codes
     }
 }
@@ -548,6 +533,21 @@ where
     pub fn encode(&self, vec: &[T]) -> Vec<u8> {
         let rotated = Self::rotate_vector(vec, &self.rotation_matrix, self.dim);
         self.pq.encode(&rotated)
+    }
+
+    /// Encode a tile of vectors
+    ///
+    /// Rotates the whole tile with one GEMM, then encodes it with
+    /// [`ProductQuantiser::encode_rows`]. Callers parallelise over tiles.
+    ///
+    /// ### Params
+    ///
+    /// * `rows` - Row-major vectors, `t * dim` elements
+    /// * `codes` - Output, `t * m` codes, row-major
+    pub fn encode_rows(&self, rows: &[T], codes: &mut [u8]) {
+        let t = rows.len() / self.dim;
+        let rotated = Self::apply_rotation(rows, &self.rotation_matrix, self.dim, t);
+        self.pq.encode_rows(&rotated, codes);
     }
 
     /// Rotate a given vector
@@ -1092,6 +1092,31 @@ mod tests {
         assert_eq!(opq.m(), 4);
         assert_eq!(opq.subvec_dim(), 8);
         assert_eq!(opq.n_centroids(), 4);
+    }
+
+    #[test]
+    fn test_pq_encode_batch_matches_encode() {
+        let dim = 32;
+        let n = 2 * ENCODE_ROW_TILE + 37;
+        let data: Vec<f32> = (0..n * dim)
+            .map(|x| ((x * 2_654_435_761usize) % 1009) as f32 * 0.01)
+            .collect();
+        let pq = ProductQuantiser::train(
+            &data,
+            dim,
+            4,
+            Some(16),
+            &Dist::SquaredEuclidean,
+            10,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+
+        let batch = pq.encode_batch(&data, n);
+        for (i, row) in data.chunks_exact(dim).enumerate() {
+            assert_eq!(&batch[i * 4..(i + 1) * 4], pq.encode(row).as_slice());
+        }
     }
 
     #[test]

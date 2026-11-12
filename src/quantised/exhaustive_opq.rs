@@ -165,14 +165,9 @@ where
 
         let mut quantised_codes = vec![0u8; n * m];
         quantised_codes
-            .par_chunks_mut(m)
-            .enumerate()
-            .for_each(|(vec_idx, chunk)| {
-                let vec_start = vec_idx * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-                let codes = codebook.encode(vec);
-                chunk.copy_from_slice(&codes);
-            });
+            .par_chunks_mut(ENCODE_ROW_TILE * m)
+            .zip(vectors_flat.par_chunks(ENCODE_ROW_TILE * dim))
+            .for_each(|(codes, rows)| codebook.encode_rows(rows, codes));
 
         log.finish();
 
