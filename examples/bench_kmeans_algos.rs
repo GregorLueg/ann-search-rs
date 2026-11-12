@@ -21,6 +21,7 @@ use ann_search_rs::utils::verbosity::Verbosity;
 use clap::Parser;
 use commons::*;
 use rayon::prelude::*;
+use faer::Mat;
 use std::time::Instant;
 use thousands::*;
 
@@ -48,7 +49,14 @@ struct Args {
     /// Timed repetitions per configuration, each with a different seed
     #[arg(long, default_value_t = 3)]
     reps: usize,
+    /// Build a CPU IVF with each method instead (nlist from `--centroids`)
+    /// and report build time, Recall@k and QPS
+    #[arg(long)]
+    ivf: bool,
 }
+
+/// Queries for the IVF mode; ground truth is an exhaustive search.
+const IVF_N_QUERY: usize = 10_000;
 
 /// One clustering method on one backend.
 #[derive(Clone, Copy)]
@@ -205,6 +213,78 @@ fn mean_error(data: &[f32], dim: usize, cents: &[f32], metric: &Dist) -> f64 {
     total / n as f64
 }
 
+/// Build a CPU IVF index per method and nlist, query it at three nprobes and
+/// print build time, Recall@k and QPS against exhaustive ground truth.
+///
+/// ### Params
+///
+/// * `data` - Row-major data
+/// * `dim` - Row length
+/// * `nlists` - Cluster counts to build
+/// * `algos` - Methods to compare
+/// * `args` - Command line, for `k`, the metric and the seed
+fn run_ivf(data: &[f32], dim: usize, nlists: &[usize], algos: &[Algo], args: &Args) {
+    let n = data.len() / dim;
+    let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+    let queries = subsample_with_noise(&mat, IVF_N_QUERY, args.data.seed + 1);
+    let k = args.data.k;
+    let dist = &args.data.distance;
+
+    let exh = ann_search_rs::build_exhaustive_index(mat.as_ref(), dist, Verbosity::Quiet);
+    let (truth, _) = ann_search_rs::query_exhaustive_index(
+        queries.as_ref(),
+        &exh,
+        k,
+        false,
+        Verbosity::Quiet,
+    )
+    .unwrap();
+    drop(exh);
+
+    println!(
+        "\n| nlist | method | build (s) | nprobe | recall@{k} | QPS |\n|---|---|---|---|---|---|"
+    );
+    for &nlist in nlists {
+        let root = (nlist as f64).sqrt();
+        let mut nprobes = vec![root as usize, (2.0 * root) as usize, nlist / 20];
+        nprobes.retain(|&p| p > 0);
+        nprobes.sort();
+        nprobes.dedup();
+        for &algo in algos {
+            let t = Instant::now();
+            let idx = ann_search_rs::build_ivf_index(
+                mat.as_ref(),
+                Some(nlist),
+                Some(algo.cpu_params()),
+                dist,
+                args.data.seed as usize,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            let build = t.elapsed().as_secs_f64();
+            for &np in &nprobes {
+                let t = Instant::now();
+                let (got, _) = ann_search_rs::query_ivf_index(
+                    queries.as_ref(),
+                    &idx,
+                    k,
+                    Some(np),
+                    false,
+                    Verbosity::Quiet,
+                )
+                .unwrap();
+                let qps = IVF_N_QUERY as f64 / t.elapsed().as_secs_f64();
+                println!(
+                    "| {nlist} | {} | {build:.3} | {np} | {:.4} | {:.0} |",
+                    algo.label(),
+                    calculate_recall(&truth, &got, k),
+                    qps
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
     let metric = parse_ann_dist(&args.data.distance).unwrap_or_default();
@@ -244,6 +324,11 @@ fn main() {
             .split(',')
             .map(|s| Algo::EMeans(s.parse().unwrap())),
     );
+
+    if args.ivf {
+        run_ivf(&data, dim, &ks, &algos, &args);
+        return;
+    }
 
     println!(
         "\n| backend | k | method | median time (s) | mean error | sd error |\n|---|---|---|---|---|---|"
