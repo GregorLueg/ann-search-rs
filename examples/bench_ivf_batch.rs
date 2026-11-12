@@ -40,6 +40,9 @@ struct Args {
     /// Probed clusters; the index default when absent
     #[arg(long)]
     nprobe: Option<usize>,
+    /// Also build the self-kNN graph with NN-Descent for comparison
+    #[arg(long)]
+    nndescent: bool,
     /// Timed repetitions, the table shows the median
     #[arg(long, default_value_t = 1)]
     reps: usize,
@@ -168,6 +171,44 @@ fn main() {
         ts.push(t.elapsed().as_secs_f64());
     }
     let found_s: Vec<Vec<usize>> = eval_rows.iter().map(|&i| found_s[i].clone()).collect();
+
+    if args.nndescent {
+        // k - 1 plus the self-edge, so rows match IVF's k including self
+        let params = NNDescentKnnParams::new(k - 1, None, None, None, 0.001, true, false);
+        let mut tn = Vec::new();
+        let mut graph = None;
+        for _ in 0..args.reps.max(1) {
+            let t = Instant::now();
+            graph = Some(
+                build_knn_graph_nndescent(
+                    (db, n, dim),
+                    &cli.distance,
+                    Some(params.clone()),
+                    cli.seed as usize,
+                    Verbosity::Quiet,
+                )
+                .unwrap(),
+            );
+            tn.push(t.elapsed().as_secs_f64());
+        }
+        let graph = graph.unwrap();
+        let found_n: Vec<Vec<usize>> = eval_rows
+            .iter()
+            .map(|&i| {
+                graph.indices[i * graph.k..(i + 1) * graph.k]
+                    .iter()
+                    .map(|&j| j as usize)
+                    .collect()
+            })
+            .collect();
+        let tn = median(tn);
+        println!(
+            "nndescent    {:>8.3} s  {:>10.0} QPS  recall {:.4}",
+            tn,
+            n as f64 / tn,
+            recall(&found_n, &truth_s, k)
+        );
+    }
 
     let (tq, ts) = (median(tq), median(ts));
     println!(
