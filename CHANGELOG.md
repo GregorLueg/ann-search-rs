@@ -3,6 +3,24 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.13.0
+
+**Breaking**
+
+- e-means (Bessa et al. 2026) is the default k-means on CPU, wgpu and MLX, so
+  every IVF-family index trains its centroids differently and results differ at
+  the same seed. Lloyd's stays available via
+  `with_algorithm(KMeansAlgorithm::Lloyd)` or `KMeansTrainingParams::new` /
+  `KMeansGpuParams::new`.
+- GPU Lloyd's defaults to 30 fixed iterations instead of 50.
+
+**Features**
+
+- `KMeansAlgorithm` and `EMeansParams` on `KMeansTrainingParams` and
+  `KMeansGpuParams` pick the algorithm for every k-means consumer.
+- e-means partitions are more even than Lloyd's, so an IVF index may need a
+  higher `nprobe` for the same recall.
+
 ## 0.12.2
 
 **Performance**
