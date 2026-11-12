@@ -11,6 +11,7 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
 use std::num::NonZero;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ops::AddAssign;
 
 use crate::prelude::*;
@@ -199,24 +200,30 @@ where
             });
         }
 
+        // subspaces in parallel: one at a time leaves most threads idle across
+        // every mini-batch fork/join and the sequential centroid update
+        let done = AtomicUsize::new(0);
         let codebooks: Vec<Vec<T>> = (0..m)
+            .into_par_iter()
             .map(|subspace| {
-                if verbosity.detailed_verbosity() {
-                    println!("  Codebook {} / {}", subspace + 1, m);
-                }
                 let mut subvectors = Vec::with_capacity(n * subvec_dim);
                 for vec_idx in 0..n {
                     let vec_start = vec_idx * dim + subspace * subvec_dim;
                     subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
                 }
-                train_centroids_pq(
+                let book = train_centroids_pq(
                     &subvectors,
                     subvec_dim,
                     n,
                     n_centroids,
                     max_iters,
                     seed + subspace,
-                )
+                );
+                if verbosity.detailed_verbosity() {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    println!("  Codebook {} / {}", d, m);
+                }
+                book
             })
             .collect();
 

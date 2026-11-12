@@ -196,6 +196,10 @@ name = "gridsearch_pq"
 required-features = ["quantised"]
 
 [[example]]
+name = "bench_pq_codebooks"
+required-features = ["quantised"]
+
+[[example]]
 name = "gridsearch_soar_pq"
 required-features = ["quantised"]
 
