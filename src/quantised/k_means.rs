@@ -52,7 +52,12 @@ pub(crate) fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usiz
 ///
 /// The index of the nearest centroid, the lowest index on ties.
 #[inline(always)]
-pub(crate) fn find_nearest_transposed<T: Float>(vec: &[T], centroids_t: &[T], k: usize, dist: &mut [T]) -> usize {
+pub(crate) fn find_nearest_transposed<T: Float>(
+    vec: &[T],
+    centroids_t: &[T],
+    k: usize,
+    dist: &mut [T],
+) -> usize {
     // seed from dimension 0 rather than zero-filling: `0 + x == x` exactly
     let q0 = vec[0];
     for (acc, &c) in dist.iter_mut().zip(&centroids_t[..k]) {
@@ -370,12 +375,16 @@ mod tests {
     fn test_find_nearest_transposed_matches_row_scan() {
         let dim = 4;
         let k = 37;
-        let centroids: Vec<f32> = (0..k * dim).map(|x| ((x * 7919) % 101) as f32 * 0.1).collect();
+        let centroids: Vec<f32> = (0..k * dim)
+            .map(|x| ((x * 7919) % 101) as f32 * 0.1)
+            .collect();
         let mut centroids_t = vec![0.0f32; k * dim];
         transpose_centroids(&centroids, dim, k, &mut centroids_t);
         let mut dist = vec![0.0f32; k];
         for p in 0..50 {
-            let vec: Vec<f32> = (0..dim).map(|d| ((p * 31 + d * 17) % 53) as f32 * 0.2).collect();
+            let vec: Vec<f32> = (0..dim)
+                .map(|d| ((p * 31 + d * 17) % 53) as f32 * 0.2)
+                .collect();
             let mut best = 0;
             let mut best_d = f32::INFINITY;
             for c in 0..k {
@@ -389,7 +398,10 @@ mod tests {
                     best = c;
                 }
             }
-            assert_eq!(find_nearest_transposed(&vec, &centroids_t, k, &mut dist), best);
+            assert_eq!(
+                find_nearest_transposed(&vec, &centroids_t, k, &mut dist),
+                best
+            );
         }
     }
 

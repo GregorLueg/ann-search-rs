@@ -11,8 +11,8 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
 use std::num::NonZero;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ops::AddAssign;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::prelude::*;
 use crate::quantised::k_means::*;
@@ -118,6 +118,27 @@ pub const N_CLUSTERS_PQ: usize = 256;
 /// Number of iterations to run for in optimised product quantisation
 pub const OPQ_ITER: usize = 3;
 
+/// Gather one subspace's slice of every row into a contiguous buffer.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vectors
+/// * `dim` - Full dimension
+/// * `n` - Number of vectors
+/// * `s` - Subspace index
+/// * `sd` - Subvector dimension
+///
+/// ### Returns
+///
+/// Row-major `n * sd` subvectors
+fn subspace_vectors<T: Copy>(vectors: &[T], dim: usize, n: usize, s: usize, sd: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(n * sd);
+    for row in vectors[..n * dim].chunks_exact(dim) {
+        out.extend_from_slice(&row[s * sd..(s + 1) * sd]);
+    }
+    out
+}
+
 /// ProductQuantiser
 ///
 /// ### Fields
@@ -211,11 +232,7 @@ where
         let codebooks: Vec<Vec<T>> = (0..m)
             .into_par_iter()
             .map(|subspace| {
-                let mut subvectors = Vec::with_capacity(n * subvec_dim);
-                for vec_idx in 0..n {
-                    let vec_start = vec_idx * dim + subspace * subvec_dim;
-                    subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
-                }
+                let subvectors = subspace_vectors(vectors_flat, dim, n, subspace, subvec_dim);
                 let book = train_centroids_pq(
                     &subvectors,
                     subvec_dim,
@@ -451,18 +468,6 @@ where
             (vectors_flat.to_vec(), n)
         };
 
-        #[allow(unused_assignments)] // clippy being stupid here
-        let mut pq = ProductQuantiser::train(
-            &training_vecs,
-            dim,
-            m,
-            n_centroids,
-            &Dist::SquaredEuclidean,
-            max_iters,
-            seed,
-            Verbosity::Quiet,
-        )?;
-
         let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
 
         for iter in 0..rotation_iter {
@@ -473,8 +478,7 @@ where
             // rotate vectors
             let rotated = Self::apply_rotation(&training_vecs, &rotation_matrix, dim, n_train);
 
-            // train PQ
-            pq = ProductQuantiser::train(
+            let pq = ProductQuantiser::train(
                 &rotated,
                 dim,
                 m,
@@ -501,7 +505,7 @@ where
 
         // final training
         let rotated = Self::apply_rotation(vectors_flat, &rotation_matrix, dim, n);
-        pq = ProductQuantiser::train(
+        let pq = ProductQuantiser::train(
             &rotated,
             dim,
             m,

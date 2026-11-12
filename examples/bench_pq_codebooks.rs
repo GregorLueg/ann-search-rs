@@ -181,7 +181,10 @@ fn encode(data: &[f32], dim: usize, books: &[Vec<f32>]) -> (Vec<u8>, f64) {
                     .chunks_exact(sd)
                     .map(|c| f32::euclidean_simd(q, c))
                     .enumerate()
-                    .fold((0, f32::INFINITY), |a, (i, d)| if d < a.1 { (i, d) } else { a });
+                    .fold(
+                        (0, f32::INFINITY),
+                        |a, (i, d)| if d < a.1 { (i, d) } else { a },
+                    );
                 codes.push(best as u8);
                 err += d as f64;
             }
@@ -315,7 +318,11 @@ fn main() {
     let mut methods = vec![Method::MiniBatch];
     if !args.mini_batch_only {
         methods.push(Method::Lloyd);
-        methods.extend(parse_list::<f64>(&args.epochs).into_iter().map(Method::EMeans));
+        methods.extend(
+            parse_list::<f64>(&args.epochs)
+                .into_iter()
+                .map(Method::EMeans),
+        );
     }
 
     println!(
@@ -339,10 +346,9 @@ fn main() {
             let train_s = times[times.len() / 2];
             let (codes, mse) = encode(db, dim, &books);
             let recall = adc_recall(queries, &codes, &books, dim, &truth, k);
-            let checksum = books
-                .iter()
-                .flatten()
-                .fold(0u64, |h, v| h.wrapping_mul(31).wrapping_add(v.to_bits() as u64));
+            let checksum = books.iter().flatten().fold(0u64, |h, v| {
+                h.wrapping_mul(31).wrapping_add(v.to_bits() as u64)
+            });
             println!(
                 "{:>5} {:>4} {:<16} {:>10.2} {:>12.5} {:>9.4} {:>18x}",
                 m,
