@@ -16,12 +16,12 @@
 mod commons;
 
 use ann_search_rs::prelude::*;
-use ann_search_rs::utils::k_means_utils::{assign_all_parallel, train_centroids};
+use ann_search_rs::utils::k_means_utils::{assign_all_parallel, train_centroids, CentroidDistance};
 use ann_search_rs::utils::verbosity::Verbosity;
 use clap::Parser;
 use commons::*;
-use rayon::prelude::*;
 use faer::Mat;
+use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
 
@@ -231,18 +231,15 @@ fn run_ivf(data: &[f32], dim: usize, nlists: &[usize], algos: &[Algo], args: &Ar
     let dist = &args.data.distance;
 
     let exh = ann_search_rs::build_exhaustive_index(mat.as_ref(), dist, Verbosity::Quiet);
-    let (truth, _) = ann_search_rs::query_exhaustive_index(
-        queries.as_ref(),
-        &exh,
-        k,
-        false,
-        Verbosity::Quiet,
-    )
-    .unwrap();
+    let (truth, _) =
+        ann_search_rs::query_exhaustive_index(queries.as_ref(), &exh, k, false, Verbosity::Quiet)
+            .unwrap();
     drop(exh);
+    let metric = parse_ann_dist(dist).unwrap_or_default();
+    let qflat = matrix_to_flat(queries.as_ref()).0;
 
     println!(
-        "\n| nlist | method | build (s) | nprobe | recall@{k} | QPS |\n|---|---|---|---|---|---|"
+        "\n| nlist | method | build (s) | imbalance | max/mean | empty | nprobe | rows scanned/query | recall@{k} | QPS |\n|---|---|---|---|---|---|---|---|---|---|"
     );
     for &nlist in nlists {
         let root = (nlist as f64).sqrt();
@@ -262,7 +259,42 @@ fn run_ivf(data: &[f32], dim: usize, nlists: &[usize], algos: &[Algo], args: &Ar
             )
             .unwrap();
             let build = t.elapsed().as_secs_f64();
+
+            // Cluster sizes from the index's own centroids; the imbalance
+            // factor is the expected rows scanned per probe over n / nlist.
+            let cents = idx.centroids();
+            let cnorms: Vec<f32> = cents.chunks(dim).map(f32::calculate_l2_norm).collect();
+            let assign = assign_all_parallel(data, &[], dim, n, cents, &cnorms, nlist, &metric);
+            let mut sizes = vec![0usize; nlist];
+            for &a in &assign {
+                sizes[a as usize] += 1;
+            }
+            let mean = n as f64 / nlist as f64;
+            let imbalance = nlist as f64 * sizes.iter().map(|&s| (s * s) as f64).sum::<f64>()
+                / (n as f64 * n as f64);
+            let max_ratio = *sizes.iter().max().unwrap() as f64 / mean;
+            let empty = sizes.iter().filter(|&&s| s == 0).count();
+
             for &np in &nprobes {
+                let scanned: f64 = qflat
+                    .par_chunks(dim)
+                    .map(|q| {
+                        let mut d: Vec<(f32, usize)> = cents
+                            .chunks(dim)
+                            .zip(&cnorms)
+                            .enumerate()
+                            .map(|(j, (c, &cn))| match metric {
+                                Dist::Cosine => {
+                                    (-f32::dot_simd(q, c) / cn.max(f32::MIN_POSITIVE), j)
+                                }
+                                _ => (f32::euclidean_simd(q, c), j),
+                            })
+                            .collect();
+                        d.select_nth_unstable_by(np - 1, |a, b| a.0.total_cmp(&b.0));
+                        d[..np].iter().map(|&(_, j)| sizes[j]).sum::<usize>() as f64
+                    })
+                    .sum::<f64>()
+                    / IVF_N_QUERY as f64;
                 let t = Instant::now();
                 let (got, _) = ann_search_rs::query_ivf_index(
                     queries.as_ref(),
@@ -275,8 +307,9 @@ fn run_ivf(data: &[f32], dim: usize, nlists: &[usize], algos: &[Algo], args: &Ar
                 .unwrap();
                 let qps = IVF_N_QUERY as f64 / t.elapsed().as_secs_f64();
                 println!(
-                    "| {nlist} | {} | {build:.3} | {np} | {:.4} | {:.0} |",
+                    "| {nlist} | {} | {build:.3} | {imbalance:.3} | {max_ratio:.2} | {empty} | {np} | {:.0} | {:.4} | {:.0} |",
                     algo.label(),
+                    scanned,
                     calculate_recall(&truth, &got, k),
                     qps
                 );
