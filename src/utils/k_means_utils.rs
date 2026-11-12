@@ -381,9 +381,9 @@ pub struct KMeansTrainingParams {
 }
 
 impl KMeansTrainingParams {
-    /// Generate a new instance of self
+    /// Lloyd's with these settings
     ///
-    /// Balancing is off. Chain [`KMeansTrainingParams::with_balancing`] to turn
+    /// [`KMeansTrainingParams::default`] is e-means instead. Balancing is off. Chain [`KMeansTrainingParams::with_balancing`] to turn
     /// it on.
     ///
     /// ### Params
@@ -429,8 +429,8 @@ impl KMeansTrainingParams {
     ///
     /// ### Params
     ///
-    /// * `algorithm` - [`KMeansAlgorithm::Lloyd`] (the default) or
-    ///   [`KMeansAlgorithm::EMeans`]
+    /// * `algorithm` - [`KMeansAlgorithm::EMeans`] (the default) or
+    ///   [`KMeansAlgorithm::Lloyd`]
     ///
     /// ### Returns
     ///
@@ -441,10 +441,11 @@ impl KMeansTrainingParams {
     }
 }
 
-/// Default implementation for KMeansTrainingParams
+/// e-means at its default epoch budget. The Lloyd's fields keep 30 iterations
+/// with auto init and path for `with_algorithm(KMeansAlgorithm::Lloyd)`.
 impl Default for KMeansTrainingParams {
     fn default() -> Self {
-        Self::new(30, None, None)
+        Self::new(30, None, None).with_algorithm(KMeansAlgorithm::default())
     }
 }
 

@@ -484,7 +484,12 @@ where
 
     let kmeans_params = params
         .kmeans
-        .unwrap_or_else(|| KMeansGpuParams::default().with_balancing(true));
+        // Balancing is Lloyd-only, and the partition sizes bound per-cluster memory.
+        .unwrap_or_else(|| {
+            KMeansGpuParams::default()
+                .with_algorithm(KMeansAlgorithm::Lloyd)
+                .with_balancing(true)
+        });
 
     let start = Instant::now();
     let centroids = train_centroids_gpu::<T>(

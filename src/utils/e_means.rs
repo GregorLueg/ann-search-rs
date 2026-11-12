@@ -125,11 +125,11 @@ impl Default for EMeansParams {
     }
 }
 
-/// Which k-means algorithm trains the centroids.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// Which k-means algorithm trains the centroids. Defaults to e-means at its
+/// default epoch budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KMeansAlgorithm {
     /// Lloyd's algorithm: full passes until convergence or the iteration cap
-    #[default]
     Lloyd,
     /// e-means: mini-batch EMA updates with fitted batch size and step
     ///
@@ -138,6 +138,12 @@ pub enum KMeansAlgorithm {
     /// Bessa et al., e-means: outperforming k-means (in one-tenth the
     /// epochs), arXiv 2611.09501, 2026
     EMeans(EMeansParams),
+}
+
+impl Default for KMeansAlgorithm {
+    fn default() -> Self {
+        Self::EMeans(EMeansParams::default())
+    }
 }
 
 ////////////

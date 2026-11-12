@@ -81,7 +81,9 @@ impl Algo {
     fn cpu_params(&self) -> KMeansTrainingParams {
         match *self {
             Algo::Lloyd(Some(i)) => KMeansTrainingParams::new(i, None, None),
-            Algo::Lloyd(None) => KMeansTrainingParams::default(),
+            Algo::Lloyd(None) => {
+                KMeansTrainingParams::default().with_algorithm(KMeansAlgorithm::Lloyd)
+            }
             Algo::EMeans(t) => KMeansTrainingParams::default()
                 .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(t))),
         }
@@ -131,7 +133,9 @@ fn train(
             use cubecl::wgpu::WgpuDevice;
             let params = match algo {
                 Algo::Lloyd(Some(i)) => KMeansGpuParams::new(i, None, true, false),
-                Algo::Lloyd(None) => KMeansGpuParams::default(),
+                Algo::Lloyd(None) => {
+                    KMeansGpuParams::default().with_algorithm(KMeansAlgorithm::Lloyd)
+                }
                 Algo::EMeans(t) => KMeansGpuParams::default()
                     .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(t))),
             };

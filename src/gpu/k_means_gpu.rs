@@ -136,9 +136,9 @@ pub struct KMeansGpuParams {
 }
 
 impl KMeansGpuParams {
-    /// New params.
+    /// Lloyd's with these settings.
     ///
-    /// Balancing is off. Chain [`KMeansGpuParams::with_balancing`] to turn it
+    /// [`KMeansGpuParams::default`] is e-means instead. Balancing is off. Chain [`KMeansGpuParams::with_balancing`] to turn it
     /// on.
     ///
     /// ### Params
@@ -180,8 +180,8 @@ impl KMeansGpuParams {
     ///
     /// ### Params
     ///
-    /// * `algorithm` - [`KMeansAlgorithm::Lloyd`] (the default) or
-    ///   [`KMeansAlgorithm::EMeans`]
+    /// * `algorithm` - [`KMeansAlgorithm::EMeans`] (the default) or
+    ///   [`KMeansAlgorithm::Lloyd`]
     ///
     /// ### Returns
     ///
@@ -192,10 +192,11 @@ impl KMeansGpuParams {
     }
 }
 
-/// Default implementation for [KMeansGpuParams]
+/// e-means at its default epoch budget. The Lloyd's fields keep 30 fixed
+/// iterations for `with_algorithm(KMeansAlgorithm::Lloyd)`.
 impl Default for KMeansGpuParams {
     fn default() -> Self {
-        Self::new(30, None, true, false)
+        Self::new(30, None, true, false).with_algorithm(KMeansAlgorithm::default())
     }
 }
 
