@@ -939,11 +939,8 @@ pub fn query_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 /// Helper function to self query an IVF index
