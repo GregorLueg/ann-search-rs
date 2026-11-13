@@ -491,11 +491,8 @@ pub fn query_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("kMkNN index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 /// Helper function to self query a kMkNN index
