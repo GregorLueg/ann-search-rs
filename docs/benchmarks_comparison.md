@@ -197,5 +197,5 @@ The ann-benchmarks convention.
 
 ### Runtime info
 
-*ann-search-rs 0.12.2 (commit v0.12.2-22-g50a9abd-dirty), run on 2026-11-13 on Apple M1 Max. Runs span commits py-v0.5.0-1-g137e44e, py-v0.5.0-dirty, v0.12.2-21-g8f55df8, v0.12.2-22-g50a9abd-dirty.*
+*ann-search-rs 0.12.2 (commit v0.12.2-22-g50a9abd-dirty), run on 2026-11-13 on Apple M1 Max. Runs span commits v0.12.2-21-g8f55df8, v0.12.2-22-g50a9abd-dirty.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
