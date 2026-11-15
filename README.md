@@ -108,7 +108,9 @@ let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean"
 ```
 
 The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
-Quickest way to see how one behaves on your kind of data. Moreover, every build
+Quickest way to see how one behaves on your kind of data. The microbenches and
+profiling drivers live in `benches/` (`bench_*.rs`, `profile_*.rs`) but still run
+as examples, e.g. `cargo run --example profile_hnsw --release`. Moreover, every build
 and query takes a `Verbosity`. `Quiet` prints nothing but warnings. `Normal`
 prints one line at the start and end of a build or query, plus a progress line
 every 100_000 queried samples. `Detailed` adds the timed build stages and

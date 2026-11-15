@@ -37,6 +37,11 @@ cargo run --example gridsearch_pq     --release --features quantised
 cargo run --example gridsearch_gpu    --release --features gpu
 cargo run --example gridsearch_rabitq --release --features binary
 
+# Bench and profiling drivers: benches/bench_*.rs and benches/profile_*.rs.
+# They are [[example]] targets, so run them with --example, not cargo bench.
+cargo run --example profile_hnsw     --release
+cargo run --example bench_pq_codebooks --release --features quantised
+
 # CPU distance-kernel microbench. One forced SIMD level per run: the level is
 # process-wide and resolved on first use, so it cannot be switched mid-run.
 ANN_SEARCH_SIMD=scalar cargo run --example bench_dist_kernels --release
@@ -46,6 +51,7 @@ ANN_SEARCH_SIMD=avx2   cargo run --example bench_dist_kernels --release
 # GPU kernel microbenches (CubeCL Benchmark harness, not criterion)
 cargo bench --bench gpu_ivf_kernels        --features gpu
 cargo bench --bench gpu_exhaustive_kernels --features gpu
+cargo bench --bench gpu_nndescent_kernels --features gpu
 
 # Per-kernel GPU profile (no code changes needed; filter the WGSL dumps out)
 CUBECL_DEBUG_OPTION=profile-medium CUBECL_DEBUG_LOG=stdout \
