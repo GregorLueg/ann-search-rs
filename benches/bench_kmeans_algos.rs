@@ -13,6 +13,7 @@
 //! A raw little-endian f32 file (`n * dim` values) replaces the synthetic data
 //! with `--file path --dim d`.
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use ann_search_rs::prelude::*;

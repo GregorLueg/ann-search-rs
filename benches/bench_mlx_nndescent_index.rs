@@ -6,6 +6,7 @@
 //! cargo run --example bench_mlx_nndescent_index --release --features gpu,mlx,synthetic -- \
 //!   --n-samples 10000 --dim 32 --data cell
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use ann_search_rs::synthetic::subsample_with_noise;

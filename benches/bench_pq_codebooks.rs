@@ -13,6 +13,7 @@
 //! cargo run --example bench_pq_codebooks --release --features quantised -- \
 //!   --data cell --dim 512 --n-samples 251000 --ms 64
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use ann_search_rs::prelude::*;

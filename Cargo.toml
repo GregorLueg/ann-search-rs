@@ -4,6 +4,9 @@ version = "0.12.2"
 edition = "2021"
 # Exposes `DEP_MLXC_AVAILABLE` to dependants' build scripts, see build.rs.
 links = "mlxc"
+# benches/ also holds bench and profiling examples; only the GPU kernel
+# benches below are real bench targets.
+autobenches = false
 authors = ["Gregor Lueg <gregorlueg@me.com>"]
 license = "MIT"
 repository = "https://github.com/GregorLueg/ann-search-rs"
@@ -141,26 +144,32 @@ required-features = ["gpu"]
 
 [[example]]
 name = "bench_mlx_annb"
+path = "benches/bench_mlx_annb.rs"
 required-features = ["gpu", "mlx"]
 
 [[example]]
 name = "bench_mlx_exhaustive"
+path = "benches/bench_mlx_exhaustive.rs"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "bench_mlx_ivf"
+path = "benches/bench_mlx_ivf.rs"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "bench_mlx_cagra"
+path = "benches/bench_mlx_cagra.rs"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "bench_mlx_nndescent"
+path = "benches/bench_mlx_nndescent.rs"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
 name = "bench_mlx_nndescent_index"
+path = "benches/bench_mlx_nndescent_index.rs"
 required-features = ["gpu", "mlx", "synthetic"]
 
 [[example]]
@@ -197,6 +206,7 @@ required-features = ["quantised"]
 
 [[example]]
 name = "bench_pq_codebooks"
+path = "benches/bench_pq_codebooks.rs"
 required-features = ["quantised"]
 
 [[example]]
@@ -221,6 +231,7 @@ required-features = ["binary"]
 
 [[example]]
 name = "bench_store_kernels"
+path = "benches/bench_store_kernels.rs"
 required-features = ["binary"]
 
 [[example]]
@@ -229,11 +240,40 @@ required-features = ["binary"]
 
 [[example]]
 name = "profile_graph_rabitq"
+path = "benches/profile_graph_rabitq.rs"
 required-features = ["binary", "quantised"]
 
 [[example]]
 name = "gridsearch_rabitq_graphs"
 required-features = ["binary", "quantised"]
+
+#######################
+# Bench and profiling #
+#######################
+
+[[example]]
+name = "bench_dist_kernels"
+path = "benches/bench_dist_kernels.rs"
+
+[[example]]
+name = "bench_ivf_batch"
+path = "benches/bench_ivf_batch.rs"
+
+[[example]]
+name = "bench_kmeans_algos"
+path = "benches/bench_kmeans_algos.rs"
+
+[[example]]
+name = "profile_hnsw"
+path = "benches/profile_hnsw.rs"
+
+[[example]]
+name = "profile_kmeans"
+path = "benches/profile_kmeans.rs"
+
+[[example]]
+name = "profile_vamana"
+path = "benches/profile_vamana.rs"
 
 ##################
 # Other examples #

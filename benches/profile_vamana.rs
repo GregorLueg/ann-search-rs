@@ -1,30 +1,30 @@
-//! Profile the HNSW build and query paths, and trace the recall-vs-time frontier.
+//! Profile the Vamana build and query paths, and trace the recall-vs-time frontier.
 //!
 //! Three modes. `build` times the build alone, one config, no recall, which is
 //! what you want under `samply`. `query` builds once and then times a probe set
 //! at a single `ef_search`. `frontier` builds once and sweeps `ef_search`,
 //! emitting `(recall, microseconds per query)` pairs.
 //!
-//! The frontier is the mode that answers "are we behind FAISS". A config-matched
-//! table cannot: FAISS stops on `count_below(d0) >= efSearch` whereas this crate
-//! uses the textbook `dist > threshold`, so the same `ef` buys a different amount
-//! of work in each. Only recall against wall-clock is comparable.
+//! The build is what `QgIndex::build` spends 93-97% of its time in, so this is
+//! the harness for any work on that. Two shapes matter: low dimensionality,
+//! where the per-neighbour loop machinery dominates, and wide vectors, where
+//! the distance kernel does. They rank build optimisations differently.
 //!
 //! ```bash
-//! cargo run --release --example profile_hnsw -- --n-samples 150000 --dim 32
-//! cargo run --release --example profile_hnsw -- --mode frontier
-//! cargo run --release --example profile_hnsw -- \
-//!     --data-file /path/pca_f32.bin --n-samples 2857393 --dim 32 --mode frontier
-//! samply record ./target/release/examples/profile_hnsw --mode build --no-recall
+//! cargo run --release --example profile_vamana -- --n-samples 150000 --dim 32
+//! cargo run --release --example profile_vamana -- --n-samples 50000 --dim 512
+//! cargo run --release --example profile_vamana -- --mode frontier
+//! samply record ./target/release/examples/profile_vamana --mode build --no-recall
 //! ```
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use std::time::Instant;
 
 use ann_search_rs::Verbosity;
 use ann_search_rs::{
-    build_exhaustive_index, build_hnsw_index, query_exhaustive_index, query_hnsw_index,
+    build_exhaustive_index, build_vamana_index, query_exhaustive_index, query_vamana_index,
 };
 use clap::Parser;
 use commons::*;
@@ -42,7 +42,7 @@ const DEFAULT_EF_SWEEP: &str = "10,16,24,32,48,64,100,150,200";
 
 /// CLI for the profiler.
 #[derive(Parser, Debug)]
-#[command(about = "HNSW build/query profile and recall-vs-time frontier")]
+#[command(about = "Vamana build/query profile and recall-vs-time frontier")]
 struct Cli {
     /// What to profile: build, query or frontier
     #[arg(long, default_value = "build")]
@@ -68,13 +68,25 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_DATA)]
     data: String,
 
-    /// Base connectivity parameter
-    #[arg(long, default_value_t = 16)]
-    m: usize,
+    /// Maximum out-degree of the graph
+    #[arg(long, default_value_t = 32)]
+    r: usize,
 
-    /// Size of the dynamic candidate list during construction
-    #[arg(long, default_value_t = 200)]
-    ef_construction: usize,
+    /// Beam width during construction
+    #[arg(long, default_value_t = 128)]
+    l_build: usize,
+
+    /// Beam width for the first pass, defaults to `--l-build`
+    #[arg(long)]
+    l_build_pass1: Option<usize>,
+
+    /// Pruning alpha for pass 1
+    #[arg(long, default_value_t = 1.0)]
+    alpha_pass1: f32,
+
+    /// Pruning alpha for pass 2
+    #[arg(long, default_value_t = 1.2)]
+    alpha_pass2: f32,
 
     /// Search budget for `--mode query` and for the build-mode recall check
     #[arg(long, default_value_t = 100)]
@@ -116,8 +128,7 @@ struct Cli {
 /// Load the dataset as a flat row-major `Vec<f32>`.
 ///
 /// Either reads raw little-endian f32 from `--data-file` or runs one of the
-/// synthetic generators. Working in flat space throughout avoids the
-/// element-by-element `Mat` unpack the rest of the harness does.
+/// synthetic generators.
 ///
 /// ### Params
 ///
@@ -215,29 +226,36 @@ fn main() {
 
     println!("-----------------------------");
     println!(
-        "HNSW {} profile: {} samples, {} dim, {} dist, {} threads",
+        "Vamana {} profile: {} samples, {} dim, {} dist, {} threads",
         cli.mode,
         n.separate_with_underscores(),
         dim,
         cli.distance,
         rayon::current_num_threads()
     );
-    println!("M = {}, ef_construction = {}", cli.m, cli.ef_construction);
+    println!(
+        "R = {}, l_build = {} / pass1 {:?}, alpha = {} / {}",
+        cli.r, cli.l_build, cli.l_build_pass1, cli.alpha_pass1, cli.alpha_pass2
+    );
     println!("-----------------------------");
 
     let mut index = None;
     for run in 0..cli.repeats.max(1) {
         let start = Instant::now();
-        let built = build_hnsw_index(
+        let built = build_vamana_index(
             (&flat[..], n, dim),
-            cli.m,
-            cli.ef_construction,
+            cli.r,
+            cli.l_build,
+            cli.l_build_pass1,
+            cli.alpha_pass1,
+            cli.alpha_pass2,
             &cli.distance,
             cli.seed as usize,
             Verbosity::Quiet,
         )
         .unwrap();
         println!("Build {}: {:.2?}", run + 1, start.elapsed());
+
         index = Some(built);
     }
     let index = index.expect("at least one build");
@@ -270,29 +288,29 @@ fn main() {
     for ef in sweep {
         // One untimed pass so the first sweep point is not charged for cold
         // pages in the graph and vector arrays.
-        let _ = query_hnsw_index(
+        let _ = query_vamana_index(
             (&queries[..], n_probes, dim),
             &index,
             cli.k,
-            ef,
+            Some(ef),
             false,
             Verbosity::Quiet,
         )
-        .expect("hnsw query failed");
+        .expect("vamana query failed");
 
         let mut best = f64::INFINITY;
         let mut got = Vec::new();
         for _ in 0..cli.query_repeats.max(1) {
             let start = Instant::now();
-            let (indices, _) = query_hnsw_index(
+            let (indices, _) = query_vamana_index(
                 (&queries[..], n_probes, dim),
                 &index,
                 cli.k,
-                ef,
+                Some(ef),
                 false,
                 Verbosity::Quiet,
             )
-            .expect("hnsw query failed");
+            .expect("vamana query failed");
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             best = best.min(elapsed);
             got = indices;

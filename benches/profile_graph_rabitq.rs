@@ -11,6 +11,7 @@
 //! cargo run --release --features binary --example profile_graph_rabitq -- --mode frontier
 //! ```
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use std::time::Instant;

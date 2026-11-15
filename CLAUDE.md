@@ -99,7 +99,9 @@ src/
                    # clustered_nndescent_gpu, forest_gpu, k_means_gpu,
                    # dist_gpu, topk_gpu
   serialise/       # IndexIo trait, save_index / load_index, bundle header
-benches/           # GPU kernel microbenches (CubeCL Benchmark trait, not criterion)
+benches/           # gpu_*_kernels.rs: GPU kernel microbenches (CubeCL Benchmark trait);
+                   # bench_*.rs / profile_*.rs: bench and profiling examples
+                   # (`cargo run --example`), sharing examples/commons/mod.rs
 examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs;
                    # fill_benchmarks.sh regenerates docs/ from docs/templates/
 docs/              # benchmark result tables (markdown) + the templates they fill
@@ -173,7 +175,7 @@ Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non
 - The `lib.rs` shims must **flatten**, not forward: `Index::build(mat.into_row_major(), ...)`. `FlattenData<T>` implements `AnnMatrix` by identity, so this collapses the index constructors to one instantiation. Forwarding the input type instead re-monomorphises every constructor body per input type, and rustc does not run LLVM's `MergeFunctions` to dedupe them.
 - The trait method is `into_row_major`, not `into_flat`. `ndarray` has an inherent `into_flat` on `ArrayBase` and inherent methods beat trait methods, so `arr.into_flat()` would silently resolve to ndarray's and hand back a 1-D array.
 - CubeCL version is pinned to `0.11.0`. There is a commented-out git-dep block in `Cargo.toml` for when the main branch is needed. `0.11` dropped the runtime generic: `GpuTensor<T>`, `cubecl::client::Client` and a type-erased `cubecl::Device` (callers pass `WgpuDevice::default().into()`). Its compiler rejects a typed `let mut x: u32` in `#[cube]` code (write `0u32`) and comptime `as` casts inside a `&&`/`||` loop condition (hoist to a local).
-- Do not add new benchmarks under `benches/` without a `harness = false` entry in `Cargo.toml`. They use the CubeCL `Benchmark` trait, not criterion's default harness.
+- `autobenches = false`: every target in `benches/` is declared in `Cargo.toml`. GPU kernel microbenches are `[[bench]]` with `harness = false` (CubeCL `Benchmark` trait, not criterion). Bench and profiling binaries that parse CLI args are `[[example]]` with `path = "benches/..."`, because `cargo bench` appends `--bench`, which clap rejects.
 - Documentation-of-record for results lives in `docs/benchmarks_*.md`. `CHANGELOG.md` at the repo root tracks release-note-style changes.
 
 ## What's tracked outside this file

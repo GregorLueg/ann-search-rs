@@ -9,6 +9,7 @@
 //! cargo run --release --features gpu --example profile_kmeans -- --gpu --dim 128 --k 1000 --repeats 4
 //! ```
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use std::io::Write;

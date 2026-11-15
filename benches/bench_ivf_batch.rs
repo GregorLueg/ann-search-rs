@@ -15,6 +15,7 @@
 //! cargo run --example bench_ivf_batch --release --features gpu,mlx -- \
 //!   --file pca32.f32 --dim 32 --n-rows 500000 --gpu --mlx --reps 3
 
+#[path = "../examples/commons/mod.rs"]
 mod commons;
 
 use ann_search_rs::prelude::*;
