@@ -109,8 +109,9 @@ benches/           # gpu_*_kernels.rs: GPU kernel microbenches (CubeCL Benchmark
                    # bench_*.rs / profile_*.rs: bench and profiling examples
                    # (`cargo run --example`), sharing examples/commons/mod.rs
 examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs;
-                   # fill_benchmarks.sh regenerates docs/ from docs/templates/
-docs/              # benchmark result tables (markdown) + the templates they fill
+                   # fill_benchmarks.sh runs them into docs/results/ and renders docs/
+docs/              # benchmark result tables (markdown), templates/ they are rendered
+                   # from, results/<kind>/<tag>.txt cached table per run
 ```
 
 Saving is a *directory*, not a file: `index.bin` plus any aux files (currently only the binary indices' mmap store). Everything is written under a temporary name and renamed at the end with `index.bin` last, so `index.bin` is the commit point. `utils/staging.rs` owns that dance, and it exists partly because truncating a mapped file is a `SIGBUS` waiting to happen. Do not replace it with a plain `File::create`.
@@ -183,6 +184,7 @@ Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non
 - CubeCL version is pinned to `0.11.0`. There is a commented-out git-dep block in `Cargo.toml` for when the main branch is needed. `0.11` dropped the runtime generic: `GpuTensor<T>`, `cubecl::client::Client` and a type-erased `cubecl::Device` (callers pass `WgpuDevice::default().into()`). Its compiler rejects a typed `let mut x: u32` in `#[cube]` code (write `0u32`) and comptime `as` casts inside a `&&`/`||` loop condition (hoist to a local).
 - `autobenches = false`: every target in `benches/` is declared in `Cargo.toml`. GPU kernel microbenches are `[[bench]]` with `harness = false` (CubeCL `Benchmark` trait, not criterion). Bench and profiling binaries that parse CLI args are `[[example]]` with `path = "benches/..."`, because `cargo bench` appends `--bench`, which clap rejects.
 - Documentation-of-record for results lives in `docs/benchmarks_*.md`. `CHANGELOG.md` at the repo root tracks release-note-style changes.
+- The benchmark docs are generated, never hand-edited. `examples/fill_benchmarks.sh --kind <kind>` writes each table to `docs/results/<kind>/<tag>.txt` (tag `:` becomes `.`), stamped with version, commit and date, then rebuilds `docs/benchmarks_<kind>.md` from the template plus every cached table. `--only <glob>` reruns just the matching tags (`kmknn`, `'kmknn:*:cell:*'`), `--render-only` rebuilds after a template edit without running anything, `--dry-run` lists what would run. A failed run keeps the old cached table. Tables in one doc can therefore come from different commits; the per-table stamp says which.
 
 ## What's tracked outside this file
 
