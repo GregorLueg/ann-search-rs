@@ -353,7 +353,7 @@ fn main() {
                 build_knn_graph_nndescent(
                     (db, n, dim),
                     &cli.distance,
-                    Some(params.clone()),
+                    Some(params),
                     cli.seed as usize,
                     Verbosity::Quiet,
                 )

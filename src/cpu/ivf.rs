@@ -13,6 +13,10 @@ use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::*;
 use std::time::Instant;
 
+////////////
+// Consts //
+////////////
+
 /// Bounds on the queries per block of the batched search. Queries in a block
 /// are ordered by nearest centroid, so they share most probed cells and each
 /// cell is read once per block instead of once per query: larger blocks mean
@@ -42,9 +46,15 @@ const RERANK_EXTRA: usize = 8;
 /// Flat across the sizes tried, so not critical.
 const CELL_ROW_TILE: usize = 512;
 
-/////////////
-// IvfIndex//
-/////////////
+///////////
+// Types //
+///////////
+
+type BlockResult<T> = Vec<(u32, Vec<usize>, Vec<T>)>;
+
+//////////////
+// IvfIndex //
+//////////////
 
 /// IVF (Inverted File) index for similarity search
 ///
@@ -596,7 +606,7 @@ where
         let mut order: Vec<u32> = (0..nq as u32).collect();
         order.par_sort_by_key(|&i| probes[i as usize][0]);
 
-        let block_results: Vec<Vec<(u32, Vec<usize>, Vec<T>)>> = order
+        let block_results: Vec<BlockResult<T>> = order
             .par_chunks(block_size)
             .map_init(
                 || (Vec::new(), Vec::new(), Vec::new()),

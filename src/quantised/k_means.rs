@@ -93,9 +93,9 @@ fn argmin_lanes<T: Float>(dist: &[T]) -> usize {
     let mut best_v = [T::infinity(); ARGMIN_LANES];
     // u32 keeps the index blend at the width of the f32 compare
     let mut best_i = [0u32; ARGMIN_LANES];
-    let chunks = dist.chunks_exact(ARGMIN_LANES);
-    let rem_start = dist.len() - chunks.remainder().len();
-    for (ci, chunk) in chunks.enumerate() {
+    let (chunks, rem) = dist.as_chunks::<ARGMIN_LANES>();
+    let rem_start = dist.len() - rem.len();
+    for (ci, chunk) in chunks.iter().enumerate() {
         for l in 0..ARGMIN_LANES {
             let v = chunk[l];
             let take = v < best_v[l];
@@ -391,7 +391,7 @@ mod tests {
                 let mut s = 0.0f32;
                 for d in 0..dim {
                     let diff = vec[d] - centroids[c * dim + d];
-                    s = s + diff * diff;
+                    s += diff * diff;
                 }
                 if s < best_d {
                     best_d = s;
