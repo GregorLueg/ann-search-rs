@@ -38,6 +38,7 @@ cargo run --example bench_mlx_nndescent --features gpu,mlx --release
 <details>
 <summary><b>MLX - Euclidean (Gaussian)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -67,6 +68,7 @@ IVF-MLX-nl547 (self)                                      73.71       218.37    
 <details>
 <summary><b>MLX - Cosine (Gaussian)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -96,6 +98,7 @@ IVF-MLX-nl547 (self)                                      73.41       209.83    
 <details>
 <summary><b>MLX - Euclidean (Correlated)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -125,6 +128,7 @@ IVF-MLX-nl547 (self)                                      72.47       214.13    
 <details>
 <summary><b>MLX - Euclidean (LowRank)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -154,6 +158,7 @@ IVF-MLX-nl547 (self)                                      75.94       213.19    
 <details>
 <summary><b>MLX - Euclidean (Cell; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 128D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -183,6 +188,7 @@ IVF-MLX-nl547 (self)                                     166.65       497.47    
 <details>
 <summary><b>MLX-IVF (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 64D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -213,6 +219,7 @@ IVF-MLX-nl707 (self)                                     157.96       697.19    
 <details>
 <summary><b>MLX-IVF (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 128D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -243,6 +250,7 @@ IVF-MLX-nl707 (self)                                     254.34     1_094.72    
 <details>
 <summary><b>MLX-IVF (500k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 64D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -273,6 +281,7 @@ IVF-MLX-nl1000 (self)                                    340.69     2_082.71    
 <details>
 <summary><b>MLX-IVF (500k samples; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 128D (CPU vs MLX Exhaustive vs IVF-MLX)
 =====================================================================================================================================================
@@ -307,6 +316,7 @@ The parameters match [the wgpu CAGRA section](benchmarks_gpu.md#cagra-type-query
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Gaussian)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -335,6 +345,7 @@ CAGRA-bw64 (self)                                        367.42        92.88    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning - Cosine (Gaussian)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -363,6 +374,7 @@ CAGRA-bw64 (self)                                        370.49       101.51    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Correlated)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -391,6 +403,7 @@ CAGRA-bw64 (self)                                        358.04        88.40    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (LowRank)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -419,6 +432,7 @@ CAGRA-bw64 (self)                                        355.29        93.41    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning - Euclidean (Cell; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 128D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -447,6 +461,7 @@ CAGRA-bw64 (self)                                        941.61       293.46    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 64D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -475,6 +490,7 @@ CAGRA-bw64 (self)                                        962.41       353.85    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning (250k samples; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 128D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -503,6 +519,7 @@ CAGRA-bw64 (self)                                      1_845.63       696.65    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning (500k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 64D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -531,6 +548,7 @@ CAGRA-bw64 (self)                                      2_246.80       928.01    
 <details>
 <summary><b>MLX NNDescent with CAGRA style pruning (500k samples; 128 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 128D (Exhaustive vs CAGRA beam search)
 =====================================================================================================================================================
@@ -556,7 +574,7 @@ CAGRA-bw64 (self)                                      4_407.71     1_858.52    
 
 ### Runtime info
 
-*ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13.*
+*Each table starts with the ann-search-rs version and commit it was run on.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was MLX (mlx-c 0.7.0).*
 
@@ -571,6 +589,7 @@ exhaustive self-kNN.
 <details>
 <summary><b>kNN generation (250k samples; 32 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 250_000 samples, dim 32, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<
@@ -586,6 +605,7 @@ mlx               509.3          488.8     0.9945
 <details>
 <summary><b>kNN generation (250k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 250_000 samples, dim 64, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<
@@ -601,6 +621,7 @@ mlx               655.3          621.4     0.9944
 <details>
 <summary><b>kNN generation (500k samples; 32 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 500_000 samples, dim 32, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<
@@ -616,6 +637,7 @@ mlx              1152.2         1115.2     0.9914
 <details>
 <summary><b>kNN generation (500k samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 500_000 samples, dim 64, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<
@@ -631,6 +653,7 @@ mlx              1384.5         1358.4     0.9912
 <details>
 <summary><b>kNN generation (1m samples; 32 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 1_000_000 samples, dim 32, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<
@@ -646,6 +669,7 @@ mlx              2367.5         2329.4     0.9873
 <details>
 <summary><b>kNN generation (1m samples; 64 dimensions)</b>:</summary>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
 ============================================================
 1_000_000 samples, dim 64, k 15, euclidean distance
 >>> Using data that simulating manifold hypothesis. <<<

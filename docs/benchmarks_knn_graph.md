@@ -71,6 +71,7 @@ matters most here is the graph degree `k`, which is the ceiling on what
 <summary><b>CPU NN-Descent - Euclidean (Gaussian)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D
 =====================================================================================================================================================
@@ -108,6 +109,7 @@ NNDescent-k:auto-nt:auto-dp1 (extract)                 2_164.67         2.71    
 <summary><b>CPU NN-Descent - Euclidean (LowRank)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 32D
 =====================================================================================================================================================
@@ -145,6 +147,7 @@ NNDescent-k:auto-nt:auto-dp1 (extract)                 1_239.30         2.72    
 <summary><b>CPU NN-Descent - Euclidean (NN embeddings; 128 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 150k samples, 128D
 =====================================================================================================================================================
@@ -212,6 +215,7 @@ of leaf proposals per point, reverse edges are capped at `build_k` per node, and
 <summary><b>kNN generation (250k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -238,6 +242,7 @@ GPU-kNN bk=3x refine=2                                 1_367.14         0.00    
 <summary><b>kNN generation (250k samples; 64 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 250k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -264,6 +269,7 @@ GPU-kNN bk=3x refine=2                                 5_296.13         0.00    
 <summary><b>kNN generation (500k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -290,6 +296,7 @@ GPU-kNN bk=3x refine=2                                 5_605.09         0.00    
 <summary><b>kNN generation (500k samples; 64 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 500k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -321,6 +328,7 @@ gap widens accordingly.
 <summary><b>kNN generation (1m samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 1000k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -347,6 +355,7 @@ GPU-kNN bk=3x refine=2                                17_278.97         0.00    
 <summary><b>kNN generation (1m samples; 64 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 1000k samples, 64D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -373,6 +382,7 @@ GPU-kNN bk=3x refine=2                                49_890.17         0.00    
 <summary><b>kNN generation (2.5m samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 =====================================================================================================================================================
 Benchmark: 2500k samples, 32D kNN graph generation (build_k x refinement)
 =====================================================================================================================================================
@@ -426,6 +436,7 @@ speed-up. The timings only mean something once the fill count is at 100%.
 <summary><b>Clustered GPU NN-Descent (250k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 ===================================================================================================================
 Benchmark: 250k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
@@ -447,6 +458,7 @@ NNDescent-GPU (clustered, c=16)          16        1090.39       0.9992        3
 <summary><b>Clustered GPU NN-Descent (250k samples; 64 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 ===================================================================================================================
 Benchmark: 250k samples, 64D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
@@ -468,6 +480,7 @@ NNDescent-GPU (clustered, c=16)          16        1539.63       0.9993        3
 <summary><b>Clustered GPU NN-Descent (500k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
+ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13
 ===================================================================================================================
 Benchmark: 500k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
@@ -485,6 +498,6 @@ NNDescent-GPU (clustered, c=16)          16        1966.59       0.9987        7
 
 ### Runtime info
 
-*ann-search-rs 0.12.2 (commit v0.12.2-23-g8e59906-dirty), run on 2026-11-13.*
+*Each table starts with the ann-search-rs version and commit it was run on.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*
 *The GPU backend was the `wgpu` backend.*
