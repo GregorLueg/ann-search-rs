@@ -813,6 +813,11 @@ impl<T: AnnSearchFloat> OptimisedProductQuantiser<T> {
     pub(crate) fn rotate_to(&self, vec: &[T], out: &mut [T]) {
         rotate_into(vec, &self.rotation_matrix, self.dim, out);
     }
+
+    /// Rotation matrix, `dim * dim` row-major; a vector rotates as `R * v`
+    pub(crate) fn rotation_matrix(&self) -> &[T] {
+        &self.rotation_matrix
+    }
 }
 
 ///////////

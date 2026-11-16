@@ -16,12 +16,15 @@
 //!
 //! Jégou, Douze & Schmid, IEEE TPAMI, 2011 (IVFADC)
 
+use faer::{Accum, MatMut, MatRef, Par};
 use num_traits::Float;
 use rayon::prelude::*;
 
 use crate::prelude::*;
 use crate::quantised::k_means::{dots_transposed, sq_dists_transposed, transpose_centroids};
 use crate::quantised::quantisers::ProductQuantiser;
+use crate::utils::dist::normalise_vector;
+use crate::utils::gemm::gemm;
 use crate::utils::k_means_utils::select_probed_clusters;
 
 ///////////////
@@ -38,6 +41,14 @@ pub(crate) const PRECOMP_TABLE_MAX_BYTES: usize = 256 << 20;
 /// Fewest queries for which `query_batch` takes the batched path. Below it the
 /// query pre-pass and the reordering are not amortised. Not tuned.
 pub(crate) const BATCH_MIN_QUERIES: usize = 1024;
+
+/// Queries per GEMM when the batched path rotates and probes. Not tuned.
+const PROBE_BLOCK: usize = 64;
+
+/// Queries per GEMM when the batched path builds query-only tables. Each
+/// query's table is `m * n_centroids` elements, so this bounds the scratch.
+/// Not tuned.
+const LUT_BLOCK: usize = 32;
 
 /// Queries scored together against one tile of codes on the exhaustive path.
 /// Each query's lookup table has to stay cache resident across the tile. Not
@@ -428,19 +439,33 @@ impl<T: AnnSearchFloat> IvfAdc<'_, T> {
     ///
     /// * `probes` - Cells to scan
     /// * `s` - Scratch; `s.q` holds the query, `s.heap` is reset by the caller
+    /// * `qlut` - This query's row of [`Self::query_luts`]; built here when
+    ///   `None`. Ignored without cell terms.
     /// * `skip` - Positions for which this returns `true` are not scored
-    pub fn search<F: Fn(usize) -> bool>(&self, probes: &[usize], s: &mut AdcScratch<T>, skip: F) {
+    pub fn search<F: Fn(usize) -> bool>(
+        &self,
+        probes: &[usize],
+        s: &mut AdcScratch<T>,
+        qlut: Option<&[T]>,
+        skip: F,
+    ) {
         let (m, sd, k, dim) = (self.m, self.sd, self.k, self.dim);
         let precomputed = !self.cell_terms.is_empty();
         let two = T::one() + T::one();
-        if precomputed {
-            fill_lut_dot(&s.q, self.books_t, m, sd, k, -two, &mut s.query_lut);
-        }
+        let qlut = match qlut {
+            Some(row) => row,
+            None => {
+                if precomputed {
+                    fill_lut_dot(&s.q, self.books_t, m, sd, k, -two, &mut s.query_lut);
+                }
+                &s.query_lut
+            }
+        };
         for &cell in probes {
             let c = &self.centroids[cell * dim..(cell + 1) * dim];
             let bias = if precomputed {
                 let t1 = &self.cell_terms[cell * m * k..(cell + 1) * m * k];
-                for ((o, &a), &b) in s.lut.iter_mut().zip(t1).zip(&s.query_lut) {
+                for ((o, &a), &b) in s.lut.iter_mut().zip(t1).zip(qlut) {
                     *o = self.scale * (a + b);
                 }
                 self.scale * T::euclidean_simd(&s.q, c)
@@ -464,70 +489,208 @@ impl<T: AnnSearchFloat> IvfAdc<'_, T> {
             );
         }
     }
+
+    /// Query-only tables `-2 <q_s, c_sj>` of a block of queries, one GEMM per
+    /// subspace. Same values as the per-query build up to summation order.
+    ///
+    /// ### Params
+    ///
+    /// * `tile` - Row-major queries in codebook space, `b * dim`
+    /// * `out` - Output, `b * m * k`, one table per query
+    pub fn query_luts(&self, tile: &[T], out: &mut [T]) {
+        let (m, sd, k, dim) = (self.m, self.sd, self.k, self.dim);
+        let b = tile.len() / dim;
+        let two = T::one() + T::one();
+        for s in 0..m {
+            // Not `from_row_major_slice_with_stride_mut`: faer 0.24.4 lays that
+            // out column-major (unit row stride), which writes out of bounds.
+            gemm(
+                MatMut::from_column_major_slice_with_stride_mut(&mut out[s * k..], k, b, m * k)
+                    .transpose_mut(),
+                Accum::Replace,
+                MatRef::from_row_major_slice_with_stride(&tile[s * sd..], b, sd, dim),
+                MatRef::from_row_major_slice(&self.books_t[s * sd * k..(s + 1) * sd * k], sd, k),
+                -two,
+                Par::Seq,
+            );
+        }
+    }
+}
+
+/// What the batched path needs to prepare and probe queries on its own.
+pub(crate) struct BatchPlan<'a, T> {
+    /// Scan state; its centroids are the ones probed
+    pub adc: IvfAdc<'a, T>,
+    /// Per-cell counts for the probe underfill, `nlist + 1`
+    pub probe_offsets: &'a [u32],
+    /// OPQ rotation, `dim * dim` row-major; `None` for plain PQ
+    pub rotation: Option<&'a [T]>,
+    /// Normalise prepared queries
+    pub cosine: bool,
+    /// Requested cells
+    pub nprobe: usize,
+    /// Neighbours the probe list has to reach
+    pub k: usize,
 }
 
 /// One query's `(ids, distances)`, nearest first.
 type QueryResult<T> = (Vec<usize>, Vec<T>);
 
-/// Run prepared queries in parallel, nearest-centroid order first.
+/// Rotate, normalise and probe a block of queries with two GEMMs.
 ///
-/// Every query is mapped to codebook space and probed up front, then the
-/// queries are scored ordered by their nearest cell, so consecutive queries
-/// on a thread share cells and their codes and tables stay cache resident.
-/// Results come back in input order.
+/// Centroid distances come from `||q||^2 + ||c||^2 - 2 <q, c>`, so they match
+/// the per-query [`probe_cells`] up to rounding and a near tie can order
+/// differently.
 ///
 /// ### Params
 ///
-/// * `nq` - Number of queries
-/// * `dim` - Dimension
+/// * `plan` - Index state
+/// * `c_sq` - Squared centroid norms, `nlist`
+/// * `queries` - Raw queries, `b * dim`
+/// * `out` - Prepared queries, `b * dim`
+/// * `probes` - Probe lists, `b`
+/// * `dots` - Scratch for the `b * nlist` dot products
+/// * `buf` - Scratch for one query's `(distance, cell)` pairs
+fn prepare_block<T: AnnSearchFloat>(
+    plan: &BatchPlan<'_, T>,
+    c_sq: &[T],
+    queries: &[T],
+    out: &mut [T],
+    probes: &mut [Vec<usize>],
+    dots: &mut Vec<T>,
+    buf: &mut Vec<(T, usize)>,
+) {
+    let dim = plan.adc.dim;
+    let nlist = c_sq.len();
+    let b = out.len() / dim;
+    let two = T::one() + T::one();
+
+    match plan.rotation {
+        Some(r) => gemm(
+            MatMut::from_row_major_slice_mut(out, b, dim),
+            Accum::Replace,
+            MatRef::from_row_major_slice(queries, b, dim),
+            MatRef::from_row_major_slice(r, dim, dim).transpose(),
+            T::one(),
+            Par::Seq,
+        ),
+        None => out.copy_from_slice(queries),
+    }
+    if plan.cosine {
+        out.chunks_exact_mut(dim).for_each(normalise_vector);
+    }
+
+    dots.resize(b * nlist, T::zero());
+    gemm(
+        MatMut::from_row_major_slice_mut(dots, b, nlist),
+        Accum::Replace,
+        MatRef::from_row_major_slice(out, b, dim),
+        MatRef::from_row_major_slice(plan.adc.centroids, nlist, dim).transpose(),
+        T::one(),
+        Par::Seq,
+    );
+    for (i, q) in out.chunks_exact(dim).enumerate() {
+        let q_sq = T::dot_simd(q, q);
+        buf.clear();
+        buf.extend(
+            dots[i * nlist..(i + 1) * nlist]
+                .iter()
+                .zip(c_sq)
+                .enumerate()
+                .map(|(c, (&d, &cs))| (q_sq + cs - two * d, c)),
+        );
+        probes[i] = select_probed_clusters(buf, plan.probe_offsets, plan.nprobe, plan.k);
+    }
+}
+
+/// Run a batch of queries in parallel, nearest-centroid order first.
+///
+/// Queries are rotated, normalised and probed up front in blocks
+/// ([`prepare_block`]), then scored ordered by their nearest cell, so
+/// consecutive queries on a thread share cells and their codes and tables
+/// stay cache resident. With cell terms, each run of [`LUT_BLOCK`] queries
+/// gets its query-only tables from [`IvfAdc::query_luts`]. Both GEMM steps
+/// change summation order, so results can differ from the per-query path in
+/// the last bits and at near ties. Results come back in input order.
+///
+/// ### Params
+///
+/// * `queries` - Raw queries, row-major
+/// * `plan` - Index state for preparing and probing
 /// * `scratch` - Builds one thread's scratch
-/// * `prepare` - Writes query `i` in codebook space into the slice, returns
-///   its probe list
-/// * `search` - Scores the query held in the scratch against its probes and
-///   returns `(ids, distances)`
+/// * `search` - Scores the query held in the scratch against its probes,
+///   given its query-only table when there is one, and returns
+///   `(ids, distances)`
 /// * `progress` - Ticked once per query
 ///
 /// ### Returns
 ///
 /// Per query `(ids, distances)`, nearest first
-pub(crate) fn run_ordered<T, S, P, Q>(
-    nq: usize,
-    dim: usize,
+pub(crate) fn run_ordered<T, S, Q>(
+    queries: &[T],
+    plan: &BatchPlan<'_, T>,
     scratch: S,
-    prepare: P,
     search: Q,
     progress: &crate::utils::verbosity::QueryProgress,
 ) -> Vec<(Vec<usize>, Vec<T>)>
 where
     T: AnnSearchFloat,
     S: Fn() -> AdcScratch<T> + Sync + Send,
-    P: Fn(usize, &mut [T], &mut AdcScratch<T>) -> Vec<usize> + Sync + Send,
-    Q: Fn(&[usize], &mut AdcScratch<T>) -> (Vec<usize>, Vec<T>) + Sync + Send,
+    Q: Fn(&[usize], &mut AdcScratch<T>, Option<&[T]>) -> (Vec<usize>, Vec<T>) + Sync + Send,
 {
-    let mut prepared = vec![T::zero(); nq * dim];
-    let probes: Vec<Vec<usize>> = prepared
-        .par_chunks_mut(dim)
-        .enumerate()
-        .map_init(&scratch, |s, (i, q)| prepare(i, q, s))
+    let adc = &plan.adc;
+    let dim = adc.dim;
+    let nq = queries.len() / dim;
+    let c_sq: Vec<T> = adc
+        .centroids
+        .chunks_exact(dim)
+        .map(|c| T::dot_simd(c, c))
         .collect();
+
+    let mut prepared = vec![T::zero(); nq * dim];
+    let mut probes: Vec<Vec<usize>> = vec![Vec::new(); nq];
+    prepared
+        .par_chunks_mut(PROBE_BLOCK * dim)
+        .zip(queries.par_chunks(PROBE_BLOCK * dim))
+        .zip(probes.par_chunks_mut(PROBE_BLOCK))
+        .for_each_init(
+            || (Vec::new(), Vec::new()),
+            |(dots, buf), ((out, raw), pr)| prepare_block(plan, &c_sq, raw, out, pr, dots, buf),
+        );
 
     let mut order: Vec<u32> = (0..nq as u32).collect();
     order.par_sort_by_key(|&i| probes[i as usize].first().copied().unwrap_or(0));
 
+    let precomputed = !adc.cell_terms.is_empty();
+    let mk = adc.m * adc.k;
     let chunk = nq.div_ceil(rayon::current_num_threads().max(1) * 8).max(1);
     let scored: Vec<(u32, QueryResult<T>)> = order
         .par_chunks(chunk)
-        .map_init(&scratch, |s, block| {
-            block
-                .iter()
-                .map(|&i| {
-                    let i_us = i as usize;
-                    s.q.copy_from_slice(&prepared[i_us * dim..(i_us + 1) * dim]);
-                    progress.tick();
-                    (i, search(&probes[i_us], s))
-                })
-                .collect::<Vec<_>>()
-        })
+        .map_init(
+            || (scratch(), Vec::new(), Vec::new()),
+            |(s, tile, qluts), block| {
+                let mut res = Vec::with_capacity(block.len());
+                for sub in block.chunks(LUT_BLOCK) {
+                    if precomputed {
+                        tile.clear();
+                        for &i in sub {
+                            let i = i as usize;
+                            tile.extend_from_slice(&prepared[i * dim..(i + 1) * dim]);
+                        }
+                        qluts.resize(sub.len() * mk, T::zero());
+                        adc.query_luts(tile, qluts);
+                    }
+                    for (j, &i) in sub.iter().enumerate() {
+                        let i_us = i as usize;
+                        s.q.copy_from_slice(&prepared[i_us * dim..(i_us + 1) * dim]);
+                        progress.tick();
+                        let qlut = precomputed.then(|| &qluts[j * mk..(j + 1) * mk]);
+                        res.push((i, search(&probes[i_us], s, qlut)));
+                    }
+                }
+                res
+            },
+        )
         .flatten()
         .collect();
 

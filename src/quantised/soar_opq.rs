@@ -651,6 +651,7 @@ where
     /// * `probes` - Cells to scan
     /// * `k` - Neighbours to return
     /// * `s` - Scratch holding the prepared query
+    /// * `qlut` - Query-only table from the batched path, see [`IvfAdc::search`]
     ///
     /// ### Returns
     ///
@@ -660,6 +661,7 @@ where
         probes: &[usize],
         k: usize,
         s: &mut AdcScratch<T>,
+        qlut: Option<&[T]>,
     ) -> (Vec<usize>, Vec<T>) {
         SOAR_OPQ_PROBED.with(|cell| {
             let mut mask = cell.borrow_mut();
@@ -670,7 +672,7 @@ where
                 mask.insert(c);
             }
             s.heap.reset(k);
-            self.adc().search(probes, s, |pos| {
+            self.adc().search(probes, s, qlut, |pos| {
                 let key = self.dedup_key[pos];
                 key != u32::MAX && mask.contains(key as usize)
             });
@@ -710,7 +712,7 @@ where
         let mut s = self.scratch();
         self.prepare(query_vec, &mut s.q);
         let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
-        Ok(self.search_prepared(&probes, k, &mut s))
+        Ok(self.search_prepared(&probes, k, &mut s, None))
     }
 
     /// Query many vectors at once
@@ -750,14 +752,17 @@ where
 
         let results = if nq >= BATCH_MIN_QUERIES {
             run_ordered(
-                nq,
-                dim,
-                || self.scratch(),
-                |i, q, s| {
-                    self.prepare(&queries[i * dim..(i + 1) * dim], q);
-                    self.probe(q, nprobe, k, &mut s.probe_buf)
+                queries,
+                &BatchPlan {
+                    adc: self.adc(),
+                    probe_offsets: &self.primary_offsets,
+                    rotation: Some(self.codebook.rotation_matrix()),
+                    cosine: self.metric == Dist::Cosine,
+                    nprobe,
+                    k,
                 },
-                |probes, s| self.search_prepared(probes, k, s),
+                || self.scratch(),
+                |probes, s, qlut| self.search_prepared(probes, k, s, qlut),
                 &progress,
             )
         } else {
@@ -769,7 +774,7 @@ where
                         self.prepare(&queries[i * dim..(i + 1) * dim], &mut s.q);
                         let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
                         progress.tick();
-                        self.search_prepared(&probes, k, s)
+                        self.search_prepared(&probes, k, s, None)
                     },
                 )
                 .collect()
@@ -863,7 +868,7 @@ where
                     }
                     let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
                     progress.tick();
-                    let (ids, dists) = self.search_prepared(&probes, k, s);
+                    let (ids, dists) = self.search_prepared(&probes, k, s, None);
                     (self.original_ids[i] as usize, ids, dists)
                 },
             )

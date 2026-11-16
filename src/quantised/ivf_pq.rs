@@ -420,6 +420,7 @@ where
     /// * `probes` - Cells to scan
     /// * `k` - Neighbours to return
     /// * `s` - Scratch holding the prepared query
+    /// * `qlut` - Query-only table from the batched path, see [`IvfAdc::search`]
     ///
     /// ### Returns
     ///
@@ -429,9 +430,10 @@ where
         probes: &[usize],
         k: usize,
         s: &mut AdcScratch<T>,
+        qlut: Option<&[T]>,
     ) -> (Vec<usize>, Vec<T>) {
         s.heap.reset(k);
-        self.adc().search(probes, s, |_| false);
+        self.adc().search(probes, s, qlut, |_| false);
         finish_heap(&mut s.heap, Some(&self.original_ids))
     }
 
@@ -464,7 +466,7 @@ where
         let mut s = self.scratch();
         self.prepare(query_vec, &mut s.q);
         let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
-        Ok(self.search_prepared(&probes, k, &mut s))
+        Ok(self.search_prepared(&probes, k, &mut s, None))
     }
 
     /// Query many vectors at once
@@ -504,14 +506,17 @@ where
 
         let results = if nq >= BATCH_MIN_QUERIES {
             run_ordered(
-                nq,
-                dim,
-                || self.scratch(),
-                |i, q, s| {
-                    self.prepare(&queries[i * dim..(i + 1) * dim], q);
-                    self.probe(q, nprobe, k, &mut s.probe_buf)
+                queries,
+                &BatchPlan {
+                    adc: self.adc(),
+                    probe_offsets: &self.offsets,
+                    rotation: None,
+                    cosine: self.metric == Dist::Cosine,
+                    nprobe,
+                    k,
                 },
-                |probes, s| self.search_prepared(probes, k, s),
+                || self.scratch(),
+                |probes, s, qlut| self.search_prepared(probes, k, s, qlut),
                 &progress,
             )
         } else {
@@ -523,7 +528,7 @@ where
                         self.prepare(&queries[i * dim..(i + 1) * dim], &mut s.q);
                         let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
                         progress.tick();
-                        self.search_prepared(&probes, k, s)
+                        self.search_prepared(&probes, k, s, None)
                     },
                 )
                 .collect()
@@ -615,7 +620,7 @@ where
                     }
                     let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
                     progress.tick();
-                    let (ids, dists) = self.search_prepared(&probes, k, s);
+                    let (ids, dists) = self.search_prepared(&probes, k, s, None);
                     (self.original_ids[i] as usize, ids, dists)
                 },
             )
@@ -1073,8 +1078,10 @@ mod tests {
             .collect()
     }
 
-    /// The batched path and the per-query path share their kernels, so they
-    /// have to agree exactly, above and below the batching threshold.
+    /// The batched path probes and builds its query tables with GEMMs, so it
+    /// agrees with the per-query path up to summation order: distances to
+    /// rounding at every rank, ids except where that rounding breaks a near
+    /// tie. Below the batching threshold both paths are the same code.
     fn assert_batch_matches_query(metric: Dist, nq: usize) {
         let dim = 32;
         let data = noisy_matrix(3_000, dim, 7);
@@ -1094,11 +1101,23 @@ mod tests {
             .query_batch(&queries, dim, 10, Some(4), true, Verbosity::Quiet)
             .unwrap();
         let dists = dists.unwrap();
+        let mut id_mismatch = 0;
         for (i, q) in queries.chunks_exact(dim).enumerate() {
             let (want_ids, want_d) = index.query(q, 10, Some(4)).unwrap();
-            assert_eq!(ids[i], want_ids, "row {i}");
-            assert_eq!(dists[i], want_d, "row {i}");
+            if nq < BATCH_MIN_QUERIES {
+                assert_eq!(ids[i], want_ids, "row {i}");
+                assert_eq!(dists[i], want_d, "row {i}");
+                continue;
+            }
+            for (&a, &b) in dists[i].iter().zip(&want_d) {
+                assert!(
+                    (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                    "row {i}: {a} vs {b}"
+                );
+            }
+            id_mismatch += (ids[i] != want_ids) as usize;
         }
+        assert!(id_mismatch * 100 <= nq, "{id_mismatch} of {nq} rows differ");
     }
 
     #[test]
@@ -1145,10 +1164,10 @@ mod tests {
             let probes = index.probe(&s.q, 4, 10, &mut s.probe_buf);
 
             s.heap.reset(10);
-            with_terms.search(&probes, &mut s, |_| false);
+            with_terms.search(&probes, &mut s, None, |_| false);
             let (_, d_terms) = finish_heap(&mut s.heap, None);
             s.heap.reset(10);
-            direct.search(&probes, &mut s, |_| false);
+            direct.search(&probes, &mut s, None, |_| false);
             let (_, d_direct) = finish_heap(&mut s.heap, None);
 
             for (a, b) in d_terms.iter().zip(&d_direct) {
