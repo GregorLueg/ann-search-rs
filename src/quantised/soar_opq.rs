@@ -2,17 +2,19 @@
 //! [`crate::quantised::soar_pq::SoarPqIndex`]: every point is encoded twice,
 //! once as a rotated residual against each of the two cells it belongs to.
 //!
-//! The reason spilling pays here is the same as for plain PQ. Codes are
-//! residuals against a cell centroid, so each probed cell must rebuild the ADC
-//! lookup table at `n_pq_centroids * dim` operations before scoring a single
-//! candidate. Drawing twice the candidates from one cell is therefore much
-//! cheaper than drawing the same candidates from two. Exact full-vector search
-//! has no such fixed cost, which is why spilling loses there.
+//! The case for spilling is the same as for plain PQ. Codes are residuals
+//! against a cell centroid, so each probed cell needs its own ADC lookup table:
+//! `m * n_pq_centroids` adds with the precomputed cell terms (see
+//! `pq_search`), `n_pq_centroids * dim` operations when they are over budget.
+//! The larger that fixed cost relative to scanning the cell, the more twice
+//! the candidates from one cell is worth over the same candidates from two.
+//! Exact full-vector search has no such fixed cost, which is why spilling
+//! loses there.
 //!
 //! OPQ adds a learned rotation `R`. Codes are `PQ(R * r)`, so the codebooks
 //! live in the rotated space and the lookup table has to be built there too:
 //! `R` is orthogonal, so `||q_r - r|| == ||R q_r - R r||`, but only when both
-//! sides are rotated. The query residual is rotated before the table is built.
+//! sides are rotated. The query is rotated once and the centroids at build.
 //!
 //! Costs `2 * n * m` code bytes rather than `n * m`, so the honest comparison
 //! is against an [`crate::quantised::ivf_opq::IvfOpqIndex`] with twice the
@@ -835,7 +837,7 @@ where
                         .decode_into(&self.quantised_codes[i * m..(i + 1) * m], &mut s.q);
                     let centroid = &self.centroids_rotated[c * dim..(c + 1) * dim];
                     for (v, &cv) in s.q.iter_mut().zip(centroid) {
-                        *v = *v + cv;
+                        *v += cv;
                     }
                     if self.metric == Dist::Cosine {
                         normalise_vector(&mut s.q);

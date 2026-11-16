@@ -608,7 +608,7 @@ where
                         .decode_into(&self.quantised_codes[i * m..(i + 1) * m], &mut s.q);
                     let centroid = &self.centroids[c * dim..(c + 1) * dim];
                     for (v, &cv) in s.q.iter_mut().zip(centroid) {
-                        *v = *v + cv;
+                        *v += cv;
                     }
                     if self.metric == Dist::Cosine {
                         normalise_vector(&mut s.q);

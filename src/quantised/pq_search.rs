@@ -284,7 +284,7 @@ pub(crate) fn cell_terms<T: AnnSearchFloat>(centroids: &[T], pq: &ProductQuantis
         .for_each(|(dst, c)| {
             fill_lut_dot(c, books_t, m, sd, k, two, dst);
             for (v, &nr) in dst.iter_mut().zip(&norms) {
-                *v = *v + nr;
+                *v += nr;
             }
         });
     out
@@ -460,6 +460,9 @@ impl<T: AnnSearchFloat> IvfAdc<'_, T> {
     }
 }
 
+/// One query's `(ids, distances)`, nearest first.
+type QueryResult<T> = (Vec<usize>, Vec<T>);
+
 /// Run prepared queries in parallel, nearest-centroid order first.
 ///
 /// Every query is mapped to codebook space and probed up front, then the
@@ -506,7 +509,7 @@ where
     order.par_sort_by_key(|&i| probes[i as usize].first().copied().unwrap_or(0));
 
     let chunk = nq.div_ceil(rayon::current_num_threads().max(1) * 8).max(1);
-    let scored: Vec<(u32, (Vec<usize>, Vec<T>))> = order
+    let scored: Vec<(u32, QueryResult<T>)> = order
         .par_chunks(chunk)
         .map_init(&scratch, |s, block| {
             block

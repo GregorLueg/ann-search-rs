@@ -3,13 +3,14 @@
 //!
 //! Spilling loses to plain IVF on exact full-vector search: probing one more
 //! cell costs nothing fixed there, so raising `nprobe` is simply a better use
-//! of the same candidate budget. Product quantisation breaks that symmetry.
-//! Codes are residuals against a cell's centroid, so each probed cell has to
-//! rebuild the ADC lookup table (`build_lookup_tables_residual`), costing
-//! `n_pq_centroids * dim` operations before a single candidate is scored. At
-//! the sizes this crate targets that table build is several times the cost of
-//! scanning the cell it serves, so twice the candidates out of *one* cell is
-//! much cheaper than the same candidates out of two.
+//! of the same candidate budget. Product quantisation reintroduces a fixed
+//! cost per probed cell. Codes are residuals against a cell's centroid, so
+//! each probed cell needs its own ADC lookup table. With the precomputed cell
+//! terms (see `pq_search`) that table is `m * n_pq_centroids` adds; when the
+//! terms are over budget it is rebuilt from the residual at
+//! `n_pq_centroids * dim` operations. The larger that fixed cost relative to
+//! scanning the cell, the more twice the candidates out of *one* cell is worth
+//! over the same candidates out of two.
 //!
 //! ### References
 //!
@@ -812,7 +813,7 @@ where
                         .decode_into(&self.quantised_codes[i * m..(i + 1) * m], &mut s.q);
                     let centroid = &self.centroids[c * dim..(c + 1) * dim];
                     for (v, &cv) in s.q.iter_mut().zip(centroid) {
-                        *v = *v + cv;
+                        *v += cv;
                     }
                     if self.metric == Dist::Cosine {
                         normalise_vector(&mut s.q);
