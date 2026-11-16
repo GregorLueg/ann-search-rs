@@ -433,7 +433,7 @@ where
         qlut: Option<&[T]>,
     ) -> (Vec<usize>, Vec<T>) {
         s.heap.reset(k);
-        self.adc().search(probes, s, qlut, |_| false);
+        self.adc().search(probes, s, qlut, None, |_| false);
         finish_heap(&mut s.heap, Some(&self.original_ids))
     }
 
@@ -1164,10 +1164,10 @@ mod tests {
             let probes = index.probe(&s.q, 4, 10, &mut s.probe_buf);
 
             s.heap.reset(10);
-            with_terms.search(&probes, &mut s, None, |_| false);
+            with_terms.search(&probes, &mut s, None, None, |_| false);
             let (_, d_terms) = finish_heap(&mut s.heap, None);
             s.heap.reset(10);
-            direct.search(&probes, &mut s, None, |_| false);
+            direct.search(&probes, &mut s, None, None, |_| false);
             let (_, d_direct) = finish_heap(&mut s.heap, None);
 
             for (a, b) in d_terms.iter().zip(&d_direct) {

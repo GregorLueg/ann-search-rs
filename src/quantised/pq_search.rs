@@ -218,10 +218,9 @@ pub(crate) fn adc_dist<T: Float>(codes: &[u8], lut: &[T], k: usize) -> T {
 /// * `start` - First position
 /// * `end` - One past the last position
 /// * `heap` - Receives `(distance, position)`
-/// * `skip` - Positions for which this returns `true` are not scored
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) fn scan_range<T: Float, F: Fn(usize) -> bool>(
+pub(crate) fn scan_range<T: Float>(
     codes: &[u8],
     m: usize,
     k: usize,
@@ -230,14 +229,85 @@ pub(crate) fn scan_range<T: Float, F: Fn(usize) -> bool>(
     start: usize,
     end: usize,
     heap: &mut BoundedMaxHeap<T>,
-    skip: F,
 ) {
     for (i, row) in codes[start * m..end * m].chunks_exact(m).enumerate() {
-        let pos = start + i;
-        if skip(pos) {
-            continue;
+        heap.push(bias + adc_dist(row, lut, k), start + i);
+    }
+}
+
+////////////////
+// SOAR dedup //
+////////////////
+
+/// Runs of equal dedup key within each cell of a SOAR index.
+///
+/// A SOAR entry carries `u32::MAX` when it is its point's primary copy and
+/// otherwise the cell holding the primary. The scan decides per run rather
+/// than per entry whether to skip, so a cell laid out by
+/// [`sort_spills_by_primary`] costs one check per source cell. Derived from
+/// the keys, so not serialised; any layout is correct, a sorted one just has
+/// fewer runs.
+#[derive(Default)]
+pub(crate) struct KeyRuns {
+    /// Run ranges per cell, `nlist + 1`
+    pub offsets: Vec<u32>,
+    /// `(key, one past the last position)` per run
+    pub runs: Vec<(u32, u32)>,
+}
+
+impl KeyRuns {
+    /// Run-length encode the keys of every cell.
+    ///
+    /// ### Params
+    ///
+    /// * `dedup_key` - Key per position
+    /// * `cell_offsets` - Positions per cell, `nlist + 1`
+    ///
+    /// ### Returns
+    ///
+    /// The run table
+    pub fn new(dedup_key: &[u32], cell_offsets: &[u32]) -> Self {
+        let mut offsets = Vec::with_capacity(cell_offsets.len());
+        let mut runs = Vec::new();
+        offsets.push(0);
+        for w in cell_offsets.windows(2) {
+            for pos in w[0]..w[1] {
+                let key = dedup_key[pos as usize];
+                match runs.last_mut() {
+                    Some((k, end)) if *k == key && *end == pos && pos != w[0] => *end = pos + 1,
+                    _ => runs.push((key, pos + 1)),
+                }
+            }
+            offsets.push(runs.len() as u32);
         }
-        heap.push(bias + adc_dist(row, lut, k), pos);
+        Self { offsets, runs }
+    }
+
+    /// Bytes held by the table
+    ///
+    /// ### Returns
+    ///
+    /// Capacity of both buffers in bytes
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.runs.capacity() * std::mem::size_of::<(u32, u32)>()
+    }
+}
+
+/// Order every cell as primaries first, then spilled entries grouped by the
+/// cell holding their primary, so [`KeyRuns`] finds long runs.
+///
+/// ### Params
+///
+/// * `members` - Point id per position, reordered within each cell
+/// * `offsets` - Positions per cell, `nlist + 1`
+/// * `primary` - Primary cell per point
+pub(crate) fn sort_spills_by_primary(members: &mut [u32], offsets: &[u32], primary: &[u32]) {
+    for (c, w) in offsets.windows(2).enumerate() {
+        members[w[0] as usize..w[1] as usize].sort_by_key(|&p| {
+            let pc = primary[p as usize];
+            (pc != c as u32, pc, p)
+        });
     }
 }
 
@@ -441,13 +511,16 @@ impl<T: AnnSearchFloat> IvfAdc<'_, T> {
     /// * `s` - Scratch; `s.q` holds the query, `s.heap` is reset by the caller
     /// * `qlut` - This query's row of [`Self::query_luts`]; built here when
     ///   `None`. Ignored without cell terms.
-    /// * `skip` - Positions for which this returns `true` are not scored
-    pub fn search<F: Fn(usize) -> bool>(
+    /// * `runs` - SOAR dedup runs; `None` scans every entry
+    /// * `skip_key` - Runs whose (non-primary) key this returns `true` for are
+    ///   not scored
+    pub fn search<F: Fn(u32) -> bool>(
         &self,
         probes: &[usize],
         s: &mut AdcScratch<T>,
         qlut: Option<&[T]>,
-        skip: F,
+        runs: Option<&KeyRuns>,
+        skip_key: F,
     ) {
         let (m, sd, k, dim) = (self.m, self.sd, self.k, self.dim);
         let precomputed = !self.cell_terms.is_empty();
@@ -476,17 +549,19 @@ impl<T: AnnSearchFloat> IvfAdc<'_, T> {
                 fill_lut_sq(&s.resid, self.books_t, m, sd, k, self.scale, &mut s.lut);
                 T::zero()
             };
-            scan_range(
-                self.codes,
-                m,
-                k,
-                &s.lut,
-                bias,
-                self.offsets[cell] as usize,
-                self.offsets[cell + 1] as usize,
-                &mut s.heap,
-                &skip,
-            );
+            let (lo, hi) = (self.offsets[cell] as usize, self.offsets[cell + 1] as usize);
+            let Some(r) = runs else {
+                scan_range(self.codes, m, k, &s.lut, bias, lo, hi, &mut s.heap);
+                continue;
+            };
+            let mut start = lo;
+            for &(key, end) in &r.runs[r.offsets[cell] as usize..r.offsets[cell + 1] as usize] {
+                let end = end as usize;
+                if key == u32::MAX || !skip_key(key) {
+                    scan_range(self.codes, m, k, &s.lut, bias, start, end, &mut s.heap);
+                }
+                start = end;
+            }
         }
     }
 
@@ -789,7 +864,7 @@ pub(crate) fn exhaustive_block<T: Float>(
     for t0 in (0..n).step_by(EXH_CODE_TILE) {
         let t1 = (t0 + EXH_CODE_TILE).min(n);
         for (lut, heap) in luts.chunks_exact(lut_len).zip(heaps.iter_mut()) {
-            scan_range(codes, m, k_cents, lut, T::zero(), t0, t1, heap, |_| false);
+            scan_range(codes, m, k_cents, lut, T::zero(), t0, t1, heap);
         }
     }
 

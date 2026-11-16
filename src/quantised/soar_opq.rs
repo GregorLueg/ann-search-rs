@@ -110,6 +110,10 @@ pub struct SoarOpqIndex<T> {
     /// rebuilt on load.
     #[cfg_attr(feature = "serialise", serde(skip, default = "Vec::new"))]
     cell_terms: Vec<T>,
+    /// Runs of equal `dedup_key` per cell, see [`KeyRuns`]. Derived, so not
+    /// serialised and rebuilt on load.
+    #[cfg_attr(feature = "serialise", serde(skip, default))]
+    key_runs: KeyRuns,
 }
 
 //////////////////////
@@ -408,7 +412,8 @@ where
             both[i * 2] = primary[i];
             both[i * 2 + 1] = secondary[i];
         }
-        let (members, offsets) = invert_assignments_csr(&both, n, 2, nlist);
+        let (mut members, offsets) = invert_assignments_csr(&both, n, 2, nlist);
+        sort_spills_by_primary(&mut members, &offsets, &primary);
 
         let n_entries = members.len();
         let mut pos_cluster = vec![0u32; n_entries];
@@ -495,7 +500,9 @@ where
             rule,
             original_ids: members,
             cell_terms: Vec::new(),
+            key_runs: KeyRuns::default(),
         };
+        idx.key_runs = KeyRuns::new(&idx.dedup_key, &idx.offsets);
         idx.cell_terms = cell_terms(
             &idx.centroids_rotated,
             idx.codebook.pq(),
@@ -545,6 +552,7 @@ where
             + self.dedup_key.capacity() * std::mem::size_of::<u32>()
             + self.original_ids.capacity() * std::mem::size_of::<u32>()
             + self.cell_terms.capacity() * std::mem::size_of::<T>()
+            + self.key_runs.memory_usage_bytes()
             + self.codebook.memory_usage_bytes()
     }
 
@@ -672,10 +680,10 @@ where
                 mask.insert(c);
             }
             s.heap.reset(k);
-            self.adc().search(probes, s, qlut, |pos| {
-                let key = self.dedup_key[pos];
-                key != u32::MAX && mask.contains(key as usize)
-            });
+            self.adc()
+                .search(probes, s, qlut, Some(&self.key_runs), |key| {
+                    mask.contains(key as usize)
+                });
             for &c in probes {
                 mask.remove(c);
             }
@@ -899,6 +907,7 @@ where
             self.codebook.pq(),
             PRECOMP_TABLE_MAX_BYTES,
         );
+        self.key_runs = KeyRuns::new(&self.dedup_key, &self.offsets);
         Ok(())
     }
 }

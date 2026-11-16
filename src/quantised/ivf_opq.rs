@@ -472,7 +472,7 @@ where
         qlut: Option<&[T]>,
     ) -> (Vec<usize>, Vec<T>) {
         s.heap.reset(k);
-        self.adc().search(probes, s, qlut, |_| false);
+        self.adc().search(probes, s, qlut, None, |_| false);
         finish_heap(&mut s.heap, Some(&self.original_ids))
     }
 
