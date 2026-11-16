@@ -603,29 +603,35 @@ where
             }
         }
 
-        let results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..n_pos)
-            .into_par_iter()
-            .map_init(
-                || self.scratch(),
-                |s, i| {
-                    let c = pos_cell[i] as usize;
-                    self.codebook
-                        .decode_into(&self.quantised_codes[i * m..(i + 1) * m], &mut s.q);
-                    let centroid = &self.centroids[c * dim..(c + 1) * dim];
-                    for (v, &cv) in s.q.iter_mut().zip(centroid) {
-                        *v += cv;
-                    }
-                    if self.metric == Dist::Cosine {
-                        normalise_vector(&mut s.q);
-                    }
-                    let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
-                    progress.tick();
-                    let (ids, dists) = self.search_prepared(&probes, k, s, None);
-                    (self.original_ids[i] as usize, ids, dists)
-                },
-            )
-            .collect();
+        let rows: Vec<u32> = (0..n_pos as u32).collect();
+        let results = run_self(
+            &rows,
+            &BatchPlan {
+                adc: self.adc(),
+                probe_offsets: &self.offsets,
+                rotation: None,
+                cosine: self.metric == Dist::Cosine,
+                nprobe,
+                k,
+            },
+            || self.scratch(),
+            |i, out| {
+                let c = pos_cell[i] as usize;
+                self.codebook
+                    .decode_into(&self.quantised_codes[i * m..(i + 1) * m], out);
+                for (v, &cv) in out.iter_mut().zip(&self.centroids[c * dim..(c + 1) * dim]) {
+                    *v += cv;
+                }
+            },
+            |probes, s, qlut| self.search_prepared(probes, k, s, qlut),
+            &progress,
+        );
         progress.finish();
+        let results = rows
+            .iter()
+            .zip(results)
+            .map(|(&p, (ids, dists))| (self.original_ids[p as usize] as usize, ids, dists))
+            .collect();
 
         Ok(scatter_self(results, self.n, return_dist))
     }
