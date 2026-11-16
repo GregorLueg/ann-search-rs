@@ -27,6 +27,9 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   higher `nprobe` for the same recall.
 - `query_batch()` on all six PQ/OPQ indices (exhaustive, IVF, SOAR). The
   `query_*_index` wrappers use it.
+- `set_cell_terms_budget()` on IVF-PQ, IVF-OPQ, SOAR-PQ and SOAR-OPQ sets the
+  memory cap of the precomputed per-cell table (default 256 MiB, `0` turns it
+  off). Not saved with the index.
 
 **Performance**
 

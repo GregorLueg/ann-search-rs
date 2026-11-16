@@ -28,10 +28,11 @@ use crate::utils::k_means_utils::select_probed_clusters;
 // Constants //
 ///////////////
 
-/// Largest precomputed cell-term table, in bytes. Above it the IVF indices
-/// fall back to building the residual table per probed cell. The table is
-/// `nlist * m * n_centroids` elements, so it outgrows the codes themselves for
-/// small datasets with many subspaces. Not tuned.
+/// Default budget for the precomputed cell-term table, in bytes. Above it the
+/// IVF indices fall back to building the residual table per probed cell. The
+/// table is `nlist * m * n_centroids` elements, so it outgrows the codes
+/// themselves for small datasets with many subspaces. Callers can change it
+/// per index with `set_cell_terms_budget`. Not tuned.
 pub(crate) const PRECOMP_TABLE_MAX_BYTES: usize = 256 << 20;
 
 /// Fewest queries for which `query_batch` takes the batched path. Below it the
@@ -257,16 +258,21 @@ pub(crate) fn finish_heap<T: Float>(
 ///
 /// * `centroids` - IVF centroids in codebook space, `nlist * dim`
 /// * `pq` - The product quantiser the codes were encoded with
+/// * `max_bytes` - Budget; a larger table is not built
 ///
 /// ### Returns
 ///
 /// `nlist * m * k` elements, cell-major, or an empty vector when the table
-/// would exceed [`PRECOMP_TABLE_MAX_BYTES`].
-pub(crate) fn cell_terms<T: AnnSearchFloat>(centroids: &[T], pq: &ProductQuantiser<T>) -> Vec<T> {
+/// would exceed `max_bytes`.
+pub(crate) fn cell_terms<T: AnnSearchFloat>(
+    centroids: &[T],
+    pq: &ProductQuantiser<T>,
+    max_bytes: usize,
+) -> Vec<T> {
     let (m, sd, k) = (pq.m(), pq.subvec_dim(), pq.n_centroids());
     let dim = m * sd;
     let nlist = centroids.len() / dim;
-    if nlist * m * k * std::mem::size_of::<T>() > PRECOMP_TABLE_MAX_BYTES {
+    if nlist * m * k * std::mem::size_of::<T>() > max_bytes {
         return Vec::new();
     }
 
@@ -701,7 +707,7 @@ mod tests {
         )
         .unwrap();
         let centroids = noise(nlist * dim, 9);
-        let terms = cell_terms(&centroids, &pq);
+        let terms = cell_terms(&centroids, &pq, PRECOMP_TABLE_MAX_BYTES);
         assert_eq!(terms.len(), nlist * m * k);
 
         let q = noise(dim, 11);

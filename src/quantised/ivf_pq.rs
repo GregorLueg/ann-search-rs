@@ -331,7 +331,7 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx.cell_terms = cell_terms(&idx.centroids, &idx.codebook);
+        idx.cell_terms = cell_terms(&idx.centroids, &idx.codebook, PRECOMP_TABLE_MAX_BYTES);
 
         log.finish();
 
@@ -625,6 +625,21 @@ where
         Ok(scatter_self(results, self.n, return_dist))
     }
 
+    /// Set the memory budget for the precomputed residual-table terms
+    ///
+    /// The table holds `nlist * m * n_pq_centroids` values and lets a probed
+    /// cell cost one add per entry instead of a full residual-table build.
+    /// It is rebuilt or dropped straight away. The budget is not saved with
+    /// the index: a loaded index starts from the default of 256 MiB.
+    ///
+    /// ### Params
+    ///
+    /// * `max_bytes` - Largest table to keep; `0` turns the table off and
+    ///   queries build the residual table per probed cell instead
+    pub fn set_cell_terms_budget(&mut self, max_bytes: usize) {
+        self.cell_terms = cell_terms(&self.centroids, &self.codebook, max_bytes);
+    }
+
     /// Returns the size of the index in bytes
     ///
     /// ### Returns
@@ -691,7 +706,7 @@ where
 
     fn load_aux(&mut self, _dir: &std::path::Path) -> Result<(), AnnSearchErrors> {
         self.codebook.rebuild_codebooks_t();
-        self.cell_terms = cell_terms(&self.centroids, &self.codebook);
+        self.cell_terms = cell_terms(&self.centroids, &self.codebook, PRECOMP_TABLE_MAX_BYTES);
         Ok(())
     }
 }
@@ -1140,5 +1155,49 @@ mod tests {
                 assert!((a - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} vs {b}");
             }
         }
+    }
+
+    /// Turning the table off drops its memory and falls back to per-cell
+    /// residual tables; restoring the budget gives back the original results.
+    #[test]
+    fn test_cell_terms_budget_toggles_the_table() {
+        let dim = 32;
+        let data = noisy_matrix(2_000, dim, 3);
+        let mut index = IvfPqIndex::build(
+            data.as_ref(),
+            Some(16),
+            8,
+            Dist::SquaredEuclidean,
+            get_default_k_means(),
+            Some(16),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let queries = flat(&noisy_matrix(20, dim, 5));
+        let run = |idx: &IvfPqIndex<f32>| -> Vec<Vec<f32>> {
+            queries
+                .chunks_exact(dim)
+                .map(|q| idx.query(q, 10, Some(4)).unwrap().1)
+                .collect()
+        };
+
+        let with_terms = run(&index);
+        let full_bytes = index.memory_usage_bytes();
+        assert!(!index.cell_terms.is_empty());
+
+        index.set_cell_terms_budget(0);
+        assert!(index.cell_terms.is_empty());
+        assert!(index.memory_usage_bytes() < full_bytes);
+        for (a, b) in run(&index)
+            .iter()
+            .flatten()
+            .zip(with_terms.iter().flatten())
+        {
+            assert!((a - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} vs {b}");
+        }
+
+        index.set_cell_terms_budget(PRECOMP_TABLE_MAX_BYTES);
+        assert_eq!(run(&index), with_terms);
     }
 }

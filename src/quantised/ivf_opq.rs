@@ -352,7 +352,11 @@ where
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
-        idx.cell_terms = cell_terms(&idx.centroids_rotated, idx.codebook.pq());
+        idx.cell_terms = cell_terms(
+            &idx.centroids_rotated,
+            idx.codebook.pq(),
+            PRECOMP_TABLE_MAX_BYTES,
+        );
 
         log.finish();
 
@@ -661,6 +665,21 @@ where
         Ok(scatter_self(results, self.n, return_dist))
     }
 
+    /// Set the memory budget for the precomputed residual-table terms
+    ///
+    /// The table holds `nlist * m * n_pq_centroids` values and lets a probed
+    /// cell cost one add per entry instead of a full residual-table build.
+    /// It is rebuilt or dropped straight away. The budget is not saved with
+    /// the index: a loaded index starts from the default of 256 MiB.
+    ///
+    /// ### Params
+    ///
+    /// * `max_bytes` - Largest table to keep; `0` turns the table off and
+    ///   queries build the residual table per probed cell instead
+    pub fn set_cell_terms_budget(&mut self, max_bytes: usize) {
+        self.cell_terms = cell_terms(&self.centroids_rotated, self.codebook.pq(), max_bytes);
+    }
+
     /// Returns the size of the index in bytes
     ///
     /// ### Returns
@@ -728,7 +747,11 @@ where
 
     fn load_aux(&mut self, _dir: &std::path::Path) -> Result<(), AnnSearchErrors> {
         self.codebook.pq_mut().rebuild_codebooks_t();
-        self.cell_terms = cell_terms(&self.centroids_rotated, self.codebook.pq());
+        self.cell_terms = cell_terms(
+            &self.centroids_rotated,
+            self.codebook.pq(),
+            PRECOMP_TABLE_MAX_BYTES,
+        );
         Ok(())
     }
 }
