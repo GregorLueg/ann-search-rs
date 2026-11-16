@@ -18,7 +18,7 @@ use thousands::*;
 
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
-use crate::utils::k_means_utils::{assign_all_parallel, fast_random_init};
+use crate::utils::k_means_utils::{assign_all_parallel, init_centroids, KMeansInit};
 use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
 
@@ -689,6 +689,7 @@ where
 /// * `k` - Number of centroids
 /// * `metric` - `SquaredEuclidean` or `Cosine`
 /// * `params` - e-means parameters
+/// * `init` - Seeding strategy, see [`init_centroids`]
 /// * `seed` - Seed for the initialisation, shuffles and revival
 /// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
 ///
@@ -703,6 +704,7 @@ pub(crate) fn e_means_cpu<T>(
     k: usize,
     metric: &Dist,
     params: &EMeansParams,
+    init: KMeansInit,
     seed: usize,
     capture_labels: bool,
     verbosity: Verbosity,
@@ -714,7 +716,7 @@ where
     if verbosity.detailed_verbosity() {
         print_recipe(&recipe);
     }
-    let init = fast_random_init(data, dim, n, k, seed);
+    let init = init_centroids(data, dim, n, k, metric, init, seed);
 
     let mut scratch: Vec<T> = Vec::with_capacity(recipe.batch_size * dim);
     let mut order: Vec<u32> = Vec::with_capacity(recipe.batch_size);
@@ -994,6 +996,7 @@ mod tests {
             2,
             &Dist::SquaredEuclidean,
             &EMeansParams::default(),
+            KMeansInit::Random,
             42,
             true,
             Verbosity::Quiet,
@@ -1019,6 +1022,7 @@ mod tests {
                 k,
                 &Dist::SquaredEuclidean,
                 &p,
+                KMeansInit::Random,
                 7,
                 false,
                 Verbosity::Quiet,
@@ -1043,6 +1047,7 @@ mod tests {
             10,
             &Dist::SquaredEuclidean,
             &EMeansParams::default(),
+            KMeansInit::Random,
             1,
             false,
             Verbosity::Quiet,
@@ -1050,5 +1055,44 @@ mod tests {
         .unwrap();
         assert_eq!(cents.len(), 20);
         assert!(cents.iter().all(|v| v.is_finite()));
+    }
+
+    /// Random rows can seed two centroids in one blob and none in another,
+    /// and revival never repairs that: the merged centroid is heavy and the
+    /// split pair is not starved. k-means|| seeding puts one centroid in every
+    /// well-separated blob.
+    #[test]
+    fn test_e_means_cpu_kmeans_parallel_seeds_every_blob() {
+        let centres: Vec<[f32; 2]> = (0..8)
+            .map(|i| [(i % 4) as f32 * 30.0, (i / 4) as f32 * 30.0])
+            .collect();
+        let data = blobs(300, &centres, 4);
+        for seed in 0..8 {
+            let (cents, _) = e_means_cpu(
+                &data,
+                2,
+                2400,
+                8,
+                &Dist::SquaredEuclidean,
+                &EMeansParams::default(),
+                KMeansInit::KMeansParallel,
+                seed,
+                false,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            let mut hits = [0usize; 8];
+            for c in cents.chunks(2) {
+                let nearest = (0..8)
+                    .min_by(|&a, &b| {
+                        let da = (c[0] - centres[a][0]).powi(2) + (c[1] - centres[a][1]).powi(2);
+                        let db = (c[0] - centres[b][0]).powi(2) + (c[1] - centres[b][1]).powi(2);
+                        da.total_cmp(&db)
+                    })
+                    .unwrap();
+                hits[nearest] += 1;
+            }
+            assert_eq!(hits, [1; 8], "seed {seed}: centroids per blob {hits:?}");
+        }
     }
 }

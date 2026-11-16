@@ -158,7 +158,7 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 
 ### k-means and batched queries
 
-- Every IVF-family index trains with `KMeansTrainingParams` (CPU) or `KMeansGpuParams` (wgpu, MLX), whose `algorithm` is `KMeansAlgorithm::EMeans(EMeansParams)` by default; `Lloyd` is opt-in, and `iters`, `init` and balancing only apply to it.
+- Every IVF-family index trains with `KMeansTrainingParams` (CPU) or `KMeansGpuParams` (wgpu, MLX), whose `algorithm` is `KMeansAlgorithm::EMeans(EMeansParams)` by default; `Lloyd` is opt-in, and `iters` and balancing only apply to it. Both seed through `init`: k-means|| up to 200 centroids, random rows above. e-means revival only resets starved clusters, so it cannot repair a bad seed (one centroid across two blobs, two centroids in one).
 - `query_batch` on CPU IVF, kMkNN and all six PQ/OPQ indices (exhaustive, IVF, SOAR) takes a cell-grouped or tiled batched path from a minimum query count up and falls back to per-query search below it.
 - IVF and SOAR PQ/OPQ precompute a per-cell lookup-table term, `nlist * m * 256 * sizeof(T)` bytes, skipped above 256 MiB. It is rebuilt on load and not serialised.
 

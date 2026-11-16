@@ -14,8 +14,6 @@
 //! Balancing, when asked for, is the exception: [`adjust_centers`] runs on the
 //! host and costs one sync per iteration.
 
-use rayon::prelude::*;
-
 use crate::mlx::exhaustive_mlx::RowTopK;
 use crate::mlx::ffi::*;
 use crate::prelude::*;
@@ -183,6 +181,7 @@ fn upload_tiles(data: &[f32], dim: usize, tile: usize) -> Vec<(Array, usize)> {
 /// The within-cluster sum of squares
 #[cfg(test)]
 pub(crate) fn inertia(data: &[f32], dim: usize, centroids: &[f32], assignments: &[u32]) -> f64 {
+    use rayon::prelude::*;
     data.par_chunks_exact(dim)
         .zip(assignments.par_iter())
         .map(|(x, &c)| {
@@ -244,6 +243,8 @@ pub fn train_centroids_mlx(
         });
     }
     let params = params.unwrap_or_default();
+    let init = resolve_init(params.init, n_centroids);
+    let seeded = init_centroids(data, dim, n, n_centroids, metric, init, seed);
 
     if let KMeansAlgorithm::EMeans(em) = params.algorithm {
         if verbosity.normal_verbosity() {
@@ -252,28 +253,23 @@ pub fn train_centroids_mlx(
                 n_centroids.separate_with_underscores()
             );
         }
-        let centroids = e_means_mlx(data, dim, n, n_centroids, metric, &em, seed, s, verbosity)?;
+        let centroids = e_means_mlx(
+            data,
+            dim,
+            n,
+            n_centroids,
+            metric,
+            &em,
+            &seeded,
+            seed,
+            s,
+            verbosity,
+        )?;
         if verbosity.normal_verbosity() {
             println!("... trained e-means in {:.2?}", start.elapsed());
         }
         return Ok(centroids);
     }
-
-    let init = params.init.unwrap_or(if n_centroids > 200 {
-        KMeansInit::Random
-    } else {
-        KMeansInit::KMeansParallel
-    });
-    let init_centroids = match init {
-        KMeansInit::Random => fast_random_init(data, dim, n, n_centroids, seed),
-        KMeansInit::KMeansParallel => {
-            let norms: Vec<f32> = data
-                .par_chunks_exact(dim)
-                .map(f32::calculate_l2_norm)
-                .collect();
-            kmeans_parallel_init(data, &norms, dim, n, n_centroids, metric, seed)
-        }
-    };
     if verbosity.normal_verbosity() {
         println!(
             "Training k-means on MLX ({} centroids) ...",
@@ -306,7 +302,7 @@ pub fn train_centroids_mlx(
 
     let zero = Array::scalar_f32(0.0);
     let one = Array::scalar_f32(1.0);
-    let mut c = Array::from_f32(&init_centroids, &[k, dim as i32]);
+    let mut c = Array::from_f32(&seeded, &[k, dim as i32]);
 
     for iter in 0..params.iters {
         let ops = CentroidOperands::new(&c, n_centroids, metric, s)?;
@@ -384,6 +380,7 @@ pub fn train_centroids_mlx(
 /// * `n_centroids` - Number of centroids
 /// * `metric` - Euclidean or Cosine
 /// * `em` - e-means parameters
+/// * `init` - Initial `n_centroids * dim` centroids
 /// * `seed` - Seed for the initialisation, shuffles and revival
 /// * `s` - Stream to run on
 /// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
@@ -399,6 +396,7 @@ fn e_means_mlx(
     n_centroids: usize,
     metric: &Dist,
     em: &EMeansParams,
+    init: &[f32],
     seed: usize,
     s: &Stream,
     verbosity: Verbosity,
@@ -422,7 +420,7 @@ fn e_means_mlx(
     let xa = Array::from_f32(&aug, &[n as i32, d1]);
     drop(aug);
 
-    let mut c = Array::from_f32(&fast_random_init(data, dim, n, n_centroids, seed), &[k, d]);
+    let mut c = Array::from_f32(init, &[k, d]);
     let mut usage = Array::from_f32(&vec![INIT_USAGE as f32; n_centroids], &[k, 1]);
     let mut pass = Array::zeros(&[k, d1], MLX_FLOAT32, s)?;
     let mut perm: Vec<u32> = (0..n as u32).collect();

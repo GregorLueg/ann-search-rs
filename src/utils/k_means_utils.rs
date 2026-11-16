@@ -317,7 +317,7 @@ pub enum LloydPath {
 /// ### Returns
 ///
 /// The [KMeansInit]
-fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
+pub(crate) fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
     init.unwrap_or({
         if n_centroids > 200 {
             KMeansInit::Random
@@ -325,6 +325,48 @@ fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
             KMeansInit::KMeansParallel
         }
     })
+}
+
+/// Seed `k` centroids on the host, by random rows or by k-means||.
+///
+/// Shared by Lloyd's and e-means on the CPU and by the MLX backend, so every
+/// host-seeded k-means starts from the same centroids at the same seed.
+///
+/// ### Params
+///
+/// * `data` - Row-major training data, `n * dim`
+/// * `dim` - Dimensionality
+/// * `n` - Number of training rows
+/// * `k` - Number of centroids
+/// * `metric` - Distance metric, used by k-means||
+/// * `init` - Seeding strategy, see [`resolve_init`]
+/// * `seed` - Random seed
+///
+/// ### Returns
+///
+/// `k * dim` initial centroids
+pub(crate) fn init_centroids<T>(
+    data: &[T],
+    dim: usize,
+    n: usize,
+    k: usize,
+    metric: &Dist,
+    init: KMeansInit,
+    seed: usize,
+) -> Vec<T>
+where
+    T: AnnSearchFloat,
+{
+    match init {
+        KMeansInit::Random => fast_random_init(data, dim, n, k, seed),
+        KMeansInit::KMeansParallel => {
+            let norms: Vec<T> = data[..n * dim]
+                .par_chunks_exact(dim)
+                .map(T::calculate_l2_norm)
+                .collect();
+            kmeans_parallel_init(data, &norms, dim, n, k, metric, seed)
+        }
+    }
 }
 
 /// Resolve Lloyd's path
@@ -374,9 +416,9 @@ pub struct KMeansTrainingParams {
     /// Off by default: it changes the partition, so turning it on shifts the
     /// results of every index built on top of this k-means.
     pub balanced: bool,
-    /// Lloyd's or e-means. Under [`KMeansAlgorithm::EMeans`], `iters`, `init`,
-    /// `path` and `balanced` are ignored: e-means seeds at random, runs its
-    /// own epoch budget and revives starved clusters itself.
+    /// Lloyd's or e-means. Both seed through `init`. Under
+    /// [`KMeansAlgorithm::EMeans`], `iters`, `path` and `balanced` are ignored:
+    /// e-means runs its own epoch budget and revives starved clusters itself.
     pub algorithm: KMeansAlgorithm,
 }
 
@@ -3343,6 +3385,7 @@ where
             n_centroids,
             metric,
             &em,
+            resolve_init(params.init, n_centroids),
             seed,
             false,
             verbosity,
@@ -3380,22 +3423,7 @@ where
 
     let init_method = resolve_init(params.init, n_centroids);
 
-    let mut centroids = match init_method {
-        KMeansInit::Random => fast_random_init(data, dim, n, n_centroids, seed),
-        KMeansInit::KMeansParallel => {
-            let init_norms: Vec<T> = match metric {
-                Dist::SquaredEuclidean => (0..n)
-                    .into_par_iter()
-                    .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
-                    .collect(),
-                Dist::Cosine => data_norms.clone(),
-                Dist::Manhattan => {
-                    unreachable!("Manhattan distance not reachable for train_centroids().")
-                }
-            };
-            kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
-        }
-    };
+    let mut centroids = init_centroids(data, dim, n, n_centroids, metric, init_method, seed);
 
     if verbosity.detailed_verbosity() {
         let how = match init_method {

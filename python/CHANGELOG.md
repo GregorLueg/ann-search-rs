@@ -14,6 +14,7 @@ Requires `ann-search-rs` 0.13.0
   `ValueError` otherwise; before, passing `kmeans_iters` quietly switched to
   Lloyd's and `kmeans_balanced` alone was ignored.
 - GPU IVF Lloyd's defaults to 30 iterations instead of 50.
+- e-means seeds with k-means|| for up to 200 centroids, like Lloyd's.
 - Faster IVF and kMkNN queries, faster PQ/OPQ builds and queries, and a faster
   NSG build (its NN-Descent kNN graph), all from `ann-search-rs` 0.13.0.
   PQ/OPQ distances differ at rounding level; NSG differs at the same seed.

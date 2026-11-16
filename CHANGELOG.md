@@ -13,6 +13,9 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `with_algorithm(KMeansAlgorithm::Lloyd)` or `KMeansTrainingParams::new` /
   `KMeansGpuParams::new`.
 - GPU Lloyd's defaults to 30 fixed iterations instead of 50.
+- e-means seeds through `init` like Lloyd's: k-means|| for up to 200
+  centroids, random rows above. Results differ at the same seed wherever
+  `nlist <= 200`.
 - `build_knn_graph_nndescent()` no longer returns the same graph as
   `extract_knn` on an NN-Descent index at the same seed. Recall is unchanged.
 

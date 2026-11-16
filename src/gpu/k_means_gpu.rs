@@ -130,8 +130,9 @@ pub struct KMeansGpuParams {
     pub quantise_to_f16: bool,
     /// Reseed starved centroids each iteration, RAFT-style.
     pub balanced: bool,
-    /// Lloyd's or e-means. Under [`KMeansAlgorithm::EMeans`], `iters`, `init`,
-    /// `fixed` and `balanced` are ignored; `quantise_to_f16` still applies.
+    /// Lloyd's or e-means. Both seed through `init`. Under
+    /// [`KMeansAlgorithm::EMeans`], `iters`, `fixed` and `balanced` are
+    /// ignored; `quantise_to_f16` still applies.
     pub algorithm: KMeansAlgorithm,
 }
 
@@ -2241,7 +2242,6 @@ where
 ///
 /// * `client` - CubeCL compute client
 /// * `data_gpu` - Data on device `[n, dim_padded]` in `S`
-/// * `data_host` - The same data on the host in `A`, for the initialisation
 /// * `pnorm_gpu` - Point L2 norms `[n]` under cosine, a dummy otherwise
 /// * `n` - Number of data points
 /// * `n_centroids` - Number of centroids
@@ -2249,7 +2249,8 @@ where
 /// * `dim_padded` - Padded dimension, a multiple of `LINE_SIZE`
 /// * `dist` - Distance metric
 /// * `em` - e-means parameters
-/// * `seed` - Seed for the initialisation, shuffles and revival
+/// * `init` - Initial centroids `[n_centroids, dim_padded]` in `A`
+/// * `seed` - Seed for the shuffles and revival
 /// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
 ///
 /// ### Returns
@@ -2259,7 +2260,6 @@ where
 fn run_e_means_gpu<S, A>(
     client: &Client,
     data_gpu: &GpuTensor<S>,
-    data_host: &[A],
     pnorm_gpu: &GpuTensor<A>,
     n: usize,
     n_centroids: usize,
@@ -2267,6 +2267,7 @@ fn run_e_means_gpu<S, A>(
     dim_padded: usize,
     dist: &Dist,
     em: &EMeansParams,
+    init: &[A],
     seed: usize,
     verbosity: Verbosity,
 ) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
@@ -2286,11 +2287,7 @@ where
     let bsz = recipe.batch_size;
     let cube_count = bsz.div_ceil(HIST_ROWS_PER_CUBE).clamp(1, HIST_MAX_CUBES);
 
-    let mut cent_gpu = GpuTensor::<A>::from_slice(
-        &fast_random_init(data_host, dp, n, k, seed),
-        vec![k, dp],
-        client,
-    )?;
+    let mut cent_gpu = GpuTensor::<A>::from_slice(init, vec![k, dp], client)?;
     let mut usage_gpu = GpuTensor::<A>::from_slice(&vec![to_a(INIT_USAGE); k], vec![k], client)?;
     let pass_sums = GpuTensor::<A>::from_slice(&vec![A::zero(); k * dp], vec![k, dp], client)?;
     let pass_counts = GpuTensor::<u32>::from_slice(&vec![0u32; k], vec![k], client)?;
@@ -2557,23 +2554,6 @@ where
     S: Float + cubecl::CubeElement,
     A: Float + cubecl::CubeElement + num_traits::Float + AnnSearchFloat,
 {
-    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
-        return run_e_means_gpu::<S, A>(
-            client,
-            data_gpu,
-            data_host,
-            pnorm_gpu,
-            n,
-            n_centroids,
-            dim,
-            dim_padded,
-            dist,
-            &em,
-            seed,
-            verbosity,
-        );
-    }
-
     let centroids = match init_method {
         KMeansInit::Random => fast_random_init(data_host, dim_padded, n, n_centroids, seed),
         KMeansInit::KMeansParallel => kmeans_parallel_init_gpu::<S, A>(
@@ -2596,6 +2576,23 @@ where
             KMeansInit::KMeansParallel => "k-means|| on the GPU",
         };
         println!(" Initialised centroids via {how}");
+    }
+
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        return run_e_means_gpu::<S, A>(
+            client,
+            data_gpu,
+            pnorm_gpu,
+            n,
+            n_centroids,
+            dim,
+            dim_padded,
+            dist,
+            &em,
+            &centroids,
+            seed,
+            verbosity,
+        );
     }
 
     let cent_gpu = GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
@@ -2888,15 +2885,7 @@ where
     };
 
     let e_means = matches!(params.algorithm, KMeansAlgorithm::EMeans(_));
-    let init_method = if e_means {
-        KMeansInit::Random
-    } else {
-        params.init.unwrap_or(if n_centroids > 200 {
-            KMeansInit::Random
-        } else {
-            KMeansInit::KMeansParallel
-        })
-    };
+    let init_method = resolve_init(params.init, n_centroids);
 
     // Norms are needed by the cosine assignment kernel and by the k-means||
     // initialisation, so compute them once. They depend only on the data, so
