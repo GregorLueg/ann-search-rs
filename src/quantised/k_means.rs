@@ -34,12 +34,78 @@ pub(crate) fn transpose_centroids<T: Float>(centroids: &[T], dim: usize, k: usiz
     }
 }
 
-/// Find nearest centroid against dimension-major centroids.
+/// Squared Euclidean distance from one vector to every dimension-major centroid
 ///
 /// The inner loop runs over centroids with independent accumulators, so it
 /// vectorises across centroids at any `dim`. Each centroid still sums its
 /// squared differences in dimension order, so the result is bit-identical to
 /// a plain row-by-row scalar scan.
+///
+/// ### Params
+///
+/// * `vec` - The vector, length `dim`
+/// * `centroids_t` - Dimension-major centroids from [`transpose_centroids`]
+/// * `k` - Number of centroids
+/// * `dist` - Output of length `k`
+#[inline(always)]
+pub(crate) fn sq_dists_transposed<T: Float>(
+    vec: &[T],
+    centroids_t: &[T],
+    k: usize,
+    dist: &mut [T],
+) {
+    // seed from dimension 0 rather than zero-filling: `0 + x == x` exactly
+    let q0 = vec[0];
+    for (acc, &c) in dist.iter_mut().zip(&centroids_t[..k]) {
+        let diff = q0 - c;
+        *acc = diff * diff;
+    }
+    for (d, &q) in vec.iter().enumerate().skip(1) {
+        let row = &centroids_t[d * k..(d + 1) * k];
+        for (acc, &c) in dist.iter_mut().zip(row) {
+            let diff = q - c;
+            *acc = *acc + diff * diff;
+        }
+    }
+}
+
+/// Scaled dot product of one vector with every dimension-major centroid
+///
+/// Same loop shape as [`sq_dists_transposed`], so it vectorises across
+/// centroids. `out[c] = factor * <vec, centroid_c>`; the factor is folded into
+/// the vector entries so it costs `dim` multiplies, not `k`.
+///
+/// ### Params
+///
+/// * `vec` - The vector, length `dim`
+/// * `centroids_t` - Dimension-major centroids from [`transpose_centroids`]
+/// * `k` - Number of centroids
+/// * `factor` - Scale applied to every dot product
+/// * `out` - Output of length `k`
+#[inline(always)]
+pub(crate) fn dots_transposed<T: Float>(
+    vec: &[T],
+    centroids_t: &[T],
+    k: usize,
+    factor: T,
+    out: &mut [T],
+) {
+    let q0 = factor * vec[0];
+    for (acc, &c) in out.iter_mut().zip(&centroids_t[..k]) {
+        *acc = q0 * c;
+    }
+    for (d, &q) in vec.iter().enumerate().skip(1) {
+        let q = factor * q;
+        let row = &centroids_t[d * k..(d + 1) * k];
+        for (acc, &c) in out.iter_mut().zip(row) {
+            *acc = *acc + q * c;
+        }
+    }
+}
+
+/// Find nearest centroid against dimension-major centroids.
+///
+/// [`sq_dists_transposed`] followed by a lane-wise argmin.
 ///
 /// ### Params
 ///
@@ -58,19 +124,7 @@ pub(crate) fn find_nearest_transposed<T: Float>(
     k: usize,
     dist: &mut [T],
 ) -> usize {
-    // seed from dimension 0 rather than zero-filling: `0 + x == x` exactly
-    let q0 = vec[0];
-    for (acc, &c) in dist.iter_mut().zip(&centroids_t[..k]) {
-        let diff = q0 - c;
-        *acc = diff * diff;
-    }
-    for (d, &q) in vec.iter().enumerate().skip(1) {
-        let row = &centroids_t[d * k..(d + 1) * k];
-        for (acc, &c) in dist.iter_mut().zip(row) {
-            let diff = q - c;
-            *acc = *acc + diff * diff;
-        }
-    }
+    sq_dists_transposed(vec, centroids_t, k, dist);
     argmin_lanes(dist)
 }
 

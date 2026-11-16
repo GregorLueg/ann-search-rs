@@ -2271,11 +2271,8 @@ pub fn query_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("Exhaustive-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2379,11 +2376,8 @@ pub fn query_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("Exhaustive-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3020,11 +3014,8 @@ pub fn query_soar_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("SOAR-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3087,11 +3078,8 @@ pub fn query_soar_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("SOAR-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3156,11 +3144,8 @@ pub fn query_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3287,11 +3272,8 @@ pub fn query_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]

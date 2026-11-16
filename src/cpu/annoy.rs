@@ -243,7 +243,12 @@ impl<T: AnnSearchFloat> SeedTree<'_, T> {
                 let left_seed: u64 = node.rng.random();
                 let right_seed: u64 = node.rng.random();
                 self.place(node.start, n_left, left_seed, local_max);
-                self.place(node.start + n_left, node.len - n_left, right_seed, local_max);
+                self.place(
+                    node.start + n_left,
+                    node.len - n_left,
+                    right_seed,
+                    local_max,
+                );
             } else if node.attempts >= SPLIT_ATTEMPTS {
                 self.leaves.push((node.start, node.len));
             } else {
@@ -524,7 +529,11 @@ where
                         &mut rng,
                         metric,
                     );
-                    let leaves = parts.nodes.iter().filter_map(|nd| nd.leaf_range()).collect();
+                    let leaves = parts
+                        .nodes
+                        .iter()
+                        .filter_map(|nd| nd.leaf_range())
+                        .collect();
                     (t, leaves)
                 },
             )

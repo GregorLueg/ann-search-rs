@@ -1558,7 +1558,10 @@ where
         }
         builder.vectors_flat = permute_rows(&builder.vectors_flat, dim, &old_to_new);
         if !builder.norms.is_empty() {
-            builder.norms = old_to_new.iter().map(|&i| builder.norms[i as usize]).collect();
+            builder.norms = old_to_new
+                .iter()
+                .map(|&i| builder.norms[i as usize])
+                .collect();
         }
         builder.graph = vec![(SENTINEL_PID as u32, T::max_value()); n * k];
         builder

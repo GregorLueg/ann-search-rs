@@ -12,6 +12,7 @@ pub mod ivf_opq;
 pub mod ivf_pq;
 pub mod ivf_sq8;
 pub mod k_means;
+pub(crate) mod pq_search;
 pub mod quantisers;
 pub mod soar_opq;
 pub mod soar_pq;

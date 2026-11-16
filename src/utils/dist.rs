@@ -6649,7 +6649,7 @@ where
 
     /// Compute distance using ADC lookup tables
     ///
-    /// Optimised with manual unrolling and unsafe indexing for small m
+    /// Same four-accumulator kernel the query paths use.
     ///
     /// ### Params
     ///
@@ -6662,51 +6662,8 @@ where
     #[inline(always)]
     fn compute_distance_adc(&self, vec_idx: usize, lookup_table: &[T]) -> T {
         let m = self.codebook_m();
-        let n_cents = self.codebook_n_centroids();
-        let codes_start = vec_idx * m;
-        let codes = &self.quantised_codes()[codes_start..codes_start + m];
-
-        // manual unrolling for common small m values with unsafe indexing
-        match m {
-            8 => {
-                let mut sum = T::zero();
-                for i in 0..8 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            16 => {
-                let mut sum = T::zero();
-                for i in 0..16 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            32 => {
-                let mut sum = T::zero();
-                for i in 0..32 {
-                    let code = unsafe { *codes.get_unchecked(i) } as usize;
-                    let offset = i * n_cents + code;
-                    sum = sum + unsafe { *lookup_table.get_unchecked(offset) };
-                }
-                sum
-            }
-            _ => {
-                // Generic fallback for other m values
-                codes
-                    .iter()
-                    .enumerate()
-                    .map(|(subspace, &code)| {
-                        let offset = subspace * n_cents + (code as usize);
-                        lookup_table[offset]
-                    })
-                    .fold(T::zero(), |acc, x| acc + x)
-            }
-        }
+        let codes = &self.quantised_codes()[vec_idx * m..(vec_idx + 1) * m];
+        crate::quantised::pq_search::adc_dist(codes, lookup_table, self.codebook_n_centroids())
     }
 }
 

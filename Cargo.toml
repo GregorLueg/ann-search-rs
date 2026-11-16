@@ -275,6 +275,11 @@ path = "benches/profile_kmeans.rs"
 name = "profile_vamana"
 path = "benches/profile_vamana.rs"
 
+[[example]]
+name = "profile_pq_query"
+path = "benches/profile_pq_query.rs"
+required-features = ["quantised"]
+
 ##################
 # Other examples #
 ##################

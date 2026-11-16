@@ -4,12 +4,13 @@
 
 use faer::RowRef;
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
 use thousands::*;
 
 use crate::prelude::*;
+use crate::quantised::pq_search::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::pack_knn_results;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -42,6 +43,11 @@ pub struct IvfPqIndex<T> {
     nlist: usize,
     /// Original indices
     original_ids: Vec<u32>,
+    /// Precomputed per-cell residual-table terms, see [`cell_terms`]. Empty
+    /// when over [`PRECOMP_TABLE_MAX_BYTES`]. Derived, so not serialised and
+    /// rebuilt on load.
+    #[cfg_attr(feature = "serialise", serde(skip, default = "Vec::new"))]
+    cell_terms: Vec<T>,
 }
 
 //////////////////////
@@ -320,31 +326,130 @@ where
             metric,
             centroids_norm: Vec::new(),
             original_ids: Vec::new(),
+            cell_terms: Vec::new(),
         };
 
         let new_to_old = idx.optimise_memory_layout();
         idx.original_ids = new_to_old;
+        idx.cell_terms = cell_terms(&idx.centroids, &idx.codebook);
 
         log.finish();
 
         Ok(idx)
     }
 
+    /// Residual ADC view over this index
+    ///
+    /// ### Returns
+    ///
+    /// The shared IVF scan state, see [`IvfAdc`]
+    fn adc(&self) -> IvfAdc<'_, T> {
+        IvfAdc {
+            centroids: &self.centroids,
+            books_t: self.codebook.codebooks_t(),
+            cell_terms: &self.cell_terms,
+            codes: &self.quantised_codes,
+            offsets: &self.offsets,
+            dim: self.dim,
+            m: self.codebook.m(),
+            sd: self.codebook.subvec_dim(),
+            k: self.codebook.n_centroids(),
+            scale: lut_scale(self.metric),
+        }
+    }
+
+    /// Scratch for one thread
+    ///
+    /// ### Returns
+    ///
+    /// Buffers sized for this index
+    fn scratch(&self) -> AdcScratch<T> {
+        AdcScratch::new(self.dim, self.codebook.m(), self.codebook.n_centroids())
+    }
+
+    /// Resolve the probe count
+    ///
+    /// ### Params
+    ///
+    /// * `nprobe` - Requested cells, `sqrt(nlist)` when `None`
+    ///
+    /// ### Returns
+    ///
+    /// Cells to probe, at most `nlist`
+    fn resolve_nprobe(&self, nprobe: Option<usize>) -> usize {
+        nprobe
+            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
+            .min(self.nlist)
+    }
+
+    /// Copy a query into `out` and normalise it under cosine
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query, length `dim`
+    /// * `out` - Output, length `dim`
+    #[inline]
+    fn prepare(&self, q: &[T], out: &mut [T]) {
+        out.copy_from_slice(q);
+        if self.metric == Dist::Cosine {
+            normalise_vector(out);
+        }
+    }
+
+    /// Probe list of a prepared query
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query in codebook space
+    /// * `nprobe` - Requested cells
+    /// * `k` - Neighbours the probe list has to reach
+    /// * `buf` - Scratch for the centroid scores
+    ///
+    /// ### Returns
+    ///
+    /// Cell ids, nearest first
+    #[inline]
+    fn probe(&self, q: &[T], nprobe: usize, k: usize, buf: &mut Vec<(T, usize)>) -> Vec<usize> {
+        probe_cells(q, &self.centroids, self.dim, &self.offsets, nprobe, k, buf)
+    }
+
+    /// Score the query held in `s.q` against its probed cells
+    ///
+    /// ### Params
+    ///
+    /// * `probes` - Cells to scan
+    /// * `k` - Neighbours to return
+    /// * `s` - Scratch holding the prepared query
+    ///
+    /// ### Returns
+    ///
+    /// `(original ids, distances)`, nearest first
+    fn search_prepared(
+        &self,
+        probes: &[usize],
+        k: usize,
+        s: &mut AdcScratch<T>,
+    ) -> (Vec<usize>, Vec<T>) {
+        s.heap.reset(k);
+        self.adc().search(probes, s, |_| false);
+        finish_heap(&mut s.heap, Some(&self.original_ids))
+    }
+
     /// Query the index for approximate nearest neighbours
     ///
-    /// Uses asymmetric distance computation (ADC): builds lookup tables
-    /// from query subvectors to all centroids, then computes distances
-    /// via table lookups.
+    /// Uses asymmetric distance computation (ADC). With the precomputed cell
+    /// terms, one query-only table is built and each probed cell adds its
+    /// precomputed term to it; otherwise the residual table is built per cell.
     ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector
     /// * `k` - Number of neighbours to return
-    /// * `nprobe` - Number of clusters to search (defaults to 15% of nlist)
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
     ///
     /// ### Returns
     ///
-    /// Tuple of (indices, distances) sorted by
+    /// Tuple of (indices, distances) sorted by distance
     #[inline]
     pub fn query(
         &self,
@@ -353,65 +458,78 @@ where
         nprobe: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.check_dim(query_vec.len())?;
-
-        let mut query_vec = query_vec.to_vec();
-
-        if self.metric == Dist::Cosine {
-            normalise_vector(&mut query_vec);
-        }
-
-        let nprobe = nprobe
-            .unwrap_or_else(|| ((self.nlist as f64).sqrt() as usize).max(1))
-            .min(self.nlist);
+        let nprobe = self.resolve_nprobe(nprobe);
         let k = k.min(self.n);
 
-        // Find top nprobe centroids, expanding to cover >= k reachable vectors.
-        let mut cluster_scores: Vec<(T, usize)> = self.get_centroids_prenorm(&query_vec, nprobe);
-        let probed = select_probed_clusters(&mut cluster_scores, &self.offsets, nprobe, k);
+        let mut s = self.scratch();
+        self.prepare(query_vec, &mut s.q);
+        let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
+        Ok(self.search_prepared(&probes, k, &mut s))
+    }
 
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
+    /// Query many vectors at once
+    ///
+    /// From `BATCH_MIN_QUERIES` queries up, every query is probed first and
+    /// the queries are then scored in nearest-cell order (see
+    /// `run_ordered`); below it, one query per task. Both give identical
+    /// results.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Row-major queries, `nq * query_dim`
+    /// * `query_dim` - Query dimensionality, must match the index
+    /// * `k` - Number of neighbours to return
+    /// * `nprobe` - Number of clusters to search (defaults to `sqrt(nlist)`)
+    /// * `return_dist` - Whether to return distances
+    /// * `verbosity` - Prints start, progress and end at `Normal`
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)`, one row per query
+    pub fn query_batch(
+        &self,
+        queries: &[T],
+        query_dim: usize,
+        k: usize,
+        nprobe: Option<usize>,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        self.check_dim(query_dim)?;
+        let dim = self.dim;
+        let nq = queries.len() / dim;
+        let nprobe = self.resolve_nprobe(nprobe);
+        let k = k.min(self.n);
+        let progress = QueryProgress::new("IVF-PQ index", nq, false, verbosity);
 
-        for cluster_idx in probed {
-            let lookup_tables = self.build_lookup_tables_residual(&query_vec, cluster_idx);
-
-            let start = self.offsets[cluster_idx] as usize;
-            let end = self.offsets[cluster_idx + 1] as usize;
-
-            let mut worst_dist = if heap.len() >= k {
-                heap.peek().unwrap().0 .0
-            } else {
-                T::infinity()
-            };
-
-            for vec_idx in start..end {
-                let dist = self.compute_distance_adc(vec_idx, &lookup_tables);
-
-                if dist >= worst_dist {
-                    continue;
-                }
-
-                if heap.len() < k {
-                    heap.push((OrderedFloat(dist), vec_idx));
-                    if heap.len() == k {
-                        worst_dist = heap.peek().unwrap().0 .0;
-                    }
-                } else {
-                    heap.pop();
-                    heap.push((OrderedFloat(dist), vec_idx));
-                    worst_dist = heap.peek().unwrap().0 .0;
-                }
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-
-        let (distances, indices) = results
-            .into_iter()
-            .map(|(d, i)| (d.0, self.original_ids[i] as usize))
-            .unzip();
-
-        Ok((indices, distances))
+        let results = if nq >= BATCH_MIN_QUERIES {
+            run_ordered(
+                nq,
+                dim,
+                || self.scratch(),
+                |i, q, s| {
+                    self.prepare(&queries[i * dim..(i + 1) * dim], q);
+                    self.probe(q, nprobe, k, &mut s.probe_buf)
+                },
+                |probes, s| self.search_prepared(probes, k, s),
+                &progress,
+            )
+        } else {
+            (0..nq)
+                .into_par_iter()
+                .map_init(
+                    || self.scratch(),
+                    |s, i| {
+                        self.prepare(&queries[i * dim..(i + 1) * dim], &mut s.q);
+                        let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
+                        progress.tick();
+                        self.search_prepared(&probes, k, s)
+                    },
+                )
+                .collect()
+        };
+        progress.finish();
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Query using a matrix row reference
@@ -444,8 +562,10 @@ where
 
     /// Generate kNN graph from vectors stored in the index
     ///
-    /// Reconstructs each vector (centroid + decoded residual) and uses ADC
-    /// for accurate distance computation across clusters.
+    /// Reconstructs each point in codebook space (centroid plus decoded
+    /// residual) from its code row and queries with it. Positions
+    /// are walked in storage order, which is cell order, so consecutive
+    /// queries on a thread share their cells.
     ///
     /// ### Params
     ///
@@ -465,55 +585,44 @@ where
         return_dist: bool,
         verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
-        let m = self.codebook.m();
+        let (m, dim) = (self.codebook.m(), self.dim);
+        let nprobe = self.resolve_nprobe(nprobe);
+        let k = k.min(self.n);
         let progress = QueryProgress::new("IVF-PQ index", self.n, true, verbosity);
 
-        let mut cluster_assignments = vec![0usize; self.n];
-        for cluster_idx in 0..self.nlist {
-            let start = self.offsets[cluster_idx] as usize;
-            let end = self.offsets[cluster_idx + 1] as usize;
-            for new_idx in start..end {
-                cluster_assignments[new_idx] = cluster_idx;
+        let n_pos = self.quantised_codes.len() / m;
+        let mut pos_cell = vec![0u32; n_pos];
+        for cell in 0..self.nlist {
+            for p in self.offsets[cell] as usize..self.offsets[cell + 1] as usize {
+                pos_cell[p] = cell as u32;
             }
         }
 
-        let unordered_results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..self.n)
+        let results: Vec<(usize, Vec<usize>, Vec<T>)> = (0..n_pos)
             .into_par_iter()
-            .map(|i| {
-                let my_cluster = cluster_assignments[i];
-                let codes = &self.quantised_codes[i * m..(i + 1) * m];
-
-                let my_centroid =
-                    &self.centroids[my_cluster * self.dim..(my_cluster + 1) * self.dim];
-                let residual = self.codebook.decode(codes);
-                let reconstructed: Vec<T> = T::add_simd(my_centroid, &residual);
-
-                let orig_id = self.original_ids[i] as usize;
-
-                progress.tick();
-
-                let (indices, dists) = self.query(&reconstructed, k, nprobe)?;
-                Ok((orig_id, indices, dists))
-            })
-            .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
+            .map_init(
+                || self.scratch(),
+                |s, i| {
+                    let c = pos_cell[i] as usize;
+                    self.codebook
+                        .decode_into(&self.quantised_codes[i * m..(i + 1) * m], &mut s.q);
+                    let centroid = &self.centroids[c * dim..(c + 1) * dim];
+                    for (v, &cv) in s.q.iter_mut().zip(centroid) {
+                        *v = *v + cv;
+                    }
+                    if self.metric == Dist::Cosine {
+                        normalise_vector(&mut s.q);
+                    }
+                    let probes = self.probe(&s.q, nprobe, k, &mut s.probe_buf);
+                    progress.tick();
+                    let (ids, dists) = self.search_prepared(&probes, k, s);
+                    (self.original_ids[i] as usize, ids, dists)
+                },
+            )
+            .collect();
         progress.finish();
 
-        let mut final_indices = vec![Vec::new(); self.n];
-        let mut final_dists = if return_dist {
-            Some(vec![Vec::new(); self.n])
-        } else {
-            None
-        };
-
-        for (orig_id, indices, dists) in unordered_results {
-            final_indices[orig_id] = indices;
-            if let Some(ref mut fd) = final_dists {
-                fd[orig_id] = dists;
-            }
-        }
-
-        fix_neg_dist(&mut final_dists);
-        Ok((final_indices, final_dists))
+        Ok(scatter_self(results, self.n, return_dist))
     }
 
     /// Returns the size of the index in bytes
@@ -528,6 +637,7 @@ where
             + self.centroids_norm.capacity() * std::mem::size_of::<T>()
             + self.all_indices.capacity() * std::mem::size_of::<u32>()
             + self.offsets.capacity() * std::mem::size_of::<u32>()
+            + self.cell_terms.capacity() * std::mem::size_of::<T>()
             + self.codebook.memory_usage_bytes()
     }
 
@@ -578,6 +688,12 @@ where
     type Elem = T;
 
     const KIND: &'static str = "ivf_pq";
+
+    fn load_aux(&mut self, _dir: &std::path::Path) -> Result<(), AnnSearchErrors> {
+        self.codebook.rebuild_codebooks_t();
+        self.cell_terms = cell_terms(&self.centroids, &self.codebook);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +1038,107 @@ mod tests {
 
         // Should find exact or very close match
         assert_eq!(indices[0], 0);
+    }
+
+    /// Deterministic pseudo-random rows with no exact distance ties
+    fn noisy_matrix(n: usize, dim: usize, seed: u64) -> Mat<f32> {
+        let mut state = seed;
+        Mat::from_fn(n, dim, |_, _| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        })
+    }
+
+    /// Row-major copy of a matrix
+    fn flat(mat: &Mat<f32>) -> Vec<f32> {
+        (0..mat.nrows())
+            .flat_map(|i| (0..mat.ncols()).map(move |j| mat[(i, j)]))
+            .collect()
+    }
+
+    /// The batched path and the per-query path share their kernels, so they
+    /// have to agree exactly, above and below the batching threshold.
+    fn assert_batch_matches_query(metric: Dist, nq: usize) {
+        let dim = 32;
+        let data = noisy_matrix(3_000, dim, 7);
+        let index = IvfPqIndex::build(
+            data.as_ref(),
+            Some(20),
+            8,
+            metric,
+            get_default_k_means(),
+            Some(16),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let queries = flat(&noisy_matrix(nq, dim, 11));
+        let (ids, dists) = index
+            .query_batch(&queries, dim, 10, Some(4), true, Verbosity::Quiet)
+            .unwrap();
+        let dists = dists.unwrap();
+        for (i, q) in queries.chunks_exact(dim).enumerate() {
+            let (want_ids, want_d) = index.query(q, 10, Some(4)).unwrap();
+            assert_eq!(ids[i], want_ids, "row {i}");
+            assert_eq!(dists[i], want_d, "row {i}");
+        }
+    }
+
+    #[test]
+    fn test_query_batch_matches_query_euclidean() {
+        assert_batch_matches_query(Dist::SquaredEuclidean, BATCH_MIN_QUERIES + 50);
+    }
+
+    #[test]
+    fn test_query_batch_matches_query_cosine() {
+        assert_batch_matches_query(Dist::Cosine, BATCH_MIN_QUERIES + 50);
+    }
+
+    #[test]
+    fn test_query_batch_below_threshold_matches_query() {
+        assert_batch_matches_query(Dist::SquaredEuclidean, 40);
+    }
+
+    /// The precomputed cell terms and the per-cell residual table, the
+    /// fallback above the byte budget, have to score the same candidates.
+    #[test]
+    fn test_cell_terms_match_per_cell_tables() {
+        let dim = 32;
+        let data = noisy_matrix(2_000, dim, 3);
+        let index = IvfPqIndex::build(
+            data.as_ref(),
+            Some(16),
+            8,
+            Dist::SquaredEuclidean,
+            get_default_k_means(),
+            Some(16),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert!(!index.cell_terms.is_empty());
+
+        let with_terms = index.adc();
+        let mut direct = index.adc();
+        direct.cell_terms = &[];
+        let queries = flat(&noisy_matrix(20, dim, 5));
+        for q in queries.chunks_exact(dim) {
+            let mut s = index.scratch();
+            index.prepare(q, &mut s.q);
+            let probes = index.probe(&s.q, 4, 10, &mut s.probe_buf);
+
+            s.heap.reset(10);
+            with_terms.search(&probes, &mut s, |_| false);
+            let (_, d_terms) = finish_heap(&mut s.heap, None);
+            s.heap.reset(10);
+            direct.search(&probes, &mut s, |_| false);
+            let (_, d_direct) = finish_heap(&mut s.heap, None);
+
+            for (a, b) in d_terms.iter().zip(&d_direct) {
+                assert!((a - b).abs() <= 1e-4 * b.abs().max(1.0), "{a} vs {b}");
+            }
+        }
     }
 }
