@@ -41,6 +41,11 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 - PQ and OPQ queries are faster across all six indices. IVF and SOAR PQ/OPQ
   keep a precomputed per-cell table of `nlist * m * 256` floats (skipped above
   256 MiB, not saved, rebuilt on load). Distances differ at rounding level.
+- IVF and SOAR PQ/OPQ `query_batch()` and self-kNN probe, rotate and build
+  query tables by GEMM over blocks of queries. Results can differ from
+  `query()` in the last bits and at near ties.
+- SOAR-PQ and SOAR-OPQ order spilled entries by primary cell and skip
+  duplicates per run. Same neighbours up to ties.
 - The CPU, wgpu and MLX NN-Descent kNN-graph builds are faster (batched seed
   trees on CPU, rows in leaf order everywhere). Results differ at the same
   seed, recall is unchanged.

@@ -15,6 +15,9 @@ Requires `ann-search-rs` 0.13.0
   Lloyd's and `kmeans_balanced` alone was ignored.
 - GPU IVF Lloyd's defaults to 30 iterations instead of 50.
 - e-means seeds with k-means|| for up to 200 centroids, like Lloyd's.
+- `set_cell_terms_budget(max_bytes)` on `IvfPqIndex`, `IvfOpqIndex`,
+  `SoarPqIndex` and `SoarOpqIndex` caps the precomputed per-cell table
+  (default 256 MiB, `0` turns it off).
 - Faster IVF and kMkNN queries, faster PQ/OPQ builds and queries, and a faster
   NSG build (its NN-Descent kNN graph), all from `ann-search-rs` 0.13.0.
   PQ/OPQ distances differ at rounding level; NSG differs at the same seed.
