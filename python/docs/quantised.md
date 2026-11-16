@@ -104,19 +104,20 @@ and cannot exceed your sample count, so a small dataset needs it lowered.
 **OPQ** adds a learned orthogonal rotation before the split. Plain PQ splits on
 whatever axis order the data arrived in, so a space with variance concentrated
 in a few coordinates gets subspaces of wildly unequal difficulty. The rotation
-spreads it, and it buys recall everywhere it was measured: +0.01 to +0.19 over
-plain PQ depending on the generator.
+spreads it, and it never lost recall in the tables: anywhere from nothing to
++0.28 over plain PQ depending on the generator.
 
-It isn't free at either end. Build costs 3 to 5x (`opq_iters` is the knob), and
-the rotation has to be applied to every query, which runs from 1.1x the query
-time at 256 dimensions to 3.1x at 768. It also stores a `dim x dim` matrix, so
-the index is larger than the plain PQ equivalent.
+It isn't free. Build costs 3.5 to 5x for the exhaustive index and 3 to 4x under
+IVF (`opq_iters` is the knob). The rotation has to be applied to every query,
+which is lost in the noise of an exhaustive scan but costs up to 1.3x the IVF
+query time at 256 dimensions and 1.8x at 768. It also stores a `dim x dim`
+matrix, so the index is larger than the plain PQ equivalent.
 
 **The IVF variants** learn the codes on the residual from the cell centroid
 rather than on the vector, so the sub-codebooks only have to cover within-cell
 spread. That's why `IvfPqIndex` reaches better recall than `ExhaustivePqIndex`
 at the same `m`, on top of scanning fewer candidates. It holds on every
-generator in the tables, and costs about 2.2x the build time.
+generator in the tables, and costs 1.2 to 1.8x the build time.
 
 **The SOAR variants** spill every vector into a second cell chosen so its
 residual points somewhere the first one doesn't, fixing IVF's main failure of a
@@ -126,12 +127,11 @@ against query time, not against `nprobe`: at a fixed `nprobe` a spilled index
 scans about twice the candidates, so comparing at equal `nprobe` flatters it
 and answers nothing.
 
-Unlike the unquantised `SoarIndex`, here the doubling really does show up in
-the index size, because the codes *are* the storage: `SoarPqIndex` runs about
-2x an `IvfPqIndex` at the same `m`. `SoarOpqIndex` is the largest index of the
-PQ family, not the smallest, since it pays for the spilling and the rotation
-matrix both. An `IvfOpqIndex` at twice the `m` is smaller and quicker to build
-at matching memory.
+Unlike the unquantised `SoarIndex`, here the doubling does show up in the index
+size, because the codes *are* the storage. It is diluted by the per-cell lookup
+table the IVF and SOAR indices precompute, which both carry at the same size:
+`SoarPqIndex` and `SoarOpqIndex` run 1.2 to 1.4x the IVF index at the same `m`
+and `nlist`, and an IVF index at twice the `m` is larger than either.
 
 ### RaBitQ graphs
 
