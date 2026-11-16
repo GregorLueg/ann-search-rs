@@ -187,7 +187,12 @@ impl Default for NNDescentKnnParams {
 /// ### Returns
 ///
 /// New-to-old id mapping.
-fn leaf_order<T: AnnSearchFloat>(vectors_flat: &[T], dim: usize, metric: Dist, seed: usize) -> Vec<u32> {
+pub(crate) fn leaf_order<T: AnnSearchFloat>(
+    vectors_flat: &[T],
+    dim: usize,
+    metric: Dist,
+    seed: usize,
+) -> Vec<u32> {
     let metric = match metric {
         Dist::Manhattan => Dist::SquaredEuclidean,
         m => m,
@@ -210,7 +215,11 @@ fn leaf_order<T: AnnSearchFloat>(vectors_flat: &[T], dim: usize, metric: Dist, s
 /// ### Returns
 ///
 /// The permuted rows.
-fn permute_rows<T: AnnSearchFloat>(vectors_flat: &[T], dim: usize, order: &[u32]) -> Vec<T> {
+pub(crate) fn permute_rows<T: AnnSearchFloat>(
+    vectors_flat: &[T],
+    dim: usize,
+    order: &[u32],
+) -> Vec<T> {
     let mut out = vec![T::zero(); vectors_flat.len()];
     out.par_chunks_mut(dim.max(1))
         .zip(order.par_iter())

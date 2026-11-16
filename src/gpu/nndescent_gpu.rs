@@ -43,6 +43,7 @@ use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
+use crate::cpu::nndescent::{leaf_order, permute_rows};
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
@@ -50,6 +51,7 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
+use crate::utils::rp_forest::unpermute_knn_rows;
 pub use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
 use crate::utils::verbosity::BuildLog;
 
@@ -2664,9 +2666,11 @@ where
 /// Reuses every kernel that [`NNDescentGpu::build`] uses for the NNDescent
 /// phase but skips the CAGRA rank-prune and reverse-merge that follow.
 ///
-/// A thin wrapper: it resolves the defaults, pads the vectors, opens the device
+/// A thin wrapper: it resolves the defaults, permutes the rows into the leaf
+/// order of one random-projection tree, pads the vectors, opens the device
 /// context and then hands the whole device-resident loop to [`nndescent_core`],
-/// compacting its output with [`compact_knn_rows`] on the way back. The split
+/// compacting its output with [`compact_knn_rows`] and mapping it back to the
+/// input order on the way back. The split
 /// is what lets [`crate::gpu::clustered_nndescent_gpu`] drive the same loop
 /// once per cluster against a shared client.
 ///
@@ -2733,7 +2737,15 @@ where
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-    let vectors_padded = device_rows(&vectors_flat, n, dim, dim_padded, metric);
+    // The local join gathers rows by neighbour id, so put tree neighbours
+    // next to each other in memory first. Undone on the output graph.
+    let start = Instant::now();
+    let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
+    let permuted = permute_rows(&vectors_flat, dim, &new_to_old);
+    if verbosity.detailed_verbosity() {
+        println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
+    }
+    let vectors_padded = device_rows(&permuted, n, dim, dim_padded, metric);
 
     let norms = if metric == Dist::Cosine {
         (0..n)
@@ -2786,7 +2798,12 @@ where
     )?;
 
     drop(vectors_padded);
-    let knn_graph = compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k);
+    drop(permuted);
+    let knn_graph = unpermute_knn_rows(
+        &compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k),
+        k,
+        &new_to_old,
+    );
     log.finish();
 
     Ok(KnnGraphGpu {
