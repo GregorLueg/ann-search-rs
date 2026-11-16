@@ -65,7 +65,7 @@ let row = graph.row(0); // k + 1 ids, the point itself first
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.12", features = ["quantised", "binary"] }
+ann-search-rs = { version = "0.13", features = ["quantised", "binary"] }
 ```
 
 Optional features:
@@ -199,7 +199,7 @@ brew install mlx-c
 ```
 
 ```toml
-ann-search-rs = { version = "0.12", features = ["mlx"] }
+ann-search-rs = { version = "0.13", features = ["mlx"] }
 ```
 
 If mlx-c lives somewhere other than `/opt/homebrew`, set `MLX_C_PREFIX`. If it
