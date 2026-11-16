@@ -14,7 +14,8 @@
 //!
 //! Handles are `#[pyclass(frozen)]`. Every index is a plain `Vec`-of-POD with
 //! no interior mutability, so this is sound, it drops pyo3's runtime borrow
-//! flag, and it lets two Python threads query one index at once.
+//! flag, and it lets two Python threads query one index at once. The IVF and
+//! SOAR PQ/OPQ handles pass `mutable` to carry `set_cell_terms_budget`.
 //!
 //! One wrinkle: `n` and `dim` are public fields on the CPU indices and private
 //! ones behind accessors on the quantised indices. Rather than churn the
@@ -64,6 +65,17 @@ macro_rules! ann_handle {
     };
 
     ($cls:ident, $inner:ident, $index:ident, $name:literal, $shape:ident, { $($extra:tt)* }) => {
+        crate::handle::ann_handle!(@impl $cls, $inner, $index, $name, $shape, [frozen], { $($extra)* });
+    };
+
+    // Drops `frozen` so `$extra` can carry `&mut self` setters. Queries stay
+    // `&self`, so concurrent queries still work; a setter racing a query gets
+    // pyo3's borrow error.
+    ($cls:ident, $inner:ident, $index:ident, $name:literal, $shape:ident, mutable, { $($extra:tt)* }) => {
+        crate::handle::ann_handle!(@impl $cls, $inner, $index, $name, $shape, [], { $($extra)* });
+    };
+
+    (@impl $cls:ident, $inner:ident, $index:ident, $name:literal, $shape:ident, [$($attr:ident)?], { $($extra:tt)* }) => {
         /// Float-type dispatch for the handle below.
         pub(crate) enum $inner {
             /// Index built over `f32` samples.
@@ -72,7 +84,7 @@ macro_rules! ann_handle {
             F64($index<f64>),
         }
 
-        #[::pyo3::pyclass(name = $name, module = "ann_search._ann_search", frozen)]
+        #[::pyo3::pyclass(name = $name, module = "ann_search._ann_search" $(, $attr)?)]
         pub struct $cls {
             /// The built index, tagged by its float type.
             pub(crate) inner: $inner,

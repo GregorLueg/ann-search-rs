@@ -36,7 +36,7 @@ cosine. See the benchmark tables for [quantised][1] and [RaBitQ][2] numbers.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 from beartype import beartype
@@ -44,6 +44,9 @@ from beartype import beartype
 from . import _ann_search as _core
 from ._base import BaseAnnIndex
 from ._metrics import NO_MANHATTAN
+
+if TYPE_CHECKING:
+    from ._ann_search import _CellTermsHandle
 
 
 class _BaseQuantisedIndex(BaseAnnIndex):
@@ -54,6 +57,28 @@ class _BaseQuantisedIndex(BaseAnnIndex):
     """
 
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
+
+
+class _BaseCellTermsIndex(_BaseQuantisedIndex):
+    """The IVF and SOAR PQ/OPQ estimators, which precompute per-cell terms."""
+
+    @beartype
+    def set_cell_terms_budget(self, max_bytes: int) -> None:
+        """Set the memory budget for the precomputed per-cell table terms.
+
+        The table holds ``nlist * m * n_pq_centroids`` values and lets a probed
+        cell cost one add per code instead of a full residual-table build. It
+        defaults to a 256 MiB cap and is rebuilt or dropped straight away. The
+        budget is not part of the fitted state: refitting, `load` and
+        unpickling all start from the default again.
+
+        Args:
+            max_bytes: Largest table to keep. ``0`` turns it off.
+        """
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must be >= 0, got {max_bytes}")
+        handle = cast("_CellTermsHandle", self._fitted_handle())
+        handle.set_cell_terms_budget(max_bytes)
 
 
 ########
@@ -685,7 +710,7 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
         )
 
 
-class IvfPqIndex(_BaseQuantisedIndex):
+class IvfPqIndex(_BaseCellTermsIndex):
     """Inverted file plus product quantisation.
 
     The two compress different things and stack cleanly: the inverted file cuts
@@ -765,7 +790,7 @@ class IvfPqIndex(_BaseQuantisedIndex):
         )
 
 
-class IvfOpqIndex(_BaseQuantisedIndex):
+class IvfOpqIndex(_BaseCellTermsIndex):
     """`IvfPqIndex` with the learned rotation in front of the sub-codebooks.
 
     Same trade as `ExhaustiveOpqIndex` against `ExhaustivePqIndex`: better codes
@@ -847,7 +872,7 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         )
 
 
-class SoarPqIndex(_BaseQuantisedIndex):
+class SoarPqIndex(_BaseCellTermsIndex):
     """`IvfPqIndex` with SOAR spilling.
 
     Every vector also lands in a second cell, chosen so its residual points
@@ -941,7 +966,7 @@ class SoarPqIndex(_BaseQuantisedIndex):
         )
 
 
-class SoarOpqIndex(_BaseQuantisedIndex):
+class SoarOpqIndex(_BaseCellTermsIndex):
     """`SoarPqIndex` with the learned rotation in front of the sub-codebooks.
 
     The rotation on top of the spilling, so it carries both costs: the extra

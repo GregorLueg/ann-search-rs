@@ -17,7 +17,7 @@ use crate::handle::ann_handle;
 use crate::kmeans::kmeans_params;
 use crate::soar::soar_rule;
 
-ann_handle!(PySoarPq, SoarPqInner, SoarPqIndex, "SoarPq", method, {
+ann_handle!(PySoarPq, SoarPqInner, SoarPqIndex, "SoarPq", method, mutable, {
     /// Cluster with spilling, then encode each residual.
     ///
     /// ### Params
@@ -182,6 +182,22 @@ ann_handle!(PySoarPq, SoarPqInner, SoarPqIndex, "SoarPq", method, {
                     parse_annsearch_verbosity(verbose)
                 ))
             }
+        }
+    }
+
+    /// Set the memory budget for the precomputed per-cell table terms.
+    ///
+    /// The table is rebuilt or dropped straight away. Not saved with the
+    /// index: a loaded or unpickled index starts from the 256 MiB default.
+    ///
+    /// ### Params
+    ///
+    /// * `max_bytes` - Largest table to keep. `0` turns it off and queries
+    ///   build the residual table per probed cell instead.
+    fn set_cell_terms_budget(&mut self, max_bytes: usize) {
+        match &mut self.inner {
+            SoarPqInner::F32(idx) => idx.set_cell_terms_budget(max_bytes),
+            SoarPqInner::F64(idx) => idx.set_cell_terms_budget(max_bytes),
         }
     }
 });
