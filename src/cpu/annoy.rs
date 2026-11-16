@@ -31,6 +31,47 @@ const TWO_MEANS_STEPS: usize = 200;
 /// Random hyperplanes tried per node before it falls back to a leaf.
 const SPLIT_ATTEMPTS: usize = 10;
 
+/// Row bytes at or below which [`AnnoyTrees::build_seed_leaves`] hands a node
+/// to the depth-first builder: its rows then stay cache-resident, while the
+/// node table a level-synchronous pass would chase no longer does.
+const LOCAL_SUBTREE_BYTES: usize = 1 << 20;
+
+/// Points per rayon task in the level-synchronous side pass.
+const SIDE_PASS_CHUNK: usize = 4096;
+
+/// Marks a point whose node is not split at this level.
+const NO_NODE: u32 = u32::MAX;
+
+/// A node waiting for its split in [`AnnoyTrees::build_seed_leaves`].
+struct LevelNode {
+    /// Offset of the node's items in the tree permutation
+    start: usize,
+    /// Number of items
+    len: usize,
+    /// The node's own generator, so the tree does not depend on scheduling
+    rng: StdRng,
+    /// Split attempts used so far
+    attempts: usize,
+}
+
+/// One tree of a [`AnnoyTrees::build_seed_leaves`] batch.
+struct SeedTree<'a, T> {
+    /// The tree permutation, partitioned in place
+    perm: &'a mut [u32],
+    /// Index into `frontier` of each point's node, or [`NO_NODE`]
+    assign: Vec<u32>,
+    /// Nodes split at the current level
+    frontier: Vec<LevelNode>,
+    /// `dim` values per frontier node: this level's candidate normal
+    normals: Vec<T>,
+    /// Candidate offset per frontier node; `None` for a degenerate draw
+    offsets: Vec<Option<T>>,
+    /// Finished leaves as `(start, len)`
+    leaves: Vec<(usize, usize)>,
+    /// Small nodes left for the depth-first builder, as `(start, len, seed)`
+    deferred: Vec<(usize, usize, u64)>,
+}
+
 /////////////
 // Helpers //
 /////////////
@@ -98,6 +139,116 @@ impl<T: AnnSearchFloat> SplitScratch<T> {
             hyperplane: Vec::with_capacity(dim),
             p: vec![T::zero(); dim],
             q: vec![T::zero(); dim],
+        }
+    }
+}
+
+impl<T: AnnSearchFloat> SeedTree<'_, T> {
+    /// Route a new node: a leaf, a deferred small subtree, or the next level.
+    ///
+    /// ### Params
+    ///
+    /// * `start` - Offset of the node in the permutation
+    /// * `len` - Number of items
+    /// * `seed` - The node's seed
+    /// * `local_max` - Largest node handed to the depth-first builder
+    fn place(&mut self, start: usize, len: usize, seed: u64, local_max: usize) {
+        if len <= LEAF_MIN_MEMBERS {
+            self.leaves.push((start, len));
+        } else if len <= local_max {
+            self.deferred.push((start, len, seed));
+        } else {
+            self.frontier.push(LevelNode {
+                start,
+                len,
+                rng: StdRng::seed_from_u64(seed),
+                attempts: 0,
+            });
+        }
+    }
+
+    /// Draw one candidate split per frontier node and point each of its items
+    /// at it. Every other point, and the items of a degenerate draw, get
+    /// [`NO_NODE`] so the side pass skips them.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `metric` - Euclidean or Cosine
+    fn draw_candidates(&mut self, vectors_flat: &[T], dim: usize, metric: Dist) {
+        let mut scratch = SplitScratch::new(0, dim);
+        self.assign.fill(NO_NODE);
+        self.normals.clear();
+        self.offsets.clear();
+        for (f, node) in self.frontier.iter_mut().enumerate() {
+            let items = &self.perm[node.start..node.start + node.len];
+            let offset = AnnoyTrees::candidate_split(
+                vectors_flat,
+                dim,
+                items,
+                &mut scratch,
+                &mut node.rng,
+                metric,
+            );
+            match offset {
+                Some(_) => {
+                    self.normals.extend_from_slice(&scratch.hyperplane);
+                    for &p in items {
+                        self.assign[p as usize] = f as u32;
+                    }
+                }
+                None => self.normals.extend(std::iter::repeat_n(T::zero(), dim)),
+            }
+            self.offsets.push(offset);
+        }
+    }
+
+    /// Accept or retry each frontier node's candidate, partitioning the
+    /// accepted ones and routing their children.
+    ///
+    /// ### Params
+    ///
+    /// * `sides` - Point-major sides, `w` per point
+    /// * `t` - This tree's slot in `sides`
+    /// * `w` - Trees in the batch
+    /// * `local_max` - Largest node handed to the depth-first builder
+    fn apply_splits(&mut self, sides: &[bool], t: usize, w: usize, local_max: usize) {
+        let mut right: Vec<u32> = Vec::new();
+        let frontier = std::mem::take(&mut self.frontier);
+        for (f, mut node) in frontier.into_iter().enumerate() {
+            node.attempts += 1;
+            let side = |p: u32| sides[p as usize * w + t];
+            let items = &mut self.perm[node.start..node.start + node.len];
+
+            let n_left = match self.offsets[f] {
+                Some(_) => items.iter().filter(|&&p| side(p)).count(),
+                None => 0,
+            };
+            let ratio = n_left as f64 / node.len as f64;
+            if n_left > 0 && n_left < node.len && (0.05..=0.95).contains(&ratio) {
+                right.clear();
+                let mut write = 0;
+                for read in 0..items.len() {
+                    let p = items[read];
+                    if side(p) {
+                        items[write] = p;
+                        write += 1;
+                    } else {
+                        right.push(p);
+                    }
+                }
+                items[n_left..].copy_from_slice(&right);
+
+                let left_seed: u64 = node.rng.random();
+                let right_seed: u64 = node.rng.random();
+                self.place(node.start, n_left, left_seed, local_max);
+                self.place(node.start + n_left, node.len - n_left, right_seed, local_max);
+            } else if node.attempts >= SPLIT_ATTEMPTS {
+                self.leaves.push((node.start, node.len));
+            } else {
+                self.frontier.push(node);
+            }
         }
     }
 }
@@ -250,6 +401,142 @@ where
         parts
     }
 
+    /// Build the leaves of a batch of trees for leaf-join graph seeding.
+    ///
+    /// Same split rule as [`Self::build_tree`], but the large nodes of every
+    /// tree in the batch are split level by level, so one pass over the rows
+    /// serves the whole batch rather than each tree streaming the dataset on
+    /// its own. Nodes whose rows fit in [`LOCAL_SUBTREE_BYTES`] finish
+    /// depth-first as independent rayon tasks. Every node draws from its own
+    /// generator, so the result is deterministic but not the forest
+    /// [`Self::build_tree`] would give for the same seeds. Keeps no
+    /// hyperplanes, so the trees cannot route queries.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `metric` - Euclidean or Cosine
+    /// * `seeds` - One seed per tree
+    /// * `perms` - One permutation buffer of length `n` per seed, overwritten
+    ///
+    /// ### Returns
+    ///
+    /// Per tree, its leaves as `(start, len)` ranges of that tree's `perms`
+    /// entry.
+    pub(crate) fn build_seed_leaves(
+        vectors_flat: &[T],
+        dim: usize,
+        metric: Dist,
+        seeds: &[u64],
+        perms: &mut [Vec<u32>],
+    ) -> Vec<Vec<(usize, usize)>> {
+        let n = vectors_flat.len() / dim.max(1);
+        let local_max = (LOCAL_SUBTREE_BYTES / (dim.max(1) * size_of::<T>())).max(LEAF_MIN_MEMBERS);
+        let w = seeds.len();
+
+        let mut trees: Vec<SeedTree<T>> = perms
+            .iter_mut()
+            .zip(seeds)
+            .map(|(perm, &seed)| {
+                for (i, p) in perm.iter_mut().enumerate() {
+                    *p = i as u32;
+                }
+                let mut tree = SeedTree {
+                    perm: &mut perm[..],
+                    assign: vec![NO_NODE; n],
+                    frontier: Vec::new(),
+                    normals: Vec::new(),
+                    offsets: Vec::new(),
+                    leaves: Vec::new(),
+                    deferred: Vec::new(),
+                };
+                tree.place(0, n, seed, local_max);
+                tree
+            })
+            .collect();
+
+        let mut sides = vec![false; n * w];
+        while trees.iter().any(|t| !t.frontier.is_empty()) {
+            trees
+                .par_iter_mut()
+                .for_each(|t| t.draw_candidates(vectors_flat, dim, metric));
+
+            // One read of each row serves every tree that is splitting it.
+            sides
+                .par_chunks_mut(SIDE_PASS_CHUNK * w)
+                .enumerate()
+                .for_each(|(c, chunk)| {
+                    let base = c * SIDE_PASS_CHUNK;
+                    for (j, point_sides) in chunk.chunks_mut(w).enumerate() {
+                        let p = base + j;
+                        let row = &vectors_flat[p * dim..(p + 1) * dim];
+                        for (t, tree) in trees.iter().enumerate() {
+                            let f = tree.assign[p];
+                            if f == NO_NODE {
+                                continue;
+                            }
+                            let f = f as usize;
+                            let normal = &tree.normals[f * dim..(f + 1) * dim];
+                            point_sides[t] = T::dot_simd(row, normal) > tree.offsets[f].unwrap();
+                        }
+                    }
+                });
+
+            trees
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(t, tree)| tree.apply_splits(&sides, t, w, local_max));
+        }
+        drop(sides);
+
+        // Depth-first finish of the small nodes, one rayon task each.
+        let mut tasks: Vec<(usize, usize, &mut [u32], u64)> = Vec::new();
+        for (t, tree) in trees.iter_mut().enumerate() {
+            tree.deferred.sort_unstable_by_key(|&(start, _, _)| start);
+            let mut rest: &mut [u32] = &mut tree.perm[..];
+            let mut offset = 0;
+            for &(start, len, seed) in &tree.deferred {
+                let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
+                let (mine, tail) = tail.split_at_mut(len);
+                tasks.push((t, start, mine, seed));
+                rest = tail;
+                offset = start + len;
+            }
+        }
+        let finished: Vec<(usize, Vec<(usize, usize)>)> = tasks
+            .into_par_iter()
+            .map_init(
+                || SplitScratch::new(local_max, dim),
+                |scratch, (t, start, items, seed)| {
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    let mut parts = TreeParts {
+                        nodes: Vec::new(),
+                        split_data: Vec::new(),
+                    };
+                    Self::build_node(
+                        vectors_flat,
+                        dim,
+                        items,
+                        start,
+                        &mut parts,
+                        scratch,
+                        &mut rng,
+                        metric,
+                    );
+                    let leaves = parts.nodes.iter().filter_map(|nd| nd.leaf_range()).collect();
+                    (t, leaves)
+                },
+            )
+            .collect();
+
+        let mut out: Vec<Vec<(usize, usize)>> = trees.into_iter().map(|t| t.leaves).collect();
+        for (t, leaves) in finished {
+            out[t].extend(leaves);
+        }
+        out
+    }
+
     /// Angular split normal from two-means over the node's items
     ///
     /// Spotify Annoy's angular split. Starts from two unit-normalised seed
@@ -322,6 +609,81 @@ where
         hyperplane.extend((0..dim).map(|k| p[k] / np - q[k] / nq));
     }
 
+    /// Draw one candidate split for a node and leave its normal in
+    /// `scratch.hyperplane`.
+    ///
+    /// Two random items define it: their perpendicular bisector for
+    /// Euclidean, a two-means split seeded from them for Cosine.
+    ///
+    /// ### Params
+    ///
+    /// * `vectors_flat` - Flattened vector data
+    /// * `dim` - Dimensionality of vectors
+    /// * `items` - The node's items
+    /// * `scratch` - Tree scratch, receives the hyperplane
+    /// * `rng` - The node's random number generator
+    /// * `metric` - Euclidean or Cosine
+    ///
+    /// ### Returns
+    ///
+    /// The split offset, or `None` for a degenerate draw (the same item twice,
+    /// or a zero vector under Cosine).
+    fn candidate_split(
+        vectors_flat: &[T],
+        dim: usize,
+        items: &[u32],
+        scratch: &mut SplitScratch<T>,
+        rng: &mut StdRng,
+        metric: Dist,
+    ) -> Option<T> {
+        let idx1 = items[rng.random_range(0..items.len())] as usize;
+        let idx2 = items[rng.random_range(0..items.len())] as usize;
+        if idx1 == idx2 {
+            return None;
+        }
+
+        let v1 = &vectors_flat[idx1 * dim..idx1 * dim + dim];
+        let v2 = &vectors_flat[idx2 * dim..idx2 * dim + dim];
+
+        match metric {
+            Dist::Cosine => {
+                let norm1 = v1
+                    .iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt();
+                let norm2 = v2
+                    .iter()
+                    .map(|&x| x * x)
+                    .fold(T::zero(), |a, b| a + b)
+                    .sqrt();
+
+                if norm1 == T::zero() || norm2 == T::zero() {
+                    return None;
+                }
+
+                Self::angular_two_means(vectors_flat, dim, items, v1, v2, scratch, rng);
+                Some(T::zero())
+            }
+            Dist::SquaredEuclidean => {
+                scratch.hyperplane.clear();
+                let mut dot_v1 = T::zero();
+                let mut dot_v2 = T::zero();
+
+                for k in 0..dim {
+                    let val1 = v1[k];
+                    let val2 = v2[k];
+                    scratch.hyperplane.push(val1 - val2);
+                    dot_v1 += val1 * val1;
+                    dot_v2 += val2 * val2;
+                }
+
+                Some((dot_v1 - dot_v2) / T::from_f64(2.0).unwrap())
+            }
+            Dist::Manhattan => unreachable!(),
+        }
+    }
+
     /// Recursively build a node (split or leaf) over `items`.
     ///
     /// Tries up to `SPLIT_ATTEMPTS` random hyperplanes and accepts the first
@@ -370,51 +732,10 @@ where
         }
 
         for _ in 0..SPLIT_ATTEMPTS {
-            let idx1 = items[rng.random_range(0..items.len())] as usize;
-            let idx2 = items[rng.random_range(0..items.len())] as usize;
-            if idx1 == idx2 {
+            let Some(threshold) =
+                Self::candidate_split(vectors_flat, dim, items, scratch, rng, metric)
+            else {
                 continue;
-            }
-
-            let v1 = &vectors_flat[idx1 * dim..idx1 * dim + dim];
-            let v2 = &vectors_flat[idx2 * dim..idx2 * dim + dim];
-
-            let threshold = match metric {
-                Dist::Cosine => {
-                    let norm1 = v1
-                        .iter()
-                        .map(|&x| x * x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt();
-                    let norm2 = v2
-                        .iter()
-                        .map(|&x| x * x)
-                        .fold(T::zero(), |a, b| a + b)
-                        .sqrt();
-
-                    if norm1 == T::zero() || norm2 == T::zero() {
-                        continue;
-                    }
-
-                    Self::angular_two_means(vectors_flat, dim, items, v1, v2, scratch, rng);
-                    T::zero()
-                }
-                Dist::SquaredEuclidean => {
-                    scratch.hyperplane.clear();
-                    let mut dot_v1 = T::zero();
-                    let mut dot_v2 = T::zero();
-
-                    for k in 0..dim {
-                        let val1 = v1[k];
-                        let val2 = v2[k];
-                        scratch.hyperplane.push(val1 - val2);
-                        dot_v1 += val1 * val1;
-                        dot_v2 += val2 * val2;
-                    }
-
-                    (dot_v1 - dot_v2) / T::from_f64(2.0).unwrap()
-                }
-                Dist::Manhattan => unreachable!(),
             };
 
             scratch.left.clear();

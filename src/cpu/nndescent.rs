@@ -175,6 +175,51 @@ impl Default for NNDescentKnnParams {
     }
 }
 
+/// Row order that follows the leaves of one random-projection tree.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Flattened vector data
+/// * `dim` - Dimensionality of vectors
+/// * `metric` - Build metric; Manhattan orders by Euclidean splits
+/// * `seed` - Build seed
+///
+/// ### Returns
+///
+/// New-to-old id mapping.
+fn leaf_order<T: AnnSearchFloat>(vectors_flat: &[T], dim: usize, metric: Dist, seed: usize) -> Vec<u32> {
+    let metric = match metric {
+        Dist::Manhattan => Dist::SquaredEuclidean,
+        m => m,
+    };
+    let n = vectors_flat.len() / dim.max(1);
+    let mut perms = vec![vec![0u32; n]];
+    let order_seed = (seed as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    AnnoyTrees::build_seed_leaves(vectors_flat, dim, metric, &[order_seed], &mut perms);
+    perms.pop().unwrap()
+}
+
+/// Gather rows into a new buffer: row `i` of the result is row `order[i]`.
+///
+/// ### Params
+///
+/// * `vectors_flat` - Flattened vector data
+/// * `dim` - Dimensionality of vectors
+/// * `order` - Source row for each output row
+///
+/// ### Returns
+///
+/// The permuted rows.
+fn permute_rows<T: AnnSearchFloat>(vectors_flat: &[T], dim: usize, order: &[u32]) -> Vec<T> {
+    let mut out = vec![T::zero(); vectors_flat.len()];
+    out.par_chunks_mut(dim.max(1))
+        .zip(order.par_iter())
+        .for_each(|(row, &src)| {
+            row.copy_from_slice(&vectors_flat[src as usize * dim..(src as usize + 1) * dim]);
+        });
+    out
+}
+
 /// Resolve the optional build parameters shared by both NN-Descent builds.
 ///
 /// ### Params
@@ -1313,8 +1358,9 @@ where
     /// The kNN-only build has no queries to route, so no tree outlives its
     /// leaf join. A batch of trees is built in parallel, each into its own
     /// permutation, then joined one after another; the permutations are reused
-    /// for the next batch. The tree seeds match [`AnnoyTrees::build`], so the
-    /// result equals the index build's seeding.
+    /// for the next batch. Euclidean and Cosine batches go through
+    /// [`AnnoyTrees::build_seed_leaves`], which splits the batch level by
+    /// level.
     ///
     /// ### Params
     ///
@@ -1335,29 +1381,25 @@ where
         let mut perms: Vec<Vec<u32>> = (0..batch).map(|_| vec![0u32; self.n]).collect();
 
         for chunk in seeds.chunks(batch) {
-            let ranges: Vec<Vec<(usize, usize)>> = perms
-                .par_iter_mut()
-                .zip(chunk.par_iter())
-                .map(|(perm, &tree_seed)| match self.metric {
-                    Dist::Manhattan => {
+            let ranges: Vec<Vec<(usize, usize)>> = match self.metric {
+                Dist::Manhattan => perms
+                    .par_iter_mut()
+                    .zip(chunk.par_iter())
+                    .map(|(perm, &tree_seed)| {
                         KdTrees::build_tree(&self.vectors_flat, self.dim, tree_seed, perm)
                             .iter()
                             .filter_map(|node| node.leaf_range())
                             .collect()
-                    }
-                    _ => AnnoyTrees::build_tree(
-                        &self.vectors_flat,
-                        self.dim,
-                        self.metric,
-                        tree_seed,
-                        perm,
-                    )
-                    .nodes
-                    .iter()
-                    .filter_map(|node| node.leaf_range())
+                    })
                     .collect(),
-                })
-                .collect();
+                _ => AnnoyTrees::build_seed_leaves(
+                    &self.vectors_flat,
+                    self.dim,
+                    self.metric,
+                    chunk,
+                    &mut perms[..chunk.len()],
+                ),
+            };
 
             for (perm, tree) in perms.iter().zip(&ranges) {
                 let leaves: Vec<&[u32]> = tree
@@ -1412,9 +1454,12 @@ where
     ///
     /// Seeds by leaf co-membership from trees that are dropped as soon as
     /// they are joined (see [`Self::init_with_streamed_trees`]) and runs the
-    /// descent. The seeding matches [`Self::new`], Annoy trees for Euclidean
-    /// and Cosine and Kd trees for Manhattan, so the same seed and trees give
-    /// the same graph. The returned struct holds the vectors, norms and kNN
+    /// descent. The split rules match [`Self::new`], Annoy trees for Euclidean
+    /// and Cosine and Kd trees for Manhattan, but the rows are first put in
+    /// the leaf order of one extra tree and the trees are drawn over that
+    /// order, so the graph is not the one [`Self::new`] builds for the same
+    /// seed. Rows and ids are back in input order on return. The returned
+    /// struct holds the vectors, norms and kNN
     /// graph but no forest or query graph, so it cannot be queried: callers
     /// take it apart.
     ///
@@ -1439,6 +1484,16 @@ where
         verbosity: Verbosity,
     ) -> Self {
         let (vectors_flat, n, dim) = data.into_row_major();
+
+        // Every stage gathers rows by id, so put tree neighbours next to each
+        // other in memory first. Undone before returning.
+        let start = Instant::now();
+        let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
+        let vectors_flat = permute_rows(&vectors_flat, dim, &new_to_old);
+        if verbosity.detailed_verbosity() {
+            println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
+        }
+
         let norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| T::calculate_l2_norm(&vectors_flat[i * dim..(i + 1) * dim]))
@@ -1486,8 +1541,29 @@ where
             seed,
             verbosity,
         );
-        builder.graph = graph.into_iter().map(|nb| (nb.pid(), nb.dist)).collect();
         builder.converged = converged;
+
+        let mut old_to_new = vec![0u32; n];
+        for (new_id, &old_id) in new_to_old.iter().enumerate() {
+            old_to_new[old_id as usize] = new_id as u32;
+        }
+        builder.vectors_flat = permute_rows(&builder.vectors_flat, dim, &old_to_new);
+        if !builder.norms.is_empty() {
+            builder.norms = old_to_new.iter().map(|&i| builder.norms[i as usize]).collect();
+        }
+        builder.graph = vec![(SENTINEL_PID as u32, T::max_value()); n * k];
+        builder
+            .graph
+            .par_chunks_mut(k)
+            .zip(old_to_new.par_iter())
+            .for_each(|(row, &new_id)| {
+                let src = &graph[new_id as usize * k..(new_id as usize + 1) * k];
+                for (slot, nb) in row.iter_mut().zip(src) {
+                    if !nb.is_sentinel() {
+                        *slot = (new_to_old[nb.pid() as usize], nb.dist);
+                    }
+                }
+            });
         builder
     }
 
@@ -3164,29 +3240,39 @@ mod tests {
         (0..n * dim).map(|_| rng.random::<f32>()).collect()
     }
 
+    fn exact_dist(data: &[f32], dim: usize, i: usize, j: usize, metric: Dist) -> f32 {
+        let a = &data[i * dim..(i + 1) * dim];
+        let b = &data[j * dim..(j + 1) * dim];
+        match metric {
+            Dist::Manhattan => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
+            Dist::Cosine => {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let na: f32 = a.iter().map(|x| x * x).sum();
+                let nb: f32 = b.iter().map(|x| x * x).sum();
+                1.0 - dot / (na.sqrt() * nb.sqrt())
+            }
+            _ => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
+        }
+    }
+
     /// Exact neighbours of row `i`, self excluded.
     fn brute_force(data: &[f32], dim: usize, i: usize, k: usize, metric: Dist) -> Vec<usize> {
         let n = data.len() / dim;
-        let a = &data[i * dim..(i + 1) * dim];
         let mut d: Vec<(f32, usize)> = (0..n)
             .filter(|&j| j != i)
-            .map(|j| {
-                let b = &data[j * dim..(j + 1) * dim];
-                let dist = match metric {
-                    Dist::Manhattan => a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum(),
-                    _ => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum(),
-                };
-                (dist, j)
-            })
+            .map(|j| (exact_dist(data, dim, i, j, metric), j))
             .collect();
         d.sort_by(|x, y| x.partial_cmp(y).unwrap());
         d.into_iter().take(k).map(|(_, j)| j).collect()
     }
 
     #[test]
-    fn test_knn_graph_matches_index_extract() {
+    fn test_knn_graph_recall_matches_index_extract() {
+        // The graph-only path reorders rows before seeding, so its graph is not
+        // the index's; both have to reach the same recall and exact distances.
         let (n, dim, k) = (2000, 8, 10);
         let data = random_flat(n, dim, 11);
+        let probe: Vec<usize> = (0..n).step_by(20).collect();
         for metric in [Dist::SquaredEuclidean, Dist::Cosine, Dist::Manhattan] {
             let index = NNDescent::<f32>::new(
                 (&data[..], n, dim),
@@ -3201,7 +3287,7 @@ mod tests {
                 Verbosity::Quiet,
             )
             .unwrap();
-            let (ids, dists) = index.extract_knn(None, false, true);
+            let (ids, _) = index.extract_knn(None, false, true);
 
             let params = NNDescentKnnParams::new(k, None, None, Some(6), 0.001, false, true);
             let g = NNDescent::<f32>::knn_graph(
@@ -3212,21 +3298,31 @@ mod tests {
                 Verbosity::Quiet,
             );
             let gd = g.distances.as_ref().unwrap();
-
             assert_eq!((g.n, g.k), (n, k));
-            for i in 0..n {
-                let row: Vec<usize> = g
-                    .row(i)
-                    .iter()
-                    .filter(|&&p| p != KNN_GRAPH_EMPTY)
-                    .map(|&p| p as usize)
-                    .collect();
-                assert_eq!(row, ids[i], "row {i} differs for {metric:?}");
-                assert_eq!(
-                    &gd[i * k..i * k + row.len()],
-                    &dists.as_ref().unwrap()[i][..]
-                );
+
+            let (mut hits_graph, mut hits_index) = (0, 0);
+            for &i in &probe {
+                let truth = brute_force(&data, dim, i, k, metric);
+                for (slot, &p) in g.row(i).iter().enumerate() {
+                    if p == KNN_GRAPH_EMPTY {
+                        continue;
+                    }
+                    let exact = exact_dist(&data, dim, i, p as usize, metric);
+                    assert!(
+                        (gd[i * k + slot] - exact).abs() <= 1e-4 * exact.abs().max(1.0),
+                        "row {i} slot {slot} distance off for {metric:?}"
+                    );
+                    hits_graph += truth.contains(&(p as usize)) as usize;
+                }
+                hits_index += ids[i].iter().filter(|j| truth.contains(j)).count();
             }
+            let total = (probe.len() * k) as f64;
+            let (r_graph, r_index) = (hits_graph as f64 / total, hits_index as f64 / total);
+            assert!(r_graph > 0.95, "{metric:?} graph recall {r_graph}");
+            assert!(
+                r_graph >= r_index - 0.02,
+                "{metric:?} graph recall {r_graph} vs index {r_index}"
+            );
         }
     }
 
