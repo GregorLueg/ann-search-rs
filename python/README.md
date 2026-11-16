@@ -66,6 +66,12 @@ that.
 | `VamanaIndex` | DiskANN-style flat graph. |
 | `NsgIndex` | Navigating spreading-out graph. |
 
+Every index that trains k-means cells (`KmknnIndex`, `IvfIndex`, `SoarIndex`, the
+IVF-family quantised indices, `IvfGpuIndex`, `IvfMlxIndex`) uses e-means by
+default. `kmeans_algorithm="lloyd"` switches back; `kmeans_epochs` tunes
+e-means, while `kmeans_iters` and `kmeans_balanced` apply to Lloyd only and
+raise `ValueError` otherwise.
+
 `BallTreeIndex` defaults its `search_budget` to 5% of the indexed points, which
 is the crate's own heuristic. It reaches 0.9865 to 0.9996 recall at 32
 dimensions and drops to 0.9135 at 128, where 10% is the better starting point

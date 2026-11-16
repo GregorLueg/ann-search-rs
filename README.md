@@ -40,6 +40,10 @@ cannot rule out are re-scored on that instead. With a store,
 bound still overlaps the current k-th distance; `Some(f)` keeps the fixed
 `k * f` shortlist.
 
+Every IVF-family index (CPU, wgpu, MLX) trains its cells with e-means by
+default (Bessa et al., 2026); `KMeansAlgorithm::Lloyd` in
+`KMeansTrainingParams` or `KMeansGpuParams` switches back.
+
 Every index has a `query_*_self` path for the full self-kNN graph, and most take
 a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
 re-entering, NN-Descent hands back the graph it built anyway.

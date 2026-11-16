@@ -124,6 +124,12 @@ unquantised indices: it stores the vectors and a permutation, and little else.
 Recall degrades when a true neighbour sits just over a cell boundary, which is
 exactly what SOAR fixes.
 
+The cells are trained with e-means by default (`kmeans_algorithm="emeans"`,
+`kmeans_epochs` to tune). Pass `kmeans_algorithm="lloyd"` for the classic
+loop; `kmeans_iters` and `kmeans_balanced` apply to it only and raise
+`ValueError` under e-means. The same knobs exist on every IVF-family index,
+quantised, GPU and MLX included.
+
 **`SoarIndex`** writes every vector into two cells: its nearest centroid, and a
 second chosen so its residual points somewhere the first one doesn't. Better
 recall per `nprobe` than plain IVF, for twice the posting-list *entries*. That

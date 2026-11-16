@@ -13,6 +13,8 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `with_algorithm(KMeansAlgorithm::Lloyd)` or `KMeansTrainingParams::new` /
   `KMeansGpuParams::new`.
 - GPU Lloyd's defaults to 30 fixed iterations instead of 50.
+- `build_knn_graph_nndescent()` no longer returns the same graph as
+  `extract_knn` on an NN-Descent index at the same seed. Recall is unchanged.
 
 **Features**
 
@@ -20,6 +22,27 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   `KMeansGpuParams` pick the algorithm for every k-means consumer.
 - e-means partitions are more even than Lloyd's, so an IVF index may need a
   higher `nprobe` for the same recall.
+- `query_batch()` on all six PQ/OPQ indices (exhaustive, IVF, SOAR). The
+  `query_*_index` wrappers use it.
+
+**Performance**
+
+- CPU IVF cross and self queries run cell by cell through a GEMM from 1024
+  queries up. Same neighbours up to ties.
+- kMkNN self-kNN runs through a batched GEMM.
+- PQ and OPQ build faster. PQ codes are identical at the same seed, OPQ codes
+  differ at rounding level.
+- PQ and OPQ queries are faster across all six indices. IVF and SOAR PQ/OPQ
+  keep a precomputed per-cell table of `nlist * m * 256` floats (skipped above
+  256 MiB, not saved, rebuilt on load). Distances differ at rounding level.
+- The CPU, wgpu and MLX NN-Descent kNN-graph builds are faster (batched seed
+  trees on CPU, rows in leaf order everywhere). Results differ at the same
+  seed, recall is unchanged.
+
+**Fixes**
+
+- MLX k-means trains on inputs small enough to fall below MLX's device
+  binding threshold.
 
 ## 0.12.2
 

@@ -41,6 +41,7 @@ cargo run --example gridsearch_rabitq --release --features binary
 # They are [[example]] targets, so run them with --example, not cargo bench.
 cargo run --example profile_hnsw     --release
 cargo run --example bench_pq_codebooks --release --features quantised
+cargo run --example profile_pq_query  --release --features quantised
 
 # CPU distance-kernel microbench. One forced SIMD level per run: the level is
 # process-wide and resolved on first use, so it cannot be switched mid-run.
@@ -80,8 +81,11 @@ Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Relea
 - `serialise`: save indices to disk and load them back (`IndexIo`, `save_index` / `load_index`). Pulls in `serde`, `bincode`, and `half?/serde`. Covers the CPU, quantised and binary indices; GPU indices are not covered.
 - `ndarray`: accept `ndarray` 2-D arrays as input alongside faer matrices. Pulls in `ndarray` (range dep, `>=0.16, <0.18`). This makes `ndarray` a *public* dependency, which is why it is off by default: a downstream on a different major gets two incompatible `ArrayView2` types. The `(&[T], n, dim)` input works on any version without the feature.
 - `mimalloc`: swaps in `mimalloc` as the global allocator.
+- `accelerate` (default): routes dense GEMM through Apple Accelerate on macOS, no effect elsewhere.
+- `mlx`: experimental, Apple Silicon only. MLX backend via mlx-c (exhaustive, IVF, NN-Descent/CAGRA), f32 only. Without mlx-c the build warns and leaves `src/mlx/` out; `MLX_AVAILABLE` and `cfg(mlx_available)` say which.
+- `synthetic`: dataset generators (`src/synthetic/`) behind the gridsearch examples and benchmark tables.
 
-Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
+Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/mlx/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
 
 ## Architecture
 
@@ -92,18 +96,21 @@ src/
   lib.rs           # public wrapper fns; all `pub fn build_*` / `query_*` live here
   prelude.rs       # user-facing re-exports (Dist, KMeansTrainingParams, KnnResult, ...)
   errors.rs        # single AnnSearchErrors enum, thiserror-backed
-  utils/           # SIMD dist, heaps, k-means, tree/graph/nndescent helpers,
+  utils/           # SIMD dist, heaps, k-means and e-means (e_means.rs), tree/graph/nndescent helpers,
                    # traits, input conversion (input.rs), striped locks
                    # (parallelism.rs), file staging
   cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
                    #              kd_forest, kmknn, lsh, nndescent, nsg,
                    #              rnn_descent, soar, vamana
   quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + soar_pq, soar_opq
-                   # (IVF-PQ/OPQ with SOAR spilling) + shared k_means & quantisers
+                   # (IVF-PQ/OPQ with SOAR spilling) + shared k_means, quantisers and
+                   # pq_search (LUT and batched query kernels for all six PQ/OPQ indices)
   binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
   gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
                    # clustered_nndescent_gpu, forest_gpu, k_means_gpu,
                    # dist_gpu, topk_gpu
+  mlx/             # MLX backend: exhaustive, ivf, cagra, forest, nndescent, k_means
+  synthetic/       # dataset generators (`synthetic` feature)
   serialise/       # IndexIo trait, save_index / load_index, bundle header
 benches/           # gpu_*_kernels.rs: GPU kernel microbenches (CubeCL Benchmark trait);
                    # bench_*.rs / profile_*.rs: bench and profiling examples
@@ -149,6 +156,12 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 - Set `ANN_SEARCH_SIMD` to `scalar`, `sse`, `avx2` or `avx512` to force a level. It only ever downgrades, since naming a level the CPU lacks would run an illegal instruction. `cargo run --example bench_dist_kernels --release` prices the kernels at whichever level is forced; `.github/workflows/simd-check.yml` runs it at three levels on demand, and gates every SIMD PR on the x86_64 build actually emitting `ymm`, `zmm` and `vfmadd`.
 - Prefetching helper `utils::prefetch_read` inlines `_mm_prefetch` on x86_64 and `prfm pldl1keep` inline-asm on aarch64. Anywhere you're chasing an indirection in a hot loop, keep the prefetch pattern.
 
+### k-means and batched queries
+
+- Every IVF-family index trains with `KMeansTrainingParams` (CPU) or `KMeansGpuParams` (wgpu, MLX), whose `algorithm` is `KMeansAlgorithm::EMeans(EMeansParams)` by default; `Lloyd` is opt-in, and `iters`, `init` and balancing only apply to it.
+- `query_batch` on CPU IVF, kMkNN and all six PQ/OPQ indices (exhaustive, IVF, SOAR) takes a cell-grouped or tiled batched path from a minimum query count up and falls back to per-query search below it.
+- IVF and SOAR PQ/OPQ precompute a per-cell lookup-table term, `nlist * m * 256 * sizeof(T)` bytes, skipped above 256 MiB. It is rebuilt on load and not serialised.
+
 ### Validation harness
 
 `utils::KnnValidation` is a trait for computing `Recall@k` against ground truth by running a small exhaustive search internally. Indices implement it, and the gridsearch examples rely on it. When adding a new index, wire it up too.
@@ -164,8 +177,8 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 - When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735` and the IVF reducer variant in `3c657ee`. Divergence between Metal and other backends is real and needs cross-backend testing. The four distilled codegen rules (no `if` expressions for value selection, bit arithmetic over comparisons, `usize` counters plus `u32` sentinels in reducers, `Shared::new_slice` at kernel scope) are documented in the module header of `src/gpu/nndescent_gpu.rs`.
 - Every launch in the crate is `launch_unchecked`. A dispatch that busts a device limit does no work, returns zeros and reports **no error** (the panic happens on a cubecl background thread). Benches must checksum their output before reporting a timing; an implausible speedup is the signature of a kernel that did nothing.
 - Any new `Shared::new_slice` whose size depends on `k`, a graph degree or `dim` needs a plan function with a host-only test, not a constant. Any new grid dimension proportional to `n`, `nnz` or a cluster size goes through `grid_2d`, or through `checked_cube_count` when there is no free axis to flatten into.
-- `gpu/k_means_gpu.rs` holds the device-resident Lloyd's loop (FlashAssign, privatised counting-sort CSR, segmented centroid reduction, optional RAFT-style size balancing). It is what `ivf_gpu.rs` trains *and* assigns with, and what the clustered NN-Descent partitions with. Its `KMeansGpuParams` is a separate struct from the CPU `KMeansTrainingParams`; the CSR rebuild is all `Atomic::fetch_add`, so on a runtime without u32 atomics the whole thing falls back to the CPU k-means rather than silently returning empty clusters.
-- `gpu/clustered_nndescent_gpu.rs` is the batched NN-Descent path for datasets past the per-binding limit: balanced k-means on a subsample, every point joins its two nearest clusters, `nndescent_core` runs per cluster against a shared client, subgraphs merge on the host. `plan_cluster_count` is a pure function of `GpuLimits` with host-only tests, like the other staging plans. `C = 1` dispatches straight to `build_knn_graph_gpu`, since the overlap is pure cost when the dataset already fits.
+- `gpu/k_means_gpu.rs` holds the device-resident k-means: e-means (the default, `KMeansAlgorithm::EMeans`, shared with CPU and MLX) and Lloyd's loop (30 fixed iterations by default; FlashAssign, privatised counting-sort CSR, segmented centroid reduction, optional RAFT-style size balancing, Lloyd only). It is what `ivf_gpu.rs` trains *and* assigns with, and what the clustered NN-Descent partitions with. Its `KMeansGpuParams` is a separate struct from the CPU `KMeansTrainingParams`; the CSR rebuild is all `Atomic::fetch_add`, so on a runtime without u32 atomics the whole thing falls back to the CPU k-means rather than silently returning empty clusters.
+- `gpu/clustered_nndescent_gpu.rs` is the batched NN-Descent path for datasets past the per-binding limit: balanced Lloyd's k-means on a subsample, every point joins its two nearest clusters, `nndescent_core` runs per cluster against a shared client, subgraphs merge on the host. `plan_cluster_count` is a pure function of `GpuLimits` with host-only tests, like the other staging plans. `C = 1` dispatches straight to `build_knn_graph_gpu`, since the overlap is pure cost when the dataset already fits.
 - `WORKGROUP_SIZE_X` is 32, which matches Apple Silicon's plane size by coincidence rather than by design: **this crate uses no plane primitives**, every cross-thread reduction goes through `sync_cube()` plus shared memory. If you do add one, gate it on `plane_uniform(wg_size, &limits)` from `cubecl-utils-rs` and keep the existing kernel as the fallback arm, because a workgroup straddling two planes gives silently wrong answers.
 
 ### Errors
