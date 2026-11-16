@@ -48,7 +48,7 @@ class _BaseMlxIndex(BaseAnnIndex):
     _FORCE_DTYPE: ClassVar[np.dtype | None] = np.dtype(np.float32)
     _SERIALISABLE: ClassVar[bool] = False
     # Not a `_Handle`: no save/load. `_SERIALISABLE` keeps the base off those.
-    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[invalid-attribute-override]
+    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[incompatible-attribute-override]
 
     def fit(self, X: Any, y: Any = None) -> BaseAnnIndex:
         self._thread = threading.get_ident()
