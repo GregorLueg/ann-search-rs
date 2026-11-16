@@ -18,6 +18,7 @@ categories = [
     "science::bioinformatics",
     "science::computational-biology",
 ]
+exclude = ["docs/", "benchmarks/", ".github/", "CLAUDE.md"]
 
 [lib]
 name = "ann_search_rs"
