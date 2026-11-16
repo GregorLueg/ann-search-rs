@@ -107,17 +107,17 @@ in a few coordinates gets subspaces of wildly unequal difficulty. The rotation
 spreads it, and it never lost recall in the tables: anywhere from nothing to
 +0.28 over plain PQ depending on the generator.
 
-It isn't free. Build costs 3.5 to 5x for the exhaustive index and 3 to 4x under
-IVF (`opq_iters` is the knob). The rotation has to be applied to every query,
-which is lost in the noise of an exhaustive scan but costs up to 1.3x the IVF
-query time at 256 dimensions and 1.8x at 768. It also stores a `dim x dim`
+It isn't free. Build costs 4 to 5.3x for the exhaustive index and 2.7 to 4.7x
+under IVF (`opq_iters` is the knob). The rotation has to be applied to every
+query, which is lost in the noise of an exhaustive scan but costs up to 1.3x the
+IVF query time at 256 dimensions and 1.45x at 768. It also stores a `dim x dim`
 matrix, so the index is larger than the plain PQ equivalent.
 
 **The IVF variants** learn the codes on the residual from the cell centroid
 rather than on the vector, so the sub-codebooks only have to cover within-cell
 spread. That's why `IvfPqIndex` reaches better recall than `ExhaustivePqIndex`
 at the same `m`, on top of scanning fewer candidates. It holds on every
-generator in the tables, and costs 1.2 to 1.8x the build time.
+generator in the tables, and costs 1.15 to 1.9x the build time.
 
 **The SOAR variants** spill every vector into a second cell chosen so its
 residual points somewhere the first one doesn't, fixing IVF's main failure of a

@@ -2069,12 +2069,15 @@ IVF-OPQ-nl316-m128 (self)                              6_861.34     2_235.78    
 
 [SOAR](benchmarks_standard.md#soar) spilling on top of IVF-PQ and IVF-OPQ. On
 exact full-vector search spilling loses, because probing one more cell there
-costs nothing fixed. PQ changes the arithmetic: codes are residuals against a
-cell centroid, so every probed cell has to rebuild the ADC lookup table at
-`n_pq_centroids * dim` operations before it scores a single candidate. At 512
-dimensions that table build is over an order of magnitude more expensive than
-scanning the cell it serves, so pulling twice the candidates out of *one* cell
-should beat pulling them out of two.
+costs nothing fixed. PQ changes the arithmetic a little: codes are residuals
+against a cell centroid, so the ADC table differs per cell. The query part of
+that table is built once per query (by GEMM over a block of queries in
+`query_batch`), and the per-cell part is precomputed at build time (up to a
+256 MiB budget, see `set_cell_terms_budget`), so each probed cell still pays `m * 256` additions before it scores a candidate. At
+50k points and a few hundred cells that is the same order as scanning the cell
+itself. Pulling the spilled candidates out of cells that are probed anyway is
+the bet; whether it pays against simply probing more cells is what the tables
+answer.
 
 Spilling costs `2 * n * m` code bytes instead of `n * m`. The comparison that
 matters is therefore against an IVF-PQ index with **twice the subspaces**, which
@@ -2091,8 +2094,7 @@ only when both sides are rotated.
   column runs `2 * m`, which stays a divisor of `dim` for any `dim` that is a
   multiple of 16.
 - *Number of lists (nl)*: Skewed lower than the exact-search SOAR sweep, since
-  per-query cost is dominated by the per-cell table rebuild rather than by the
-  candidate scan.
+  every probed cell carries the fixed `m * 256` table cost on top of its scan.
 - *Number of probes (np)*: As SOAR, skewed low. Read recall against query time,
   not against `nprobe`.
 - *Rule*: The three secondary-assignment rules from
