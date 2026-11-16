@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
     
     
       
@@ -1017,17 +1017,18 @@ and cannot exceed your sample count, so a small dataset needs it lowered.</p>
 <p><strong>OPQ</strong> adds a learned orthogonal rotation before the split. Plain PQ splits on
 whatever axis order the data arrived in, so a space with variance concentrated
 in a few coordinates gets subspaces of wildly unequal difficulty. The rotation
-spreads it, and it buys recall everywhere it was measured: +0.01 to +0.19 over
-plain PQ depending on the generator.</p>
-<p>It isn't free at either end. Build costs 3 to 5x (<code>opq_iters</code> is the knob), and
-the rotation has to be applied to every query, which runs from 1.1x the query
-time at 256 dimensions to 3.1x at 768. It also stores a <code>dim x dim</code> matrix, so
-the index is larger than the plain PQ equivalent.</p>
+spreads it, and it never lost recall in the tables: anywhere from nothing to
++0.28 over plain PQ depending on the generator.</p>
+<p>It isn't free. Build costs 4 to 5.3x for the exhaustive index and 2.7 to 4.7x
+under IVF (<code>opq_iters</code> is the knob). The rotation has to be applied to every
+query, which is lost in the noise of an exhaustive scan but costs up to 1.3x the
+IVF query time at 256 dimensions and 1.45x at 768. It also stores a <code>dim x dim</code>
+matrix, so the index is larger than the plain PQ equivalent.</p>
 <p><strong>The IVF variants</strong> learn the codes on the residual from the cell centroid
 rather than on the vector, so the sub-codebooks only have to cover within-cell
 spread. That's why <code>IvfPqIndex</code> reaches better recall than <code>ExhaustivePqIndex</code>
 at the same <code>m</code>, on top of scanning fewer candidates. It holds on every
-generator in the tables, and costs about 2.2x the build time.</p>
+generator in the tables, and costs 1.15 to 1.9x the build time.</p>
 <p><strong>The SOAR variants</strong> spill every vector into a second cell chosen so its
 residual points somewhere the first one doesn't, fixing IVF's main failure of a
 true neighbour sitting just over a cell boundary. Twice the posting-list
@@ -1035,12 +1036,11 @@ entries, which is exactly what quantisation makes affordable. Read that trade
 against query time, not against <code>nprobe</code>: at a fixed <code>nprobe</code> a spilled index
 scans about twice the candidates, so comparing at equal <code>nprobe</code> flatters it
 and answers nothing.</p>
-<p>Unlike the unquantised <code>SoarIndex</code>, here the doubling really does show up in
-the index size, because the codes <em>are</em> the storage: <code>SoarPqIndex</code> runs about
-2x an <code>IvfPqIndex</code> at the same <code>m</code>. <code>SoarOpqIndex</code> is the largest index of the
-PQ family, not the smallest, since it pays for the spilling and the rotation
-matrix both. An <code>IvfOpqIndex</code> at twice the <code>m</code> is smaller and quicker to build
-at matching memory.</p>
+<p>Unlike the unquantised <code>SoarIndex</code>, here the doubling does show up in the index
+size, because the codes <em>are</em> the storage. It is diluted by the per-cell lookup
+table the IVF and SOAR indices precompute, which both carry at the same size:
+<code>SoarPqIndex</code> and <code>SoarOpqIndex</code> run 1.2 to 1.4x the IVF index at the same <code>m</code>
+and <code>nlist</code>, and an IVF index at twice the <code>m</code> is larger than either.</p>
 <h3 id="rabitq-graphs">RaBitQ graphs<a class="headerlink" href="#rabitq-graphs" title="Permanent link">&para;</a></h3>
 <p><code>HnswRaBitQIndex</code>, <code>QgIndex</code>.</p>
 <p>Two graph indices on RaBitQ codes, pulling in opposite directions.</p>
@@ -1141,7 +1141,7 @@ dimensions.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "navigation.tracking", "content.code.copy", "content.action.edit", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
+      <script src="../assets/javascripts/bundle.a5f9d56c.min.js"></script>
       
     
   </body>
