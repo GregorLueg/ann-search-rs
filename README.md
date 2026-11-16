@@ -40,6 +40,10 @@ cannot rule out are re-scored on that instead. With a store,
 bound still overlaps the current k-th distance; `Some(f)` keeps the fixed
 `k * f` shortlist.
 
+Every IVF-family index (CPU, wgpu, MLX) trains its cells with e-means by
+default (Bessa et al., 2026); `KMeansAlgorithm::Lloyd` in
+`KMeansTrainingParams` or `KMeansGpuParams` switches back.
+
 Every index has a `query_*_self` path for the full self-kNN graph, and most take
 a shortcut there: IVF exploits its Voronoi cells, HNSW walks the graph without
 re-entering, NN-Descent hands back the graph it built anyway.
@@ -61,7 +65,7 @@ let row = graph.row(0); // k + 1 ids, the point itself first
 
 ```toml
 [dependencies]
-ann-search-rs = { version = "0.12", features = ["quantised", "binary"] }
+ann-search-rs = { version = "0.13", features = ["quantised", "binary"] }
 ```
 
 Optional features:
@@ -108,7 +112,9 @@ let index = build_hnsw_index((flat.as_slice(), 10_000, 32), 16, 100, "euclidean"
 ```
 
 The `examples/gridsearch_*.rs` scripts run every index across a parameter grid.
-Quickest way to see how one behaves on your kind of data. Moreover, every build
+Quickest way to see how one behaves on your kind of data. The microbenches and
+profiling drivers live in `benches/` (`bench_*.rs`, `profile_*.rs`) but still run
+as examples, e.g. `cargo run --example profile_hnsw --release`. Moreover, every build
 and query takes a `Verbosity`. `Quiet` prints nothing but warnings. `Normal`
 prints one line at the start and end of a build or query, plus a progress line
 every 100_000 queried samples. `Detailed` adds the timed build stages and
@@ -193,7 +199,7 @@ brew install mlx-c
 ```
 
 ```toml
-ann-search-rs = { version = "0.12", features = ["mlx"] }
+ann-search-rs = { version = "0.13", features = ["mlx"] }
 ```
 
 If mlx-c lives somewhere other than `/opt/homebrew`, set `MLX_C_PREFIX`. If it

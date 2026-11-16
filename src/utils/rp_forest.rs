@@ -99,6 +99,46 @@ where
     knn_graph
 }
 
+/// Map a compacted graph built on permuted rows back to the original ids.
+///
+/// ### Params
+///
+/// * `graph` - Flat `n * k` graph over the permuted rows, as returned by
+///   [`compact_knn_rows`]
+/// * `k` - Row length
+/// * `new_to_old` - Original id of each permuted row
+///
+/// ### Returns
+///
+/// The same graph with rows and ids in the original order; sentinel slots
+/// stay sentinel.
+pub(crate) fn unpermute_knn_rows<T>(
+    graph: &[(u32, T)],
+    k: usize,
+    new_to_old: &[u32],
+) -> Vec<(u32, T)>
+where
+    T: AnnSearchFloat,
+{
+    let sentinel = SENTINEL_PID as u32;
+    let mut old_to_new = vec![0u32; new_to_old.len()];
+    for (new, &old) in new_to_old.iter().enumerate() {
+        old_to_new[old as usize] = new as u32;
+    }
+    let mut out = vec![(sentinel, <T as num_traits::Float>::max_value()); graph.len()];
+    out.par_chunks_mut(k)
+        .zip(old_to_new.par_iter())
+        .for_each(|(row, &new)| {
+            let src = &graph[new as usize * k..(new as usize + 1) * k];
+            for (slot, &(id, d)) in row.iter_mut().zip(src) {
+                if id != sentinel {
+                    *slot = (new_to_old[id as usize], d);
+                }
+            }
+        });
+    out
+}
+
 /// Build leaf-point arrays from final partition IDs.
 ///
 /// Groups points by partition, sorts them, and builds a CSR-style offset

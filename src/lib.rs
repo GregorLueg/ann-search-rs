@@ -491,11 +491,8 @@ pub fn query_kmknn_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("kMkNN index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 /// Helper function to self query a kMkNN index
@@ -939,11 +936,8 @@ pub fn query_ivf_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 /// Helper function to self query an IVF index
@@ -2277,11 +2271,8 @@ pub fn query_exhaustive_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("Exhaustive-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2385,11 +2376,8 @@ pub fn query_exhaustive_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("Exhaustive-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -2865,10 +2853,10 @@ where
 ///
 /// An IVF-PQ index in which every point is encoded twice, once as a residual
 /// against each of the two Voronoi cells it belongs to. Product quantisation
-/// rebuilds its ADC lookup table per probed cell, so drawing twice the
-/// candidates out of one cell is cheaper than the same candidates out of two.
-/// That is the asymmetry spilling exploits, and it does not exist for exact
-/// full-vector search.
+/// pays a fixed ADC table cost per probed cell (`m * n_pq_centroids` adds with
+/// the precomputed cell terms), so drawing twice the candidates out of one cell
+/// can beat the same candidates out of two. Exact full-vector search has no
+/// such fixed cost, which is why spilling loses there.
 ///
 /// Costs `2 * n * m` code bytes rather than `n * m`, so the fair comparison is
 /// against [`build_ivf_pq_index`] with twice the subspaces.
@@ -2937,8 +2925,8 @@ where
 ///
 /// The OPQ counterpart of [`build_soar_pq_index`]: every point is encoded twice
 /// as a rotated residual, once against each of the two Voronoi cells it belongs
-/// to. See [`build_soar_pq_index`] for why the per-cell ADC lookup table is what
-/// makes spilling pay under quantisation.
+/// to. See [`build_soar_pq_index`] for why the per-cell ADC table cost is what
+/// can make spilling pay under quantisation.
 ///
 /// ### Params
 ///
@@ -3026,11 +3014,8 @@ pub fn query_soar_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("SOAR-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3093,11 +3078,8 @@ pub fn query_soar_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("SOAR-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3162,11 +3144,8 @@ pub fn query_ivf_pq_index<T>(
 where
     T: AnnSearchFloat,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF-PQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]
@@ -3293,11 +3272,8 @@ pub fn query_ivf_opq_index<T>(
 where
     T: AnnSearchFloat + AddAssign,
 {
-    let (queries, nq, dim) = query_mat.into_row_major();
-
-    query_parallel("IVF-OPQ index", nq, return_dist, verbosity, |i| {
-        index.query(&queries[i * dim..(i + 1) * dim], k, nprobe)
-    })
+    let (queries, _, dim) = query_mat.into_row_major();
+    index.query_batch(&queries, dim, k, nprobe, return_dist, verbosity)
 }
 
 #[cfg(feature = "quantised")]

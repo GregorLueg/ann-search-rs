@@ -3,6 +3,25 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.7.0
+
+Requires `ann-search-rs` 0.13.0
+
+- e-means is the default k-means for every IVF-family index (IVF, KMKNN, SOAR,
+  the quantised IVFs, GPU and MLX IVF). Results differ at the same seed.
+- New `kmeans_algorithm` (`"emeans"` or `"lloyd"`) and `kmeans_epochs` knobs.
+  `kmeans_iters` and `kmeans_balanced` now only apply to `"lloyd"` and raise a
+  `ValueError` otherwise; before, passing `kmeans_iters` quietly switched to
+  Lloyd's and `kmeans_balanced` alone was ignored.
+- GPU IVF Lloyd's defaults to 30 iterations instead of 50.
+- e-means seeds with k-means|| for up to 200 centroids, like Lloyd's.
+- `set_cell_terms_budget(max_bytes)` on `IvfPqIndex`, `IvfOpqIndex`,
+  `SoarPqIndex` and `SoarOpqIndex` caps the precomputed per-cell table
+  (default 256 MiB, `0` turns it off).
+- Faster IVF and kMkNN queries, faster PQ/OPQ builds and queries, and a faster
+  NSG build (its NN-Descent kNN graph), all from `ann-search-rs` 0.13.0.
+  PQ/OPQ distances differ at rounding level; NSG differs at the same seed.
+
 ## 0.6.1
 
 Requires `ann-search-rs` 0.12.2

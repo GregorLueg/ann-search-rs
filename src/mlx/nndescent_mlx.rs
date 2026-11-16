@@ -26,12 +26,15 @@ use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
+use crate::cpu::nndescent::{leaf_order, permute_rows};
 use crate::cpu::vamana::compute_medoid;
 use crate::mlx::ffi::*;
 use crate::mlx::forest_mlx::forest_init_mlx;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::unpack_knn_graph;
-use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees, ForestRouter};
+use crate::utils::rp_forest::{
+    compact_knn_rows, default_forest_trees, unpermute_knn_rows, ForestRouter,
+};
 use crate::utils::verbosity::BuildLog;
 
 ////////////
@@ -1482,8 +1485,27 @@ pub fn build_knn_graph_mlx(
         use_cosine,
     };
 
-    let out = nndescent_core_mlx(&vectors_flat, &norms, n, dim, &cfg, verbosity)?;
-    let knn_graph = compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k);
+    // The local join gathers rows by neighbour id, so put tree neighbours
+    // next to each other in memory first. Undone on the output graph.
+    let start = Instant::now();
+    let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
+    let permuted = permute_rows(&vectors_flat, dim, &new_to_old);
+    let permuted_norms: Vec<f32> = if use_cosine {
+        new_to_old.iter().map(|&i| norms[i as usize]).collect()
+    } else {
+        Vec::new()
+    };
+    if verbosity.detailed_verbosity() {
+        println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
+    }
+
+    let out = nndescent_core_mlx(&permuted, &permuted_norms, n, dim, &cfg, verbosity)?;
+    drop(permuted);
+    let knn_graph = unpermute_knn_rows(
+        &compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k),
+        k,
+        &new_to_old,
+    );
     let converged = out.converged;
     log.finish();
 

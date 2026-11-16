@@ -25,6 +25,7 @@ use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
 use faer::Mat;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::iter::Sum;
 use std::time::Instant;
@@ -32,6 +33,10 @@ use std::time::Instant;
 use crate::gpu::topk_gpu::atomic_u32_add_supported;
 use crate::gpu::{WORKGROUP_128, WORKGROUP_SIZE_X};
 use crate::prelude::*;
+use crate::utils::e_means::{
+    epoch_seed, needs_revival, print_recipe, resolve_e_means_recipe, revive_unused,
+    scheduled_alpha, split_rng, CHECK_UNUSED_EVERY, INIT_USAGE,
+};
 use crate::utils::k_means_utils::*;
 use thousands::*;
 
@@ -82,6 +87,14 @@ const CENTROID_UNROLL_WIDE: usize = if cfg!(all(target_os = "macos", target_arch
 /// [`CENTROID_UNROLL_WIDE`].
 const CENTROID_UNROLL_MAX_LINES: usize = 24;
 
+/// Batch rows per privatised-histogram cube in the e-means CSR build. The
+/// column scan is serial over the cubes, so a small batch wants few of them.
+/// Speed is flat over a wide range around this value.
+const HIST_ROWS_PER_CUBE: usize = 256;
+
+/// Upper bound on the e-means histogram cubes, the count the Lloyd loop uses.
+const HIST_MAX_CUBES: usize = 512;
+
 /// Oversampling factor for [`kmeans_parallel_init_gpu`]. Each round samples
 /// `k * KMEANSPP_OVERSAMPLING` candidates. Matches the upstream CPU
 /// `kmeans_parallel_init` so the two produce comparable initialisations.
@@ -100,7 +113,7 @@ const KMEANSPP_OVERSAMPLING: usize = 2;
 /// That second difference matters when the runtime has no `u32` atomics and
 /// [`k_means_gpu_flat`] falls back to the CPU: `iters`, `init`, `balanced` and
 /// `seed` carry across, but `fixed` and `quantise_to_f16` have nothing to map
-/// onto and are dropped. A caller asking for a fixed 50 iterations may get
+/// onto and are dropped. A caller asking for a fixed 30 iterations may get
 /// fewer, because every CPU Lloyd path stops early on centroid drift.
 #[derive(Clone, Copy, Debug)]
 pub struct KMeansGpuParams {
@@ -117,12 +130,16 @@ pub struct KMeansGpuParams {
     pub quantise_to_f16: bool,
     /// Reseed starved centroids each iteration, RAFT-style.
     pub balanced: bool,
+    /// Lloyd's or e-means. Both seed through `init`. Under
+    /// [`KMeansAlgorithm::EMeans`], `iters`, `fixed` and `balanced` are
+    /// ignored; `quantise_to_f16` still applies.
+    pub algorithm: KMeansAlgorithm,
 }
 
 impl KMeansGpuParams {
-    /// New params.
+    /// Lloyd's with these settings.
     ///
-    /// Balancing is off. Chain [`KMeansGpuParams::with_balancing`] to turn it
+    /// [`KMeansGpuParams::default`] is e-means instead. Balancing is off. Chain [`KMeansGpuParams::with_balancing`] to turn it
     /// on.
     ///
     /// ### Params
@@ -139,6 +156,7 @@ impl KMeansGpuParams {
             fixed,
             quantise_to_f16,
             balanced: false,
+            algorithm: KMeansAlgorithm::Lloyd,
         }
     }
 
@@ -158,12 +176,28 @@ impl KMeansGpuParams {
         self.balanced = balanced;
         self
     }
+
+    /// Pick the clustering algorithm
+    ///
+    /// ### Params
+    ///
+    /// * `algorithm` - [`KMeansAlgorithm::EMeans`] (the default) or
+    ///   [`KMeansAlgorithm::Lloyd`]
+    ///
+    /// ### Returns
+    ///
+    /// `self` with the algorithm set, for chaining off `new` or `default`.
+    pub fn with_algorithm(mut self, algorithm: KMeansAlgorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
 }
 
-/// Default implementation for [KMeansGpuParams]
+/// e-means at its default epoch budget. The Lloyd's fields keep 30 fixed
+/// iterations for `with_algorithm(KMeansAlgorithm::Lloyd)`.
 impl Default for KMeansGpuParams {
     fn default() -> Self {
-        Self::new(50, None, true, false)
+        Self::new(30, None, true, false).with_algorithm(KMeansAlgorithm::default())
     }
 }
 
@@ -1981,7 +2015,487 @@ where
     Ok((assignments, final_cents))
 }
 
-/// Initialise the centroids, then run the device-resident Lloyd's loop.
+/////////////
+// e-means //
+/////////////
+
+/// Gather a batch of rows (and optionally their norms) into a dense buffer.
+///
+/// One thread per output element, so consecutive threads read consecutive
+/// coordinates of the same source row.
+///
+/// ### Params
+///
+/// * `data` - Source rows `[n, dim]` in storage precision `S`
+/// * `norms` - Source L2 norms `[n]`; read only with `with_norms`
+/// * `perm` - This epoch's row order `[n]`
+/// * `out` - Destination `[>= b, dim]`
+/// * `out_norms` - Destination norms `[>= b]`; written only with `with_norms`
+/// * `offset` - Position of the batch's first row in `perm`
+/// * `b` - Batch rows
+/// * `dim` - Row length, padded; comptime
+/// * `wg_size` - Workgroup size; comptime
+/// * `with_norms` - Also gather the norms; comptime
+///
+/// ### Grid mapping
+///
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> flat
+///   output element
+#[cube(launch_unchecked)]
+pub fn gather_rows<S: Float, A: Float>(
+    data: &Tensor<S>,
+    norms: &Tensor<A>,
+    perm: &Tensor<u32>,
+    out: &mut Tensor<S>,
+    out_norms: &mut Tensor<A>,
+    offset: u32,
+    b: u32,
+    #[comptime] dim: usize,
+    #[comptime] wg_size: u32,
+    #[comptime] with_norms: bool,
+) {
+    let pos = ((CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X) as usize;
+    if pos >= b as usize * dim {
+        terminate!();
+    }
+    let i = pos / dim;
+    let e = pos % dim;
+    let r = perm[offset as usize + i] as usize;
+    out[pos] = data[r * dim + e];
+    // Kept nested: the outer test is comptime and drops out of the kernel.
+    #[allow(clippy::collapsible_if)]
+    if with_norms {
+        if e == 0 {
+            out_norms[i] = norms[r];
+        }
+    }
+}
+
+/// One e-means EMA update (Algorithm 1, line 8), in place on device.
+///
+/// A touched cluster gets `N <- (1 - a) N + a n` and moves toward its batch
+/// mean by `a n / N`; an untouched one only loses mass. In the last epoch the
+/// batch sums and counts also accumulate into the closing-mean buffers. The
+/// step comes from a per-run table so no float crosses the launch.
+///
+/// ### Params
+///
+/// * `means` - Batch means `[k, dim]`; only rows with a non-zero count are read
+/// * `counts` - Batch rows per cluster `[k]`
+/// * `alphas` - Step per update `[total_steps]`
+/// * `cent` - Centroids `[k, dim]`, updated in place
+/// * `usage` - EMA mass per cluster `[k]`, updated in place
+/// * `pass_sums` - Last-epoch coordinate sums `[k, dim]`; written only with
+///   `last`
+/// * `pass_counts` - Last-epoch counts `[k]`; written only with `last`
+/// * `step` - Index of this update
+/// * `k` - Number of clusters
+/// * `dim` - Row length, padded; comptime
+/// * `wg_size` - Workgroup size; comptime
+/// * `last` - Whether this is the last epoch; comptime
+///
+/// ### Grid mapping
+///
+/// * `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` -> cluster
+/// * `UNIT_POS_X` -> dimension stride offset within the row
+#[cube(launch_unchecked)]
+pub fn e_means_ema<A: Float>(
+    means: &Tensor<A>,
+    counts: &Tensor<u32>,
+    alphas: &Tensor<A>,
+    cent: &mut Tensor<A>,
+    usage: &mut Tensor<A>,
+    pass_sums: &mut Tensor<A>,
+    pass_counts: &mut Tensor<u32>,
+    step: u32,
+    k: u32,
+    #[comptime] dim: usize,
+    #[comptime] wg_size: u32,
+    #[comptime] last: bool,
+) {
+    let c = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
+    if c >= k {
+        terminate!();
+    }
+    let ci = c as usize;
+    let tx = UNIT_POS_X as usize;
+    let cnt = counts[ci];
+    let alpha = alphas[step as usize];
+    let added = alpha * A::cast_from(cnt);
+    let mass = usage[ci] * (A::new(1.0_f32) - alpha) + added;
+    // Every thread reads the old mass before thread 0 overwrites it.
+    sync_cube();
+    if tx == 0 {
+        usage[ci] = mass;
+        if last {
+            pass_counts[ci] += cnt;
+        }
+    }
+    if cnt == 0u32 {
+        terminate!();
+    }
+    let w = added / mass;
+    let cnt_a = A::cast_from(cnt);
+    let base = ci * dim;
+    let mut e = tx;
+    while e < dim {
+        let m = means[base + e];
+        let x = cent[base + e];
+        let mut v = x + w * (m - x);
+        if w >= A::new(1.0_f32) {
+            v = m;
+        }
+        cent[base + e] = v;
+        if last {
+            pass_sums[base + e] += m * cnt_a;
+        }
+        e += wg_size as usize;
+    }
+}
+
+/// Write a batch's labels back to the rows they belong to.
+///
+/// ### Params
+///
+/// * `assign` - Label per batch row `[>= b]`
+/// * `perm` - This epoch's row order `[n]`
+/// * `labels` - Label per data row `[n]`, written at the batch's rows
+/// * `offset` - Position of the batch's first row in `perm`
+/// * `b` - Batch rows
+/// * `wg_size` - Workgroup size; comptime
+///
+/// ### Grid mapping
+///
+/// * `(CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X` -> batch
+///   row
+#[cube(launch_unchecked)]
+pub fn scatter_labels(
+    assign: &Tensor<u32>,
+    perm: &Tensor<u32>,
+    labels: &mut Tensor<u32>,
+    offset: u32,
+    b: u32,
+    #[comptime] wg_size: u32,
+) {
+    let i = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) * wg_size + UNIT_POS_X;
+    if i >= b {
+        terminate!();
+    }
+    labels[perm[(offset + i) as usize] as usize] = assign[i as usize];
+}
+
+/// Refresh the centroid norms the cosine assignment reads.
+///
+/// ### Params
+///
+/// * `client` - CubeCL compute client
+/// * `cent_gpu` - Centroids `[k, dim]`
+/// * `cnorm_gpu` - Output norms `[k]`
+/// * `k` - Number of centroids
+/// * `dim` - Row length, padded
+///
+/// ### Returns
+///
+/// `Ok(())`, or `CubeclUtils` if the grid is over the device limit
+fn refresh_centroid_norms<A>(
+    client: &Client,
+    cent_gpu: &GpuTensor<A>,
+    cnorm_gpu: &GpuTensor<A>,
+    k: usize,
+    dim: usize,
+) -> Result<(), AnnSearchErrors>
+where
+    A: Float + cubecl::CubeElement,
+{
+    let (gx, gy) = grid_2d(k as u32, &GpuLimits::from_client(client))?;
+    unsafe {
+        centroid_norms_l2::launch_unchecked::<A>(
+            client,
+            CubeCount::Static(gx, gy, 1),
+            CubeDim::new_1d(1),
+            cent_gpu.clone().into_tensor_arg(),
+            cnorm_gpu.clone().into_tensor_arg(),
+            k as u32,
+            dim,
+        );
+    }
+    Ok(())
+}
+
+/// e-means with the whole update on the device.
+///
+/// Per batch: gather the rows through this epoch's permutation, FlashAssign,
+/// privatised CSR plus segmented reduction for the batch means, then the EMA
+/// kernel. The permutation goes up once per epoch and the step sizes once per
+/// run, so nothing crosses the bus inside an epoch except the revival check:
+/// every `CHECK_UNUSED_EVERY` updates the `k` masses come back, and only when a
+/// split is due do the centroids round-trip through the host's
+/// [`revive_unused`]. The closing means are formed on the host from one read
+/// of the last-epoch sums.
+///
+/// ### Type parameters
+///
+/// * `S` - Storage precision of the data buffer
+/// * `A` - Accumulator and centroid precision
+///
+/// ### Params
+///
+/// * `client` - CubeCL compute client
+/// * `data_gpu` - Data on device `[n, dim_padded]` in `S`
+/// * `pnorm_gpu` - Point L2 norms `[n]` under cosine, a dummy otherwise
+/// * `n` - Number of data points
+/// * `n_centroids` - Number of centroids
+/// * `dim` - Unpadded dimension; picks the batch law and revival default
+/// * `dim_padded` - Padded dimension, a multiple of `LINE_SIZE`
+/// * `dist` - Distance metric
+/// * `em` - e-means parameters
+/// * `init` - Initial centroids `[n_centroids, dim_padded]` in `A`
+/// * `seed` - Seed for the shuffles and revival
+/// * `verbosity` - Prints the recipe and per-epoch lines at `Detailed`
+///
+/// ### Returns
+///
+/// `(last-pass labels, centroids [n_centroids, dim_padded] in A)`
+#[allow(clippy::too_many_arguments)]
+fn run_e_means_gpu<S, A>(
+    client: &Client,
+    data_gpu: &GpuTensor<S>,
+    pnorm_gpu: &GpuTensor<A>,
+    n: usize,
+    n_centroids: usize,
+    dim: usize,
+    dim_padded: usize,
+    dist: &Dist,
+    em: &EMeansParams,
+    init: &[A],
+    seed: usize,
+    verbosity: Verbosity,
+) -> Result<(Vec<u32>, Vec<A>), AnnSearchErrors>
+where
+    S: Float + cubecl::CubeElement,
+    A: Float + cubecl::CubeElement + AnnSearchFloat,
+{
+    let start = Instant::now();
+    let recipe = resolve_e_means_recipe(n, n_centroids, dim, em)?;
+    if verbosity.detailed_verbosity() {
+        print_recipe(&recipe);
+    }
+    let (k, dp) = (n_centroids, dim_padded);
+    let to_a = |v: f64| <A as num_traits::NumCast>::from(v).unwrap();
+    let limits = GpuLimits::from_client(client);
+    let cosine = *dist == Dist::Cosine;
+    let bsz = recipe.batch_size;
+    let cube_count = bsz.div_ceil(HIST_ROWS_PER_CUBE).clamp(1, HIST_MAX_CUBES);
+
+    let mut cent_gpu = GpuTensor::<A>::from_slice(init, vec![k, dp], client)?;
+    let mut usage_gpu = GpuTensor::<A>::from_slice(&vec![to_a(INIT_USAGE); k], vec![k], client)?;
+    let pass_sums = GpuTensor::<A>::from_slice(&vec![A::zero(); k * dp], vec![k, dp], client)?;
+    let pass_counts = GpuTensor::<u32>::from_slice(&vec![0u32; k], vec![k], client)?;
+    let alphas: Vec<A> = (0..recipe.total_steps)
+        .map(|s| to_a(scheduled_alpha(recipe.alpha0, s, recipe.total_steps)))
+        .collect();
+    let alphas_gpu = GpuTensor::<A>::from_slice(&alphas, vec![alphas.len()], client)?;
+    let cnorm_gpu = if cosine {
+        let c = GpuTensor::<A>::empty(vec![k], client)?;
+        refresh_centroid_norms(client, &cent_gpu, &c, k, dp)?;
+        c
+    } else {
+        GpuTensor::<A>::from_slice(&[A::one()], vec![1], client)?
+    };
+
+    let batch_data = GpuTensor::<S>::empty(vec![bsz, dp], client)?;
+    let batch_norms = GpuTensor::<A>::empty(vec![if cosine { bsz } else { 1 }], client)?;
+    let batch_assign = GpuTensor::<u32>::empty(vec![bsz], client)?;
+    let privatised_counts = GpuTensor::<u32>::empty(vec![cube_count, k], client)?;
+    let counts = GpuTensor::<u32>::empty(vec![k], client)?;
+    let offsets = GpuTensor::<u32>::empty(vec![k + 1], client)?;
+    let all_indices = GpuTensor::<u32>::empty(vec![bsz], client)?;
+    let means_gpu = GpuTensor::<A>::empty(vec![k, dp], client)?;
+    let labels_gpu = GpuTensor::<u32>::empty(vec![n], client)?;
+    let (ema_gx, ema_gy) = grid_2d(k as u32, &limits)?;
+
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    let mut rng = split_rng(seed);
+    let n_epochs = recipe.epoch_rows.len();
+    let mut step = 0usize;
+    for (epoch, &rows) in recipe.epoch_rows.iter().enumerate() {
+        perm.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
+        let perm_gpu = GpuTensor::<u32>::from_slice(&perm, vec![n], client)?;
+        let last = epoch + 1 == n_epochs;
+        let mut revived = 0usize;
+
+        for b0 in (0..rows).step_by(bsz) {
+            let b = bsz.min(rows - b0);
+            let (gx, gy) = grid_2d(((b * dp) as u32).div_ceil(WORKGROUP_128), &limits)?;
+            unsafe {
+                gather_rows::launch_unchecked::<S, A>(
+                    client,
+                    CubeCount::Static(gx, gy, 1),
+                    CubeDim::new_1d(WORKGROUP_128),
+                    data_gpu.clone().into_tensor_arg(),
+                    pnorm_gpu.clone().into_tensor_arg(),
+                    perm_gpu.clone().into_tensor_arg(),
+                    batch_data.clone().into_tensor_arg(),
+                    batch_norms.clone().into_tensor_arg(),
+                    b0 as u32,
+                    b as u32,
+                    dp,
+                    WORKGROUP_128,
+                    cosine,
+                );
+            }
+            flash_assign_device::<S, A>(
+                client,
+                &batch_data,
+                &cent_gpu,
+                &batch_norms,
+                &cnorm_gpu,
+                &batch_assign,
+                b,
+                k,
+                dp,
+                dist,
+            )?;
+            build_csr_gpu_privatised(
+                &batch_assign,
+                b,
+                k,
+                cube_count,
+                &privatised_counts,
+                &counts,
+                &offsets,
+                &all_indices,
+                client,
+            )?;
+            segmented_update::<S, A>(
+                &batch_data,
+                &all_indices,
+                &offsets,
+                &means_gpu,
+                k,
+                dp,
+                client,
+            )?;
+            unsafe {
+                e_means_ema::launch_unchecked::<A>(
+                    client,
+                    CubeCount::Static(ema_gx, ema_gy, 1),
+                    CubeDim::new_1d(WORKGROUP_SIZE_X),
+                    means_gpu.clone().into_tensor_arg(),
+                    counts.clone().into_tensor_arg(),
+                    alphas_gpu.clone().into_tensor_arg(),
+                    cent_gpu.clone().into_tensor_arg(),
+                    usage_gpu.clone().into_tensor_arg(),
+                    pass_sums.clone().into_tensor_arg(),
+                    pass_counts.clone().into_tensor_arg(),
+                    step as u32,
+                    k as u32,
+                    dp,
+                    WORKGROUP_SIZE_X,
+                    last,
+                );
+            }
+            if last {
+                let (lx, ly) = grid_2d((b as u32).div_ceil(WORKGROUP_128), &limits)?;
+                unsafe {
+                    scatter_labels::launch_unchecked(
+                        client,
+                        CubeCount::Static(lx, ly, 1),
+                        CubeDim::new_1d(WORKGROUP_128),
+                        batch_assign.clone().into_tensor_arg(),
+                        perm_gpu.clone().into_tensor_arg(),
+                        labels_gpu.clone().into_tensor_arg(),
+                        b0 as u32,
+                        b as u32,
+                        WORKGROUP_128,
+                    );
+                }
+            }
+
+            step += 1;
+            if step.is_multiple_of(CHECK_UNUSED_EVERY) && recipe.unused_threshold > 0.0 {
+                let mut usage: Vec<f64> = usage_gpu
+                    .clone()
+                    .read(client)?
+                    .iter()
+                    .map(|u| num_traits::ToPrimitive::to_f64(u).unwrap())
+                    .collect();
+                if needs_revival(&usage, recipe.unused_threshold) {
+                    let mut cents = cent_gpu.clone().read(client)?;
+                    revived += revive_unused(
+                        &mut cents,
+                        &mut usage,
+                        recipe.unused_threshold,
+                        dp,
+                        &mut rng,
+                    );
+                    let usage_a: Vec<A> = usage.iter().map(|&u| to_a(u)).collect();
+                    cent_gpu = GpuTensor::<A>::from_slice(&cents, vec![k, dp], client)?;
+                    usage_gpu = GpuTensor::<A>::from_slice(&usage_a, vec![k], client)?;
+                }
+            }
+            if cosine {
+                refresh_centroid_norms(client, &cent_gpu, &cnorm_gpu, k, dp)?;
+            }
+        }
+
+        if verbosity.detailed_verbosity() {
+            println!(
+                "  Epoch {}/{n_epochs}: {} clusters revived ({:.2?})",
+                epoch + 1,
+                revived.separate_with_underscores(),
+                start.elapsed()
+            );
+        }
+    }
+
+    // Closing means (Algorithm 1, line 12); clusters the last pass never
+    // touched keep their EMA position.
+    let mut centroids = cent_gpu.read(client)?;
+    let sums = pass_sums.read(client)?;
+    let cnts = pass_counts.read(client)?;
+    for ((row, sum), &cnt) in centroids
+        .chunks_exact_mut(dp)
+        .zip(sums.chunks_exact(dp))
+        .zip(&cnts)
+    {
+        if cnt > 0 {
+            let inv = A::one() / to_a(cnt as f64);
+            for (c, &s) in row.iter_mut().zip(sum) {
+                *c = s * inv;
+            }
+        }
+    }
+
+    // Below one full closing pass some rows were never labelled; label every
+    // row against the final centroids instead.
+    let labels = if *recipe.epoch_rows.last().unwrap() == n {
+        labels_gpu.read(client)?
+    } else {
+        let cent_final = GpuTensor::<A>::from_slice(&centroids, vec![k, dp], client)?;
+        if cosine {
+            refresh_centroid_norms(client, &cent_final, &cnorm_gpu, k, dp)?;
+        }
+        flash_assign_device::<S, A>(
+            client,
+            data_gpu,
+            &cent_final,
+            pnorm_gpu,
+            &cnorm_gpu,
+            &labels_gpu,
+            n,
+            k,
+            dp,
+            dist,
+        )?;
+        labels_gpu.read(client)?
+    };
+
+    Ok((labels, centroids))
+}
+
+/// Initialise the centroids, then run the device-resident Lloyd's loop, or
+/// hand over to [`run_e_means_gpu`] under [`KMeansAlgorithm::EMeans`].
 ///
 /// Split out of [`k_means_clusters_gpu`] so both storage precisions share it.
 /// Initialisation runs after the data upload because the k-means|| path needs
@@ -2003,6 +2517,7 @@ where
 ///   metric is not cosine
 /// * `n` - Number of data points
 /// * `n_centroids` - Number of centroids
+/// * `dim` - Unpadded vector dimension, for the e-means recipe
 /// * `dim_padded` - Padded vector dimension
 /// * `dist` - Distance metric
 /// * `params` - GPU k-means parameters
@@ -2027,6 +2542,7 @@ fn init_and_run<S, A>(
     pnorm_gpu: &GpuTensor<A>,
     n: usize,
     n_centroids: usize,
+    dim: usize,
     dim_padded: usize,
     dist: &Dist,
     params: &KMeansGpuParams,
@@ -2060,6 +2576,23 @@ where
             KMeansInit::KMeansParallel => "k-means|| on the GPU",
         };
         println!(" Initialised centroids via {how}");
+    }
+
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        return run_e_means_gpu::<S, A>(
+            client,
+            data_gpu,
+            pnorm_gpu,
+            n,
+            n_centroids,
+            dim,
+            dim_padded,
+            dist,
+            &em,
+            &centroids,
+            seed,
+            verbosity,
+        );
     }
 
     let cent_gpu = GpuTensor::<A>::from_slice(&centroids, vec![n_centroids, dim_padded], client)?;
@@ -2212,8 +2745,9 @@ fn kmeans_cpu_fallback<T>(
 where
     T: AnnSearchFloat,
 {
-    let cpu_params =
-        KMeansTrainingParams::new(params.iters, params.init, None).with_balancing(params.balanced);
+    let cpu_params = KMeansTrainingParams::new(params.iters, params.init, None)
+        .with_balancing(params.balanced)
+        .with_algorithm(params.algorithm);
 
     let centroids = train_centroids(
         data,
@@ -2350,11 +2884,8 @@ where
         data.to_vec()
     };
 
-    let init_method = params.init.unwrap_or(if n_centroids > 200 {
-        KMeansInit::Random
-    } else {
-        KMeansInit::KMeansParallel
-    });
+    let e_means = matches!(params.algorithm, KMeansAlgorithm::EMeans(_));
+    let init_method = resolve_init(params.init, n_centroids);
 
     // Norms are needed by the cosine assignment kernel and by the k-means||
     // initialisation, so compute them once. They depend only on the data, so
@@ -2373,7 +2904,7 @@ where
         GpuTensor::<T>::from_slice(&[T::one()], vec![1], client)?
     };
 
-    if verbosity.detailed_verbosity() {
+    if verbosity.detailed_verbosity() && !e_means {
         println!(
             " Running Lloyd's iterations ({}, {})",
             if params.fixed {
@@ -2414,6 +2945,7 @@ where
             &pnorm_gpu,
             n,
             n_centroids,
+            dim,
             dim_padded,
             metric,
             &params,
@@ -2436,6 +2968,7 @@ where
             &pnorm_gpu,
             n,
             n_centroids,
+            dim,
             dim_padded,
             metric,
             &params,
@@ -2656,6 +3189,136 @@ mod entry_point_tests {
         assert_eq!(centroids.len(), k * dim);
         assert_eq!(assignments.len(), n);
         assert!(assignments.iter().all(|&c| (c as usize) < k));
+    }
+
+    /// Blobs with uniform noise on `[-0.5, 0.5)` per dimension, row-major.
+    fn e_means_blobs(n: usize, dim: usize, n_blobs: usize, seed: u64) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let centres: Vec<f32> = (0..n_blobs * dim)
+            .map(|_| rng.random::<f32>() * 20.0 - 10.0)
+            .collect();
+        (0..n)
+            .flat_map(|i| {
+                let b = i % n_blobs;
+                (0..dim)
+                    .map(|d| centres[b * dim + d] + rng.random::<f32>() - 0.5)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Mean squared distance to the nearest centroid, scored on the CPU.
+    fn e_means_error(data: &[f32], dim: usize, cents: &[f32]) -> f64 {
+        let n = data.len() / dim;
+        let k = cents.len() / dim;
+        let a = assign_all_parallel(data, &[], dim, n, cents, &[], k, &Dist::SquaredEuclidean);
+        data.chunks(dim)
+            .zip(&a)
+            .map(|(x, &c)| {
+                f32::euclidean_simd(x, &cents[c as usize * dim..(c as usize + 1) * dim]) as f64
+            })
+            .sum::<f64>()
+            / n as f64
+    }
+
+    /// GPU and CPU e-means reach the same optimum on data with an unambiguous
+    /// answer.
+    ///
+    /// The two backends seed through different k-means|| implementations, and
+    /// rounding differs across platforms, so a single run on a rugged landscape
+    /// can settle in different local optima. Comparing one seed against the
+    /// other was therefore a test of seeding paths, not of the e-means update.
+    /// Here every blob is far apart and `k` equals the blob count, so the
+    /// optimum is the blob means at the noise floor. The best of several seeds
+    /// per backend has to reach it; that only fails if every seed misses a
+    /// blob.
+    #[test]
+    fn test_e_means_gpu_tracks_cpu() {
+        let Some(device) = try_device() else {
+            return;
+        };
+        let client = cubecl::Device::from(device).client();
+        // dim 30 pads to 32, so the padding columns ride through the EMA.
+        let (n, dim, k) = (20_000usize, 30usize, 8usize);
+        let data = e_means_blobs(n, dim, k, 5);
+        // uniform noise on [-0.5, 0.5) per dimension: variance 1/12 each
+        let floor = dim as f64 / 12.0;
+        let alg = KMeansAlgorithm::EMeans(EMeansParams::default());
+
+        let (mut best_gpu, mut best_cpu) = (f64::INFINITY, f64::INFINITY);
+        for seed in 0..8 {
+            let gpu = train_centroids_gpu::<f32>(
+                &data,
+                dim,
+                n,
+                k,
+                &Dist::SquaredEuclidean,
+                Some(KMeansGpuParams::default().with_algorithm(alg)),
+                seed,
+                &client,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            assert_eq!(gpu.len(), k * dim);
+            let cpu = train_centroids::<f32>(
+                &data,
+                dim,
+                n,
+                k,
+                &Dist::SquaredEuclidean,
+                Some(KMeansTrainingParams::default().with_algorithm(alg)),
+                seed,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            best_gpu = best_gpu.min(e_means_error(&data, dim, &gpu));
+            best_cpu = best_cpu.min(e_means_error(&data, dim, &cpu));
+        }
+
+        assert!(best_cpu < 1.05 * floor, "cpu {best_cpu} vs floor {floor}");
+        assert!(
+            (best_gpu - best_cpu).abs() / best_cpu < 0.01,
+            "gpu {best_gpu} vs cpu {best_cpu}"
+        );
+    }
+
+    #[test]
+    fn test_e_means_gpu_labels_cosine_f16_and_partial_epoch() {
+        let Some(device) = try_device() else {
+            return;
+        };
+        let client = cubecl::Device::from(device).client();
+        let (n, dim, k) = (5_000usize, 16usize, 20usize);
+        let data = e_means_blobs(n, dim, 10, 8);
+
+        for (metric, f16, epochs) in [
+            (Dist::SquaredEuclidean, false, 5.0),
+            (Dist::Cosine, false, 2.5),
+            (Dist::SquaredEuclidean, true, 3.0),
+            (Dist::SquaredEuclidean, false, 0.5),
+        ] {
+            let params = KMeansGpuParams::new(10, None, true, f16)
+                .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(epochs)));
+            let (cents, labels) = k_means_gpu_flat::<f32>(
+                &data,
+                dim,
+                n,
+                k,
+                &metric,
+                Some(params),
+                11,
+                &client,
+                Verbosity::Quiet,
+            )
+            .unwrap();
+            assert_eq!(cents.len(), k * dim);
+            assert!(cents.iter().all(|v| v.is_finite()));
+            assert_eq!(labels.len(), n);
+            assert!(
+                labels.iter().all(|&l| (l as usize) < k),
+                "{metric:?} {epochs}"
+            );
+        }
     }
 
     #[test]

@@ -102,6 +102,16 @@ pub enum AnnSearchErrors {
         /// Vectors available for training
         n_samples: usize,
     },
+    /// An e-means parameter outside its permitted range
+    #[error("Invalid e-means parameter '{name}' ({value}): {reason}.")]
+    InvalidEMeansParam {
+        /// Name of the parameter
+        name: &'static str,
+        /// Value supplied
+        value: f64,
+        /// What the value must satisfy
+        reason: &'static str,
+    },
     /// Tail-trim fraction outside the permitted range
     #[cfg(feature = "quantised")]
     #[error("The drop ratio ({drop_ratio}) must be a finite value in [0, 0.5).")]

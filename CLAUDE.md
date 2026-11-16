@@ -37,6 +37,12 @@ cargo run --example gridsearch_pq     --release --features quantised
 cargo run --example gridsearch_gpu    --release --features gpu
 cargo run --example gridsearch_rabitq --release --features binary
 
+# Bench and profiling drivers: benches/bench_*.rs and benches/profile_*.rs.
+# They are [[example]] targets, so run them with --example, not cargo bench.
+cargo run --example profile_hnsw     --release
+cargo run --example bench_pq_codebooks --release --features quantised
+cargo run --example profile_pq_query  --release --features quantised
+
 # CPU distance-kernel microbench. One forced SIMD level per run: the level is
 # process-wide and resolved on first use, so it cannot be switched mid-run.
 ANN_SEARCH_SIMD=scalar cargo run --example bench_dist_kernels --release
@@ -46,6 +52,7 @@ ANN_SEARCH_SIMD=avx2   cargo run --example bench_dist_kernels --release
 # GPU kernel microbenches (CubeCL Benchmark harness, not criterion)
 cargo bench --bench gpu_ivf_kernels        --features gpu
 cargo bench --bench gpu_exhaustive_kernels --features gpu
+cargo bench --bench gpu_nndescent_kernels --features gpu
 
 # Per-kernel GPU profile (no code changes needed; filter the WGSL dumps out)
 CUBECL_DEBUG_OPTION=profile-medium CUBECL_DEBUG_LOG=stdout \
@@ -74,8 +81,11 @@ Release profile in `Cargo.toml` sets `lto = true` and `codegen-units = 1`. Relea
 - `serialise`: save indices to disk and load them back (`IndexIo`, `save_index` / `load_index`). Pulls in `serde`, `bincode`, and `half?/serde`. Covers the CPU, quantised and binary indices; GPU indices are not covered.
 - `ndarray`: accept `ndarray` 2-D arrays as input alongside faer matrices. Pulls in `ndarray` (range dep, `>=0.16, <0.18`). This makes `ndarray` a *public* dependency, which is why it is off by default: a downstream on a different major gets two incompatible `ArrayView2` types. The `(&[T], n, dim)` input works on any version without the feature.
 - `mimalloc`: swaps in `mimalloc` as the global allocator.
+- `accelerate` (default): routes dense GEMM through Apple Accelerate on macOS, no effect elsewhere.
+- `mlx`: experimental, Apple Silicon only. MLX backend via mlx-c (exhaustive, IVF, NN-Descent/CAGRA), f32 only. Without mlx-c the build warns and leaves `src/mlx/` out; `MLX_AVAILABLE` and `cfg(mlx_available)` say which.
+- `synthetic`: dataset generators (`src/synthetic/`) behind the gridsearch examples and benchmark tables.
 
-Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
+Every code path under `src/quantised/`, `src/binary/`, `src/gpu/`, `src/mlx/`, `src/serialise/` is behind its cfg. When editing, keep new items behind the correct `#[cfg(feature = "...")]`. The crate must still compile with default features off.
 
 ## Architecture
 
@@ -86,23 +96,29 @@ src/
   lib.rs           # public wrapper fns; all `pub fn build_*` / `query_*` live here
   prelude.rs       # user-facing re-exports (Dist, KMeansTrainingParams, KnnResult, ...)
   errors.rs        # single AnnSearchErrors enum, thiserror-backed
-  utils/           # SIMD dist, heaps, k-means, tree/graph/nndescent helpers,
+  utils/           # SIMD dist, heaps, k-means and e-means (e_means.rs), tree/graph/nndescent helpers,
                    # traits, input conversion (input.rs), striped locks
                    # (parallelism.rs), file staging
   cpu/             # CPU indices: annoy, ball_tree, exhaustive, hnsw, ivf,
                    #              kd_forest, kmknn, lsh, nndescent, nsg,
                    #              rnn_descent, soar, vamana
   quantised/       # bf16/sq8/pq/opq × (exhaustive, ivf) + soar_pq, soar_opq
-                   # (IVF-PQ/OPQ with SOAR spilling) + shared k_means & quantisers
+                   # (IVF-PQ/OPQ with SOAR spilling) + shared k_means, quantisers and
+                   # pq_search (LUT and batched query kernels for all six PQ/OPQ indices)
   binary/          # binary/rabitq/tq × (exhaustive, ivf) + binariser, vec_store, turboquant/
   gpu/             # exhaustive_gpu, ivf_gpu, nndescent_gpu, cagra_gpu_search,
                    # clustered_nndescent_gpu, forest_gpu, k_means_gpu,
                    # dist_gpu, topk_gpu
+  mlx/             # MLX backend: exhaustive, ivf, cagra, forest, nndescent, k_means
+  synthetic/       # dataset generators (`synthetic` feature)
   serialise/       # IndexIo trait, save_index / load_index, bundle header
-benches/           # GPU kernel microbenches (CubeCL Benchmark trait, not criterion)
+benches/           # gpu_*_kernels.rs: GPU kernel microbenches (CubeCL Benchmark trait);
+                   # bench_*.rs / profile_*.rs: bench and profiling examples
+                   # (`cargo run --example`), sharing examples/commons/mod.rs
 examples/          # gridsearch_*.rs, one per algorithm, share examples/commons/mod.rs;
-                   # fill_benchmarks.sh regenerates docs/ from docs/templates/
-docs/              # benchmark result tables (markdown) + the templates they fill
+                   # fill_benchmarks.sh runs them into docs/results/ and renders docs/
+docs/              # benchmark result tables (markdown), templates/ they are rendered
+                   # from, results/<kind>/<tag>.txt cached table per run
 ```
 
 Saving is a *directory*, not a file: `index.bin` plus any aux files (currently only the binary indices' mmap store). Everything is written under a temporary name and renamed at the end with `index.bin` last, so `index.bin` is the commit point. `utils/staging.rs` owns that dance, and it exists partly because truncating a mapped file is a `SIGBUS` waiting to happen. Do not replace it with a plain `File::create`.
@@ -140,6 +156,12 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 - Set `ANN_SEARCH_SIMD` to `scalar`, `sse`, `avx2` or `avx512` to force a level. It only ever downgrades, since naming a level the CPU lacks would run an illegal instruction. `cargo run --example bench_dist_kernels --release` prices the kernels at whichever level is forced; `.github/workflows/simd-check.yml` runs it at three levels on demand, and gates every SIMD PR on the x86_64 build actually emitting `ymm`, `zmm` and `vfmadd`.
 - Prefetching helper `utils::prefetch_read` inlines `_mm_prefetch` on x86_64 and `prfm pldl1keep` inline-asm on aarch64. Anywhere you're chasing an indirection in a hot loop, keep the prefetch pattern.
 
+### k-means and batched queries
+
+- Every IVF-family index trains with `KMeansTrainingParams` (CPU) or `KMeansGpuParams` (wgpu, MLX), whose `algorithm` is `KMeansAlgorithm::EMeans(EMeansParams)` by default; `Lloyd` is opt-in, and `iters` and balancing only apply to it. Both seed through `init`: k-means|| up to 200 centroids, random rows above. e-means revival only resets starved clusters, so it cannot repair a bad seed (one centroid across two blobs, two centroids in one).
+- `query_batch` on CPU IVF, kMkNN and all six PQ/OPQ indices (exhaustive, IVF, SOAR) takes a cell-grouped or tiled batched path from a minimum query count up and falls back to per-query search below it.
+- IVF and SOAR PQ/OPQ precompute a per-cell lookup-table term, `nlist * m * 256 * sizeof(T)` bytes, skipped above 256 MiB. It is rebuilt on load and not serialised.
+
 ### Validation harness
 
 `utils::KnnValidation` is a trait for computing `Recall@k` against ground truth by running a small exhaustive search internally. Indices implement it, and the gridsearch examples rely on it. When adding a new index, wire it up too.
@@ -155,8 +177,8 @@ NSG is the exception: it builds from an existing kNN graph, so alongside `build_
 - When touching kernels, be aware of the Metal/wgpu quirk fixed in `fb03735` and the IVF reducer variant in `3c657ee`. Divergence between Metal and other backends is real and needs cross-backend testing. The four distilled codegen rules (no `if` expressions for value selection, bit arithmetic over comparisons, `usize` counters plus `u32` sentinels in reducers, `Shared::new_slice` at kernel scope) are documented in the module header of `src/gpu/nndescent_gpu.rs`.
 - Every launch in the crate is `launch_unchecked`. A dispatch that busts a device limit does no work, returns zeros and reports **no error** (the panic happens on a cubecl background thread). Benches must checksum their output before reporting a timing; an implausible speedup is the signature of a kernel that did nothing.
 - Any new `Shared::new_slice` whose size depends on `k`, a graph degree or `dim` needs a plan function with a host-only test, not a constant. Any new grid dimension proportional to `n`, `nnz` or a cluster size goes through `grid_2d`, or through `checked_cube_count` when there is no free axis to flatten into.
-- `gpu/k_means_gpu.rs` holds the device-resident Lloyd's loop (FlashAssign, privatised counting-sort CSR, segmented centroid reduction, optional RAFT-style size balancing). It is what `ivf_gpu.rs` trains *and* assigns with, and what the clustered NN-Descent partitions with. Its `KMeansGpuParams` is a separate struct from the CPU `KMeansTrainingParams`; the CSR rebuild is all `Atomic::fetch_add`, so on a runtime without u32 atomics the whole thing falls back to the CPU k-means rather than silently returning empty clusters.
-- `gpu/clustered_nndescent_gpu.rs` is the batched NN-Descent path for datasets past the per-binding limit: balanced k-means on a subsample, every point joins its two nearest clusters, `nndescent_core` runs per cluster against a shared client, subgraphs merge on the host. `plan_cluster_count` is a pure function of `GpuLimits` with host-only tests, like the other staging plans. `C = 1` dispatches straight to `build_knn_graph_gpu`, since the overlap is pure cost when the dataset already fits.
+- `gpu/k_means_gpu.rs` holds the device-resident k-means: e-means (the default, `KMeansAlgorithm::EMeans`, shared with CPU and MLX) and Lloyd's loop (30 fixed iterations by default; FlashAssign, privatised counting-sort CSR, segmented centroid reduction, optional RAFT-style size balancing, Lloyd only). It is what `ivf_gpu.rs` trains *and* assigns with, and what the clustered NN-Descent partitions with. Its `KMeansGpuParams` is a separate struct from the CPU `KMeansTrainingParams`; the CSR rebuild is all `Atomic::fetch_add`, so on a runtime without u32 atomics the whole thing falls back to the CPU k-means rather than silently returning empty clusters.
+- `gpu/clustered_nndescent_gpu.rs` is the batched NN-Descent path for datasets past the per-binding limit: balanced Lloyd's k-means on a subsample, every point joins its two nearest clusters, `nndescent_core` runs per cluster against a shared client, subgraphs merge on the host. `plan_cluster_count` is a pure function of `GpuLimits` with host-only tests, like the other staging plans. `C = 1` dispatches straight to `build_knn_graph_gpu`, since the overlap is pure cost when the dataset already fits.
 - `WORKGROUP_SIZE_X` is 32, which matches Apple Silicon's plane size by coincidence rather than by design: **this crate uses no plane primitives**, every cross-thread reduction goes through `sync_cube()` plus shared memory. If you do add one, gate it on `plane_uniform(wg_size, &limits)` from `cubecl-utils-rs` and keep the existing kernel as the fallback arm, because a workgroup straddling two planes gives silently wrong answers.
 
 ### Errors
@@ -173,8 +195,9 @@ Single `AnnSearchErrors` enum in `src/errors.rs`, `thiserror`-derived and `#[non
 - The `lib.rs` shims must **flatten**, not forward: `Index::build(mat.into_row_major(), ...)`. `FlattenData<T>` implements `AnnMatrix` by identity, so this collapses the index constructors to one instantiation. Forwarding the input type instead re-monomorphises every constructor body per input type, and rustc does not run LLVM's `MergeFunctions` to dedupe them.
 - The trait method is `into_row_major`, not `into_flat`. `ndarray` has an inherent `into_flat` on `ArrayBase` and inherent methods beat trait methods, so `arr.into_flat()` would silently resolve to ndarray's and hand back a 1-D array.
 - CubeCL version is pinned to `0.11.0`. There is a commented-out git-dep block in `Cargo.toml` for when the main branch is needed. `0.11` dropped the runtime generic: `GpuTensor<T>`, `cubecl::client::Client` and a type-erased `cubecl::Device` (callers pass `WgpuDevice::default().into()`). Its compiler rejects a typed `let mut x: u32` in `#[cube]` code (write `0u32`) and comptime `as` casts inside a `&&`/`||` loop condition (hoist to a local).
-- Do not add new benchmarks under `benches/` without a `harness = false` entry in `Cargo.toml`. They use the CubeCL `Benchmark` trait, not criterion's default harness.
+- `autobenches = false`: every target in `benches/` is declared in `Cargo.toml`. GPU kernel microbenches are `[[bench]]` with `harness = false` (CubeCL `Benchmark` trait, not criterion). Bench and profiling binaries that parse CLI args are `[[example]]` with `path = "benches/..."`, because `cargo bench` appends `--bench`, which clap rejects.
 - Documentation-of-record for results lives in `docs/benchmarks_*.md`. `CHANGELOG.md` at the repo root tracks release-note-style changes.
+- The benchmark docs are generated, never hand-edited. `examples/fill_benchmarks.sh --kind <kind>` writes each table to `docs/results/<kind>/<tag>.txt` (tag `:` becomes `.`), stamped with version, commit and date, then rebuilds `docs/benchmarks_<kind>.md` from the template plus every cached table. `--only <glob>` reruns just the matching tags (`kmknn`, `'kmknn:*:cell:*'`), `--render-only` rebuilds after a template edit without running anything, `--dry-run` lists what would run. A failed run keeps the old cached table. Tables in one doc can therefore come from different commits; the per-table stamp says which.
 
 ## What's tracked outside this file
 

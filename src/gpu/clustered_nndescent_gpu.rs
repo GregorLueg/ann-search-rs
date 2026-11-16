@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use std::time::Instant;
 use thousands::*;
 
+use crate::cpu::nndescent::leaf_order;
 use crate::gpu::k_means_gpu::{train_centroids_gpu, KMeansGpuParams};
 use crate::gpu::nndescent_gpu::{
     default_forest_trees, nndescent_core, KnnGraphGpu, NnDescentCfg, NnDescentOutput,
@@ -484,7 +485,12 @@ where
 
     let kmeans_params = params
         .kmeans
-        .unwrap_or_else(|| KMeansGpuParams::default().with_balancing(true));
+        // Balancing is Lloyd-only, and the partition sizes bound per-cluster memory.
+        .unwrap_or_else(|| {
+            KMeansGpuParams::default()
+                .with_algorithm(KMeansAlgorithm::Lloyd)
+                .with_balancing(true)
+        });
 
     let start = Instant::now();
     let centroids = train_centroids_gpu::<T>(
@@ -532,7 +538,19 @@ where
         &metric,
     );
 
-    let (members, offsets) = invert_assignments_csr(&assignments, n, n_assign, n_clusters);
+    let (mut members, offsets) = invert_assignments_csr(&assignments, n, n_assign, n_clusters);
+
+    // Each cluster's members in the leaf order of one tree over the whole
+    // dataset, so the per-cluster local join gathers nearby rows.
+    let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
+    let mut rank = vec![0u32; n];
+    for (r, &old) in new_to_old.iter().enumerate() {
+        rank[old as usize] = r as u32;
+    }
+    for c in 0..n_clusters {
+        members[offsets[c] as usize..offsets[c + 1] as usize]
+            .sort_unstable_by_key(|&g| rank[g as usize]);
+    }
 
     if detailed {
         let sizes: Vec<usize> = (0..n_clusters)

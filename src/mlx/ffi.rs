@@ -71,6 +71,13 @@ pub const MLX_UINT32: mlx_dtype = 3;
 /// `MLX_FLOAT32` in the `mlx_dtype` enum.
 pub const MLX_FLOAT32: mlx_dtype = 10;
 
+/// MLX's `metal_kernel` binds an input with fewer elements than this in the
+/// `constant` address space rather than `device`, and every kernel here
+/// declares `const device T*` pointers into its inputs, which then fail to
+/// compile. [`MetalKernel::apply`] pads such inputs up; the tail is never
+/// read because every kernel indexes from its template arguments.
+const MLX_MIN_DEVICE_INPUT: usize = 8;
+
 /// Signature of the callback `mlx_set_error_handler` takes.
 type mlx_error_handler_func = unsafe extern "C" fn(msg: *const c_char, data: *mut c_void);
 
@@ -99,6 +106,12 @@ unsafe extern "C" {
         s: mlx_stream,
     ) -> c_int;
     fn mlx_transpose(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_concatenate_axis(
+        res: *mut mlx_array,
+        arrays: mlx_vector_array,
+        axis: c_int,
+        s: mlx_stream,
+    ) -> c_int;
 
     fn mlx_eval(outputs: mlx_vector_array) -> c_int;
     fn mlx_async_eval(outputs: mlx_vector_array) -> c_int;
@@ -471,6 +484,8 @@ impl Array {
 //////////////////////////
 
 unsafe extern "C" {
+    fn mlx_add(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
+    fn mlx_subtract(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_multiply(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_divide(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
     fn mlx_maximum(res: *mut mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) -> c_int;
@@ -508,6 +523,13 @@ unsafe extern "C" {
         stop_num: usize,
         strides: *const c_int,
         strides_num: usize,
+        s: mlx_stream,
+    ) -> c_int;
+    fn mlx_take_axis(
+        res: *mut mlx_array,
+        a: mlx_array,
+        indices: mlx_array,
+        axis: c_int,
         s: mlx_stream,
     ) -> c_int;
     fn mlx_scatter_add(
@@ -596,6 +618,38 @@ impl Array {
     pub fn ones(shape: &[i32], dtype: mlx_dtype, s: &Stream) -> Result<Array, AnnSearchErrors> {
         op_into("mlx_ones", |out| unsafe {
             mlx_ones(out, shape.as_ptr(), shape.len(), dtype, s.raw)
+        })
+    }
+
+    /// Elementwise `self + b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn add(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_add", |out| unsafe {
+            mlx_add(out, self.raw, b.raw, s.raw)
+        })
+    }
+
+    /// Elementwise `self - b`, broadcasting.
+    ///
+    /// ### Params
+    ///
+    /// * `b` - Right operand
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) result
+    pub fn subtract(&self, b: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_subtract", |out| unsafe {
+            mlx_subtract(out, self.raw, b.raw, s.raw)
         })
     }
 
@@ -798,6 +852,22 @@ impl Array {
         })
     }
 
+    /// Rows of `self` at `indices`, along axis 0.
+    ///
+    /// ### Params
+    ///
+    /// * `indices` - Row ids, shape `[m]`
+    /// * `s` - Stream to run on
+    ///
+    /// ### Returns
+    ///
+    /// The (lazy) gathered rows, shape `[m, rest of self's shape...]`
+    pub fn take_rows(&self, indices: &Array, s: &Stream) -> Result<Array, AnnSearchErrors> {
+        op_into("mlx_take_axis", |out| unsafe {
+            mlx_take_axis(out, self.raw, indices.raw, 0, s.raw)
+        })
+    }
+
     /// `self` with `updates` added at `indices` along axis 0. Duplicate
     /// indices accumulate.
     ///
@@ -854,6 +924,49 @@ impl Drop for MetalKernel {
         // SAFETY: owned handle, freed exactly once.
         unsafe { mlx_fast_metal_kernel_free(self.raw) };
     }
+}
+
+/// Kernel input handles, with any input below [`MLX_MIN_DEVICE_INPUT`]
+/// elements flattened and zero-padded up to it.
+///
+/// ### Params
+///
+/// * `inputs` - Kernel inputs, in the registered order
+/// * `s` - Stream to run on
+///
+/// ### Returns
+///
+/// The padded arrays (the caller keeps them alive until the kernel is
+/// queued) and the raw handles to pass
+fn device_inputs(
+    inputs: &[&Array],
+    s: &Stream,
+) -> Result<(Vec<Array>, Vec<mlx_array>), AnnSearchErrors> {
+    let mut padded = Vec::new();
+    let mut raw = Vec::with_capacity(inputs.len());
+    for a in inputs {
+        // SAFETY: reads metadata of a live handle.
+        let (size, dtype) = unsafe { (mlx_array_size(a.raw), mlx_array_dtype(a.raw)) };
+        if size >= MLX_MIN_DEVICE_INPUT {
+            raw.push(a.raw);
+            continue;
+        }
+        let flat = a.reshape(&[size as i32], s)?;
+        let tail = Array::zeros(&[(MLX_MIN_DEVICE_INPUT - size) as i32], dtype, s)?;
+        let parts = [flat.raw, tail.raw];
+        // SAFETY: the vector holds copies of live handles and is freed below.
+        let p = unsafe {
+            let v = mlx_vector_array_new_data(parts.as_ptr(), parts.len());
+            let res = op_into("mlx_concatenate_axis", |out| {
+                mlx_concatenate_axis(out, v, 0, s.raw)
+            });
+            mlx_vector_array_free(v);
+            res
+        }?;
+        raw.push(p.raw);
+        padded.push(p);
+    }
+    Ok((padded, raw))
 }
 
 impl MetalKernel {
@@ -918,7 +1031,7 @@ impl MetalKernel {
         template_ints: &[(&str, i32)],
         s: &Stream,
     ) -> Result<Vec<Array>, AnnSearchErrors> {
-        let raw_in: Vec<mlx_array> = inputs.iter().map(|a| a.raw).collect();
+        let (_padded, raw_in) = device_inputs(inputs, s)?;
         let names: Vec<CString> = template_ints
             .iter()
             .map(|(n, _)| CString::new(*n).expect("template names carry no NUL"))
@@ -1060,7 +1173,7 @@ impl MetalKernel {
         template_ints: &[(&str, i32)],
         s: &Stream,
     ) -> Result<Vec<Array>, AnnSearchErrors> {
-        let raw_in: Vec<mlx_array> = inputs.iter().map(|a| a.raw).collect();
+        let (_padded, raw_in) = device_inputs(inputs, s)?;
         let names: Vec<CString> = template_ints
             .iter()
             .map(|(n, _)| CString::new(*n).expect("template names carry no NUL"))

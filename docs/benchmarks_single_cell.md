@@ -57,17 +57,17 @@ recall target. `n/a` means no point on its sweep got there.
 
 | Method | Library | Peak (MiB) | Total (s) @ 0.90 | Total (s) @ 0.95 | Total (s) @ 0.99 |
 |---|---|---:|---:|---:|---:|
-| ivf | **ann_search_mlx** | 5,079 | 3.1 | 4.7 | 4.7 |
-| ivf | **ann_search_gpu** | 7,120 | 9.2 | 15.6 | 15.6 |
-| nndescent | **ann_search_gpu** | 12,979 | 9.3 | 9.3 | 19.3 |
-| nndescent | **ann_search_mlx** | 8,663 | 9.5 | 9.5 | 18.1 |
-| ivf | **ann_search** | 1,408 | 20.5 | 33.2 | 33.2 |
-| nndescent | **ann_search** | 9,580 | 28.4 | 28.4 | 28.4 |
-| nndescent | pynndescent | 10,670 | 31.1 | 31.1 | 50.2 |
-| hnsw | **ann_search** | 2,114 | 40.6 | 45.4 | 71.9 |
-| ivf | faiss | 2,462 | 52.9 | 73.0 | 116.6 |
-| hnsw | hnswlib | 2,398 | 56.9 | 64.1 | 100.1 |
-| exhaustive | **ann_search_mlx** | 6,239 | 1607.8 | 1607.8 | 1607.8 |
+| ivf | **ann_search_mlx** | 5,207 | 2.9 | 4.4 | 4.4 |
+| ivf | **ann_search_gpu** | 5,535 | 5.7 | 9.4 | 9.4 |
+| nndescent | **ann_search_gpu** | 13,944 | 8.5 | 8.5 | 18.7 |
+| nndescent | **ann_search_mlx** | 11,022 | 8.8 | 8.8 | 17.1 |
+| ivf | **ann_search** | 2,215 | 10.4 | 13.5 | 13.5 |
+| nndescent | **ann_search** | 8,821 | 23.9 | 23.9 | 23.9 |
+| nndescent | pynndescent | 11,691 | 29.5 | 29.5 | 48.7 |
+| hnsw | **ann_search** | 1,869 | 41.1 | 46.0 | 72.9 |
+| hnsw | hnswlib | 2,283 | 55.4 | 62.3 | 97.9 |
+| ivf | faiss | 3,146 | 56.9 | 75.4 | 117.3 |
+| exhaustive | **ann_search_mlx** | 6,001 | 1934.3 | 1934.3 | 1934.3 |
 
 ### Caveats
 
@@ -79,5 +79,5 @@ recall target. `n/a` means no point on its sweep got there.
 
 ### Runtime info
 
-*ann-search-rs 0.11.0 (commit v0.10.1-76-g288b4d6), run on 2026-10-11 on Apple M1 Max.*
+*ann-search-rs 0.12.2 (commit v0.12.2-22-g50a9abd-dirty), run on 2026-11-13 on Apple M1 Max.*
 *All benchmarks were run on M1 Max MacBook Pro with 64 GB unified memory.*

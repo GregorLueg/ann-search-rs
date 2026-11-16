@@ -56,7 +56,7 @@ class _BaseGpuIndex(BaseAnnIndex):
     _FORCE_DTYPE: ClassVar[np.dtype | None] = _GPU_DTYPE
     _SERIALISABLE: ClassVar[bool] = False
     # Not a `_Handle`: no save/load. `_SERIALISABLE` keeps the base off those.
-    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[invalid-attribute-override]
+    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[incompatible-attribute-override]
 
 
 class ExhaustiveGpuIndex(_BaseGpuIndex):
@@ -119,12 +119,17 @@ class IvfGpuIndex(_BaseGpuIndex):
             batch from `nprobe`, the average cell size and the device's
             maximum binding, clamped into ``100..=20_000``. Lower it if a
             large `nprobe` overruns the candidate buffer. Search-time.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
-            defaults to 50, which is the GPU default and higher than the CPU
-            side's 30: the iterations are cheap once the data is resident.
-        kmeans_balanced: Reseed starved centroids each iteration, RAFT-style.
-            Evens out the posting lists, which matters more here than on the
-            CPU because a straggler cell serialises its whole workgroup.
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
+            defaults to 30.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each
+            iteration, RAFT-style. Evens out the posting lists, which matters
+            more here than on the CPU because a straggler cell serialises its
+            whole workgroup.
         quantise_to_f16: Hold the resident data buffer at fp16. Halves its
             memory and lifts effective bandwidth on the assignment kernels, at
             the cost of needing ``shader-f16`` on the adapter.
@@ -145,6 +150,8 @@ class IvfGpuIndex(_BaseGpuIndex):
         nlist: int | None = None,
         nprobe: int | None = None,
         nquery: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         quantise_to_f16: bool = False,
@@ -156,6 +163,8 @@ class IvfGpuIndex(_BaseGpuIndex):
         self.nlist = nlist
         self.nprobe = nprobe
         self.nquery = nquery
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.quantise_to_f16 = quantise_to_f16
@@ -167,6 +176,8 @@ class IvfGpuIndex(_BaseGpuIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             quantise_to_f16=self.quantise_to_f16,

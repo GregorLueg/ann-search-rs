@@ -5,17 +5,24 @@
 //! distance stay faithful to the metric the caller asked for.
 
 use crate::utils::gemm::gemm;
-use faer::{Accum, Mat, MatMut, MatRef, Par, Scale};
+use faer::{Accum, Mat, MatMut, MatRef, Par};
 use half::bf16;
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rayon::prelude::*;
 
 use std::num::NonZero;
 use std::ops::AddAssign;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::prelude::*;
 use crate::quantised::k_means::*;
+use crate::quantised::pq_search::transpose_codebooks;
 use crate::utils::k_means_utils::*;
+
+/// Rows per tile when encoding many vectors. Each tile transposes every
+/// codebook once, so the transpose is amortised over this many rows while the
+/// tile itself stays small enough to keep per-thread scratch cheap. Not tuned.
+pub(crate) const ENCODE_ROW_TILE: usize = 256;
 
 /// Rows per tile of the OPQ rotation GEMM.
 ///
@@ -112,6 +119,27 @@ pub const N_CLUSTERS_PQ: usize = 256;
 /// Number of iterations to run for in optimised product quantisation
 pub const OPQ_ITER: usize = 3;
 
+/// Gather one subspace's slice of every row into a contiguous buffer.
+///
+/// ### Params
+///
+/// * `vectors` - Row-major vectors
+/// * `dim` - Full dimension
+/// * `n` - Number of vectors
+/// * `s` - Subspace index
+/// * `sd` - Subvector dimension
+///
+/// ### Returns
+///
+/// Row-major `n * sd` subvectors
+fn subspace_vectors<T: Copy>(vectors: &[T], dim: usize, n: usize, s: usize, sd: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(n * sd);
+    for row in vectors[..n * dim].chunks_exact(dim) {
+        out.extend_from_slice(&row[s * sd..(s + 1) * sd]);
+    }
+    out
+}
+
 /// ProductQuantiser
 ///
 /// ### Fields
@@ -121,12 +149,17 @@ pub const OPQ_ITER: usize = 3;
 /// * `m` - Number of subspaces
 /// * `subvec_dim` - Dimension of each subvector (dim / m)
 /// * `n_centroids` - Number of centroids that were used to train the quantiser.
+/// * `codebooks_t` - Dimension-major copy of the codebooks for lookup-table
+///   builds. Derived, so not serialised: rebuilt by
+///   `rebuild_codebooks_t` after a load.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProductQuantiser<T> {
     codebooks: Vec<Vec<T>>,
     m: usize,
     subvec_dim: usize,
     n_centroids: usize,
+    #[cfg_attr(feature = "serialise", serde(skip, default = "Vec::new"))]
+    codebooks_t: Vec<T>,
 }
 
 impl<T> ProductQuantiser<T>
@@ -199,33 +232,64 @@ where
             });
         }
 
+        // subspaces in parallel: one at a time leaves most threads idle across
+        // every mini-batch fork/join and the sequential centroid update
+        let done = AtomicUsize::new(0);
         let codebooks: Vec<Vec<T>> = (0..m)
+            .into_par_iter()
             .map(|subspace| {
-                if verbosity.detailed_verbosity() {
-                    println!("  Codebook {} / {}", subspace + 1, m);
-                }
-                let mut subvectors = Vec::with_capacity(n * subvec_dim);
-                for vec_idx in 0..n {
-                    let vec_start = vec_idx * dim + subspace * subvec_dim;
-                    subvectors.extend_from_slice(&vectors_flat[vec_start..vec_start + subvec_dim]);
-                }
-                train_centroids_pq(
+                let subvectors = subspace_vectors(vectors_flat, dim, n, subspace, subvec_dim);
+                let book = train_centroids_pq(
                     &subvectors,
                     subvec_dim,
                     n,
                     n_centroids,
                     max_iters,
                     seed + subspace,
-                )
+                );
+                if verbosity.detailed_verbosity() {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    println!("  Codebook {} / {}", d, m);
+                }
+                book
             })
             .collect();
 
+        let codebooks_t = transpose_codebooks(&codebooks, subvec_dim, n_centroids);
         Ok(Self {
             codebooks,
             m,
             subvec_dim,
             n_centroids,
+            codebooks_t,
         })
+    }
+
+    /// Dimension-major codebooks, see [`transpose_codebooks`]
+    #[inline(always)]
+    pub(crate) fn codebooks_t(&self) -> &[T] {
+        &self.codebooks_t
+    }
+
+    /// Rebuild the derived dimension-major codebooks. Needed after a load,
+    /// since they are not serialised.
+    #[cfg(feature = "serialise")]
+    pub(crate) fn rebuild_codebooks_t(&mut self) {
+        self.codebooks_t = transpose_codebooks(&self.codebooks, self.subvec_dim, self.n_centroids);
+    }
+
+    /// Decode PQ codes into a caller-owned buffer
+    ///
+    /// ### Params
+    ///
+    /// * `codes` - `m` codes
+    /// * `out` - Output, `m * subvec_dim`
+    pub(crate) fn decode_into(&self, codes: &[u8], out: &mut [T]) {
+        let sd = self.subvec_dim;
+        for (s, &code) in codes.iter().enumerate() {
+            let c = code as usize * sd;
+            out[s * sd..(s + 1) * sd].copy_from_slice(&self.codebooks[s][c..c + sd]);
+        }
     }
 
     /// Encode a vector to M indices
@@ -292,15 +356,7 @@ where
     /// Decode PQ codes back to approximate vector
     pub fn decode(&self, codes: &[u8]) -> Vec<T> {
         let mut result = vec![T::zero(); self.m * self.subvec_dim];
-
-        for (subspace, &code) in codes.iter().enumerate() {
-            let out_start = subspace * self.subvec_dim;
-            let centroid_start = code as usize * self.subvec_dim;
-            let codebook = &self.codebooks[subspace];
-            result[out_start..(self.subvec_dim + out_start)]
-                .copy_from_slice(&codebook[centroid_start..(self.subvec_dim + centroid_start)]);
-        }
-
+        self.decode_into(codes, &mut result);
         result
     }
 
@@ -315,74 +371,55 @@ where
         for codebook in &self.codebooks {
             total += codebook.capacity() * std::mem::size_of::<T>();
         }
+        total += self.codebooks_t.capacity() * std::mem::size_of::<T>();
 
         total
     }
 
-    /// Batch encode multiple vectors - computes distances via matrix ops
+    /// Encode a tile of vectors
+    ///
+    /// Works subspace by subspace: each codebook is transposed to
+    /// dimension-major once, then every row of the tile is assigned against
+    /// it with the PQ k-means kernel, so the scan vectorises across
+    /// centroids. Sequential; callers parallelise over tiles.
     ///
     /// ### Params
     ///
-    /// * `vectors` - The vectors
-    /// * `n` - Size of the data set
+    /// * `rows` - Row-major vectors, `t * dim` elements
+    /// * `codes` - Output, `t * m` codes, row-major
+    pub fn encode_rows(&self, rows: &[T], codes: &mut [u8]) {
+        let m = self.m;
+        let sd = self.subvec_dim;
+        let k = self.n_centroids;
+        let dim = m * sd;
+        let mut book_t = vec![T::zero(); k * sd];
+        let mut dist = vec![T::zero(); k];
+        for (s, book) in self.codebooks.iter().enumerate() {
+            transpose_centroids(book, sd, k, &mut book_t);
+            for (r, row) in rows.chunks_exact(dim).enumerate() {
+                let sub = &row[s * sd..(s + 1) * sd];
+                codes[r * m + s] = find_nearest_transposed(sub, &book_t, k, &mut dist) as u8;
+            }
+        }
+    }
+
+    /// Encode many vectors in parallel tiles of [`ENCODE_ROW_TILE`] rows
+    ///
+    /// ### Params
+    ///
+    /// * `vectors` - The vectors, row-major
+    /// * `n` - Number of vectors
     ///
     /// ### Returns
     ///
-    /// Returns the assignments
+    /// Row-major `n * m` codes
     pub fn encode_batch(&self, vectors: &[T], n: usize) -> Vec<u8> {
-        let dim = self.m() * self.subvec_dim();
-        let mut all_codes = vec![0u8; n * self.m()];
-
-        for subspace in 0..self.m() {
-            let subvec_start = subspace * self.subvec_dim();
-
-            // extract all subvectors for this subspace (n x subvec_dim)
-            let mut subvecs = Mat::<T>::zeros(n, self.subvec_dim());
-            for i in 0..n {
-                for j in 0..self.subvec_dim() {
-                    subvecs[(i, j)] = vectors[i * dim + subvec_start + j];
-                }
-            }
-
-            // centroids matrix (n_centroids x subvec_dim)
-            let mut centroids = Mat::<T>::zeros(self.n_centroids(), self.subvec_dim());
-            for i in 0..self.n_centroids() {
-                for j in 0..self.subvec_dim() {
-                    centroids[(i, j)] = self.codebooks()[subspace][i * self.subvec_dim() + j];
-                }
-            }
-
-            // Compute squared distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x@c^T
-            // Precompute ||c||^2 for all centroids
-            let centroid_norms: Vec<T> = (0..self.n_centroids())
-                .map(|i| {
-                    (0..self.subvec_dim())
-                        .map(|j| centroids[(i, j)].powi(2))
-                        .sum()
-                })
-                .collect();
-
-            let dot_products = Scale(-T::from_f32(2.0).unwrap()) * &subvecs * centroids.transpose();
-
-            all_codes
-                .par_chunks_mut(self.m())
-                .enumerate()
-                .for_each(|(vec_idx, codes)| {
-                    let mut best_idx = 0;
-                    let mut best_dist = T::infinity();
-
-                    for c in 0..self.n_centroids() {
-                        let dist = centroid_norms[c] + dot_products[(vec_idx, c)];
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_idx = c;
-                        }
-                    }
-
-                    codes[subspace] = best_idx as u8;
-                });
-        }
-
+        let dim = self.m * self.subvec_dim;
+        let mut all_codes = vec![0u8; n * self.m];
+        all_codes
+            .par_chunks_mut(ENCODE_ROW_TILE * self.m)
+            .zip(vectors[..n * dim].par_chunks(ENCODE_ROW_TILE * dim))
+            .for_each(|(codes, rows)| self.encode_rows(rows, codes));
         all_codes
     }
 }
@@ -390,6 +427,21 @@ where
 ///////////////////////////////
 // OptimisedProductQuantiser //
 ///////////////////////////////
+
+/// Rotate one vector: `out = R * vec`, one SIMD dot product per row of `R`.
+///
+/// ### Params
+///
+/// * `vec` - Input vector, length `dim`
+/// * `rotation` - Rotation matrix, row-major `dim * dim`
+/// * `dim` - Dimension
+/// * `out` - Output, length `dim`
+#[inline]
+pub(crate) fn rotate_into<T: AnnSearchFloat>(vec: &[T], rotation: &[T], dim: usize, out: &mut [T]) {
+    for (o, row) in out.iter_mut().zip(rotation.chunks_exact(dim)) {
+        *o = T::dot_simd(row, vec);
+    }
+}
 
 /// OptimisedProductQuantiser
 ///
@@ -459,18 +511,6 @@ where
             (vectors_flat.to_vec(), n)
         };
 
-        #[allow(unused_assignments)] // clippy being stupid here
-        let mut pq = ProductQuantiser::train(
-            &training_vecs,
-            dim,
-            m,
-            n_centroids,
-            &Dist::SquaredEuclidean,
-            max_iters,
-            seed,
-            Verbosity::Quiet,
-        )?;
-
         let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
 
         for iter in 0..rotation_iter {
@@ -481,8 +521,7 @@ where
             // rotate vectors
             let rotated = Self::apply_rotation(&training_vecs, &rotation_matrix, dim, n_train);
 
-            // train PQ
-            pq = ProductQuantiser::train(
+            let pq = ProductQuantiser::train(
                 &rotated,
                 dim,
                 m,
@@ -509,7 +548,7 @@ where
 
         // final training
         let rotated = Self::apply_rotation(vectors_flat, &rotation_matrix, dim, n);
-        pq = ProductQuantiser::train(
+        let pq = ProductQuantiser::train(
             &rotated,
             dim,
             m,
@@ -543,6 +582,21 @@ where
         self.pq.encode(&rotated)
     }
 
+    /// Encode a tile of vectors
+    ///
+    /// Rotates the whole tile with one GEMM, then encodes it with
+    /// [`ProductQuantiser::encode_rows`]. Callers parallelise over tiles.
+    ///
+    /// ### Params
+    ///
+    /// * `rows` - Row-major vectors, `t * dim` elements
+    /// * `codes` - Output, `t * m` codes, row-major
+    pub fn encode_rows(&self, rows: &[T], codes: &mut [u8]) {
+        let t = rows.len() / self.dim;
+        let rotated = Self::apply_rotation(rows, &self.rotation_matrix, self.dim, t);
+        self.pq.encode_rows(&rotated, codes);
+    }
+
     /// Rotate a given vector
     ///
     /// ### Params
@@ -554,35 +608,6 @@ where
     /// The returned vector
     pub fn rotate(&self, vec: &[T]) -> Vec<T> {
         Self::rotate_vector(vec, &self.rotation_matrix, self.dim)
-    }
-
-    /// Decode PQ codes to reconstructed vector
-    ///
-    /// Reconstructs a vector from its PQ codes by concatenating the appropriate
-    /// centroids from each subspace codebook.
-    ///
-    /// ### Params
-    ///
-    /// * `codes` - M PQ codes (u8)
-    /// * `pq` - Product quantiser containing codebooks
-    ///
-    /// ### Returns
-    ///
-    /// Reconstructed vector
-    fn decode_pq(codes: &[u8], pq: &ProductQuantiser<T>) -> Vec<T> {
-        let m = pq.m();
-        let subvec_dim = pq.subvec_dim();
-        let mut reconstructed = vec![T::zero(); m * subvec_dim];
-
-        for subspace in 0..m {
-            let code = codes[subspace] as usize;
-            let centroid_start = code * subvec_dim;
-            let centroid = &pq.codebooks()[subspace][centroid_start..centroid_start + subvec_dim];
-            reconstructed[subspace * subvec_dim..(subspace + 1) * subvec_dim]
-                .copy_from_slice(centroid);
-        }
-
-        reconstructed
     }
 
     /// Apply rotation matrix to a single vector
@@ -600,14 +625,7 @@ where
     /// Rotated vector
     fn rotate_vector(vec: &[T], rotation: &[T], dim: usize) -> Vec<T> {
         let mut out = vec![T::zero(); dim];
-        for i in 0..dim {
-            let mut sum = T::zero();
-            for j in 0..dim {
-                sum += rotation[i * dim + j] * vec[j];
-            }
-            out[i] = sum;
-        }
-
+        rotate_into(vec, rotation, dim, &mut out);
         out
     }
 
@@ -709,11 +727,14 @@ where
     ///
     /// Reconstructed vector in original space
     pub fn decode(&self, codes: &[u8]) -> Vec<T> {
-        let rotated = Self::decode_pq(codes, &self.pq);
+        let rotated = self.pq.decode(codes);
         self.inverse_rotate(&rotated)
     }
 
     /// Apply inverse rotation (transpose) to a vector
+    ///
+    /// `R^T v` is `sum_j v[j] * R[j, :]`, so it walks contiguous rows of `R`
+    /// and accumulates element-wise, which vectorises without a transpose.
     ///
     /// ### Params
     ///
@@ -723,14 +744,12 @@ where
     ///
     /// Vector with inverted rotation
     fn inverse_rotate(&self, vec: &[T]) -> Vec<T> {
-        let mut out = vec![T::zero(); self.dim];
-        for i in 0..self.dim {
-            let mut sum = T::zero();
-            for j in 0..self.dim {
-                // Transpose: swap i,j indices
-                sum += self.rotation_matrix[j * self.dim + i] * vec[j];
+        let dim = self.dim;
+        let mut out = vec![T::zero(); dim];
+        for (row, &v) in self.rotation_matrix.chunks_exact(dim).zip(vec) {
+            for (o, &r) in out.iter_mut().zip(row) {
+                *o += v * r;
             }
-            out[i] = sum;
         }
         out
     }
@@ -767,6 +786,37 @@ where
         std::mem::size_of_val(self)
             + self.rotation_matrix.capacity() * std::mem::size_of::<T>()
             + self.pq.memory_usage_bytes()
+    }
+}
+
+impl<T: AnnSearchFloat> OptimisedProductQuantiser<T> {
+    /// The product quantiser applied after the rotation
+    #[inline(always)]
+    pub(crate) fn pq(&self) -> &ProductQuantiser<T> {
+        &self.pq
+    }
+
+    /// Mutable access to the inner product quantiser, for rebuilding its
+    /// derived tables after a load
+    #[cfg(feature = "serialise")]
+    pub(crate) fn pq_mut(&mut self) -> &mut ProductQuantiser<T> {
+        &mut self.pq
+    }
+
+    /// Rotate a vector into a caller-owned buffer, see `rotate_into`
+    ///
+    /// ### Params
+    ///
+    /// * `vec` - Input vector
+    /// * `out` - Output, length `dim`
+    #[inline]
+    pub(crate) fn rotate_to(&self, vec: &[T], out: &mut [T]) {
+        rotate_into(vec, &self.rotation_matrix, self.dim, out);
+    }
+
+    /// Rotation matrix, `dim * dim` row-major; a vector rotates as `R * v`
+    pub(crate) fn rotation_matrix(&self) -> &[T] {
+        &self.rotation_matrix
     }
 }
 
@@ -1085,6 +1135,31 @@ mod tests {
         assert_eq!(opq.m(), 4);
         assert_eq!(opq.subvec_dim(), 8);
         assert_eq!(opq.n_centroids(), 4);
+    }
+
+    #[test]
+    fn test_pq_encode_batch_matches_encode() {
+        let dim = 32;
+        let n = 2 * ENCODE_ROW_TILE + 37;
+        let data: Vec<f32> = (0..n * dim)
+            .map(|x| ((x * 2_654_435_761usize) % 1009) as f32 * 0.01)
+            .collect();
+        let pq = ProductQuantiser::train(
+            &data,
+            dim,
+            4,
+            Some(16),
+            &Dist::SquaredEuclidean,
+            10,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+
+        let batch = pq.encode_batch(&data, n);
+        for (i, row) in data.chunks_exact(dim).enumerate() {
+            assert_eq!(&batch[i * 4..(i + 1) * 4], pq.encode(row).as_slice());
+        }
     }
 
     #[test]

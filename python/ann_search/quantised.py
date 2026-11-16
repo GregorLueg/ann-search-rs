@@ -36,7 +36,7 @@ cosine. See the benchmark tables for [quantised][1] and [RaBitQ][2] numbers.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 from beartype import beartype
@@ -44,6 +44,9 @@ from beartype import beartype
 from . import _ann_search as _core
 from ._base import BaseAnnIndex
 from ._metrics import NO_MANHATTAN
+
+if TYPE_CHECKING:
+    from ._ann_search import _CellTermsHandle
 
 
 class _BaseQuantisedIndex(BaseAnnIndex):
@@ -54,6 +57,28 @@ class _BaseQuantisedIndex(BaseAnnIndex):
     """
 
     _SUPPORTED_METRICS: ClassVar[frozenset[str]] = NO_MANHATTAN
+
+
+class _BaseCellTermsIndex(_BaseQuantisedIndex):
+    """The IVF and SOAR PQ/OPQ estimators, which precompute per-cell terms."""
+
+    @beartype
+    def set_cell_terms_budget(self, max_bytes: int) -> None:
+        """Set the memory budget for the precomputed per-cell table terms.
+
+        The table holds ``nlist * m * n_pq_centroids`` values and lets a probed
+        cell cost one add per code instead of a full residual-table build. It
+        defaults to a 256 MiB cap and is rebuilt or dropped straight away. The
+        budget is not part of the fitted state: refitting, `load` and
+        unpickling all start from the default again.
+
+        Args:
+            max_bytes: Largest table to keep. ``0`` turns it off.
+        """
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must be >= 0, got {max_bytes}")
+        handle = cast("_CellTermsHandle", self._fitted_handle())
+        handle.set_cell_terms_budget(max_bytes)
 
 
 ########
@@ -125,10 +150,15 @@ class IvfBf16Index(_BaseQuantisedIndex):
         nprobe: Cells visited per query, the recall knob. ``None`` defaults to
             ``sqrt(nlist)``. Search-time: override it per call as
             ``index.kneighbors(nprobe=32)``.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration, evening out
-            the posting lists.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each
+            iteration, evening out the posting lists.
         seed: Fixes k-means initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
             process stdout, not ``sys.stdout``.
@@ -144,6 +174,8 @@ class IvfBf16Index(_BaseQuantisedIndex):
         metric: str = "euclidean",
         nlist: int | None = None,
         nprobe: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         seed: int = 42,
@@ -153,6 +185,8 @@ class IvfBf16Index(_BaseQuantisedIndex):
         self.metric = metric
         self.nlist = nlist
         self.nprobe = nprobe
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.seed = seed
@@ -163,6 +197,8 @@ class IvfBf16Index(_BaseQuantisedIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             seed=self.seed,
@@ -255,9 +291,14 @@ class IvfSq8Index(_BaseQuantisedIndex):
             ``sqrt(n)``.
         nprobe: Cells visited per query, the recall knob. ``None`` defaults to
             ``sqrt(nlist)``. Search-time.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         quant_drop_ratio: Fraction trimmed from each tail of every dimension
             before the range is fixed. ``None`` uses the crate default.
         quant_sample_rows: Rows sampled to calibrate the range. ``None``
@@ -277,6 +318,8 @@ class IvfSq8Index(_BaseQuantisedIndex):
         metric: str = "euclidean",
         nlist: int | None = None,
         nprobe: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         quant_drop_ratio: float | None = None,
@@ -288,6 +331,8 @@ class IvfSq8Index(_BaseQuantisedIndex):
         self.metric = metric
         self.nlist = nlist
         self.nprobe = nprobe
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.quant_drop_ratio = quant_drop_ratio
@@ -300,6 +345,8 @@ class IvfSq8Index(_BaseQuantisedIndex):
             x,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             quant_drop_ratio=self.quant_drop_ratio,
@@ -663,7 +710,7 @@ class ExhaustiveOpqIndex(_BaseQuantisedIndex):
         )
 
 
-class IvfPqIndex(_BaseQuantisedIndex):
+class IvfPqIndex(_BaseCellTermsIndex):
     """Inverted file plus product quantisation.
 
     The two compress different things and stack cleanly: the inverted file cuts
@@ -681,9 +728,14 @@ class IvfPqIndex(_BaseQuantisedIndex):
             ``sqrt(n)``.
         nprobe: Cells visited per query, the recall knob. ``None`` defaults to
             ``sqrt(nlist)``. Search-time.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         seed: Fixes both the cell and the codebook initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
@@ -701,6 +753,8 @@ class IvfPqIndex(_BaseQuantisedIndex):
         metric: str = "euclidean",
         nlist: int | None = None,
         nprobe: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
@@ -712,6 +766,8 @@ class IvfPqIndex(_BaseQuantisedIndex):
         self.metric = metric
         self.nlist = nlist
         self.nprobe = nprobe
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.n_pq_centroids = n_pq_centroids
@@ -724,6 +780,8 @@ class IvfPqIndex(_BaseQuantisedIndex):
             m=self.m,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             n_pq_centroids=self.n_pq_centroids,
@@ -732,7 +790,7 @@ class IvfPqIndex(_BaseQuantisedIndex):
         )
 
 
-class IvfOpqIndex(_BaseQuantisedIndex):
+class IvfOpqIndex(_BaseCellTermsIndex):
     """`IvfPqIndex` with the learned rotation in front of the sub-codebooks.
 
     Same trade as `ExhaustiveOpqIndex` against `ExhaustivePqIndex`: better codes
@@ -747,9 +805,14 @@ class IvfOpqIndex(_BaseQuantisedIndex):
             ``sqrt(n)``.
         nprobe: Cells visited per query, the recall knob. ``None`` defaults to
             ``sqrt(nlist)``. Search-time.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         opq_iters: Alternating rotation/codebook iterations. ``None`` uses the
             crate default. This is the build-cost knob.
@@ -769,6 +832,8 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         metric: str = "euclidean",
         nlist: int | None = None,
         nprobe: int | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
@@ -781,6 +846,8 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         self.metric = metric
         self.nlist = nlist
         self.nprobe = nprobe
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.n_pq_centroids = n_pq_centroids
@@ -794,6 +861,8 @@ class IvfOpqIndex(_BaseQuantisedIndex):
             m=self.m,
             metric=self._core_metric,
             nlist=self.nlist,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             n_pq_centroids=self.n_pq_centroids,
@@ -803,7 +872,7 @@ class IvfOpqIndex(_BaseQuantisedIndex):
         )
 
 
-class SoarPqIndex(_BaseQuantisedIndex):
+class SoarPqIndex(_BaseCellTermsIndex):
     """`IvfPqIndex` with SOAR spilling.
 
     Every vector also lands in a second cell, chosen so its residual points
@@ -829,9 +898,14 @@ class SoarPqIndex(_BaseQuantisedIndex):
             shifted otherwise.
         rule_param: ``mu`` for ``"shifted"``, ``lambda`` for ``"orthogonal"``.
             ``None`` uses the crate's value. Ignored by ``"nearest"``.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         seed: Fixes both the cell and the codebook initialisation.
         verbose: ``0`` quiet, ``1`` normal, ``2`` detailed. Prints to the
@@ -851,6 +925,8 @@ class SoarPqIndex(_BaseQuantisedIndex):
         nprobe: int | None = None,
         rule: str | None = None,
         rule_param: float | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
@@ -864,6 +940,8 @@ class SoarPqIndex(_BaseQuantisedIndex):
         self.nprobe = nprobe
         self.rule = rule
         self.rule_param = rule_param
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.n_pq_centroids = n_pq_centroids
@@ -878,6 +956,8 @@ class SoarPqIndex(_BaseQuantisedIndex):
             nlist=self.nlist,
             rule=self.rule,
             rule_param=self.rule_param,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             n_pq_centroids=self.n_pq_centroids,
@@ -886,7 +966,7 @@ class SoarPqIndex(_BaseQuantisedIndex):
         )
 
 
-class SoarOpqIndex(_BaseQuantisedIndex):
+class SoarOpqIndex(_BaseCellTermsIndex):
     """`SoarPqIndex` with the learned rotation in front of the sub-codebooks.
 
     The rotation on top of the spilling, so it carries both costs: the extra
@@ -909,9 +989,14 @@ class SoarOpqIndex(_BaseQuantisedIndex):
             ``None`` lets the crate pick per metric.
         rule_param: ``mu`` for ``"shifted"``, ``lambda`` for ``"orthogonal"``.
             ``None`` uses the crate's value.
-        kmeans_iters: Lloyd iterations when training the cells. ``None``
+        kmeans_algorithm: ``"emeans"`` (default) or ``"lloyd"``. e-means is
+            mini-batch k-means with an EMA update and fitted batch and step
+            laws (Bessa et al., 2026).
+        kmeans_epochs: Passes over the training sample under e-means, may be
+            fractional. ``None`` defaults to 5. e-means only.
+        kmeans_iters: Lloyd's only. Iterations when training the cells. ``None``
             defaults to 30.
-        kmeans_balanced: Reseed starved centroids each iteration.
+        kmeans_balanced: Lloyd's only. Reseed starved centroids each iteration.
         n_pq_centroids: Centroids per subspace. ``None`` uses 256.
         opq_iters: Alternating rotation/codebook iterations. ``None`` uses the
             crate default. This is the build-cost knob.
@@ -933,6 +1018,8 @@ class SoarOpqIndex(_BaseQuantisedIndex):
         nprobe: int | None = None,
         rule: str | None = None,
         rule_param: float | None = None,
+        kmeans_algorithm: str = "emeans",
+        kmeans_epochs: int | float | None = None,
         kmeans_iters: int | None = None,
         kmeans_balanced: bool = False,
         n_pq_centroids: int | None = None,
@@ -947,6 +1034,8 @@ class SoarOpqIndex(_BaseQuantisedIndex):
         self.nprobe = nprobe
         self.rule = rule
         self.rule_param = rule_param
+        self.kmeans_algorithm = kmeans_algorithm
+        self.kmeans_epochs = kmeans_epochs
         self.kmeans_iters = kmeans_iters
         self.kmeans_balanced = kmeans_balanced
         self.n_pq_centroids = n_pq_centroids
@@ -962,6 +1051,8 @@ class SoarOpqIndex(_BaseQuantisedIndex):
             nlist=self.nlist,
             rule=self.rule,
             rule_param=self.rule_param,
+            kmeans_algorithm=self.kmeans_algorithm,
+            kmeans_epochs=self.kmeans_epochs,
             kmeans_iters=self.kmeans_iters,
             kmeans_balanced=self.kmeans_balanced,
             n_pq_centroids=self.n_pq_centroids,

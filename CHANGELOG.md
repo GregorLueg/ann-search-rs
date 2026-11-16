@@ -3,6 +3,58 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.13.0
+
+**Breaking**
+
+- e-means (Bessa et al. 2026) is the default k-means on CPU, wgpu and MLX, so
+  every IVF-family index trains its centroids differently and results differ at
+  the same seed. Lloyd's stays available via
+  `with_algorithm(KMeansAlgorithm::Lloyd)` or `KMeansTrainingParams::new` /
+  `KMeansGpuParams::new`.
+- GPU Lloyd's defaults to 30 fixed iterations instead of 50.
+- e-means seeds through `init` like Lloyd's: k-means|| for up to 200
+  centroids, random rows above. Results differ at the same seed wherever
+  `nlist <= 200`.
+- `build_knn_graph_nndescent()` no longer returns the same graph as
+  `extract_knn` on an NN-Descent index at the same seed. Recall is unchanged.
+
+**Features**
+
+- `KMeansAlgorithm` and `EMeansParams` on `KMeansTrainingParams` and
+  `KMeansGpuParams` pick the algorithm for every k-means consumer.
+- e-means partitions are more even than Lloyd's, so an IVF index may need a
+  higher `nprobe` for the same recall.
+- `query_batch()` on all six PQ/OPQ indices (exhaustive, IVF, SOAR). The
+  `query_*_index` wrappers use it.
+- `set_cell_terms_budget()` on IVF-PQ, IVF-OPQ, SOAR-PQ and SOAR-OPQ sets the
+  memory cap of the precomputed per-cell table (default 256 MiB, `0` turns it
+  off). Not saved with the index.
+
+**Performance**
+
+- CPU IVF cross and self queries run cell by cell through a GEMM from 1024
+  queries up. Same neighbours up to ties.
+- kMkNN self-kNN runs through a batched GEMM.
+- PQ and OPQ build faster. PQ codes are identical at the same seed, OPQ codes
+  differ at rounding level.
+- PQ and OPQ queries are faster across all six indices. IVF and SOAR PQ/OPQ
+  keep a precomputed per-cell table of `nlist * m * 256` floats (skipped above
+  256 MiB, not saved, rebuilt on load). Distances differ at rounding level.
+- IVF and SOAR PQ/OPQ `query_batch()` and self-kNN probe, rotate and build
+  query tables by GEMM over blocks of queries. Results can differ from
+  `query()` in the last bits and at near ties.
+- SOAR-PQ and SOAR-OPQ order spilled entries by primary cell and skip
+  duplicates per run. Same neighbours up to ties.
+- The CPU, wgpu and MLX NN-Descent kNN-graph builds are faster (batched seed
+  trees on CPU, rows in leaf order everywhere). Results differ at the same
+  seed, recall is unchanged.
+
+**Fixes**
+
+- MLX k-means trains on inputs small enough to fall below MLX's device
+  binding threshold.
+
 ## 0.12.2
 
 **Performance**

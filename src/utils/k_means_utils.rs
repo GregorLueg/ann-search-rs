@@ -19,6 +19,8 @@ use thousands::*;
 use crate::errors::AnnSearchErrors;
 use crate::prelude::AnnSearchFloat;
 use crate::utils::dist::*;
+use crate::utils::e_means::e_means_cpu;
+pub use crate::utils::e_means::{EMeansBatchLaw, EMeansParams, KMeansAlgorithm};
 use crate::utils::verbosity::Verbosity;
 use crate::utils::Dist;
 
@@ -315,7 +317,7 @@ pub enum LloydPath {
 /// ### Returns
 ///
 /// The [KMeansInit]
-fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
+pub(crate) fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
     init.unwrap_or({
         if n_centroids > 200 {
             KMeansInit::Random
@@ -323,6 +325,48 @@ fn resolve_init(init: Option<KMeansInit>, n_centroids: usize) -> KMeansInit {
             KMeansInit::KMeansParallel
         }
     })
+}
+
+/// Seed `k` centroids on the host, by random rows or by k-means||.
+///
+/// Shared by Lloyd's and e-means on the CPU and by the MLX backend, so every
+/// host-seeded k-means starts from the same centroids at the same seed.
+///
+/// ### Params
+///
+/// * `data` - Row-major training data, `n * dim`
+/// * `dim` - Dimensionality
+/// * `n` - Number of training rows
+/// * `k` - Number of centroids
+/// * `metric` - Distance metric, used by k-means||
+/// * `init` - Seeding strategy, see [`resolve_init`]
+/// * `seed` - Random seed
+///
+/// ### Returns
+///
+/// `k * dim` initial centroids
+pub(crate) fn init_centroids<T>(
+    data: &[T],
+    dim: usize,
+    n: usize,
+    k: usize,
+    metric: &Dist,
+    init: KMeansInit,
+    seed: usize,
+) -> Vec<T>
+where
+    T: AnnSearchFloat,
+{
+    match init {
+        KMeansInit::Random => fast_random_init(data, dim, n, k, seed),
+        KMeansInit::KMeansParallel => {
+            let norms: Vec<T> = data[..n * dim]
+                .par_chunks_exact(dim)
+                .map(T::calculate_l2_norm)
+                .collect();
+            kmeans_parallel_init(data, &norms, dim, n, k, metric, seed)
+        }
+    }
 }
 
 /// Resolve Lloyd's path
@@ -372,12 +416,16 @@ pub struct KMeansTrainingParams {
     /// Off by default: it changes the partition, so turning it on shifts the
     /// results of every index built on top of this k-means.
     pub balanced: bool,
+    /// Lloyd's or e-means. Both seed through `init`. Under
+    /// [`KMeansAlgorithm::EMeans`], `iters`, `path` and `balanced` are ignored:
+    /// e-means runs its own epoch budget and revives starved clusters itself.
+    pub algorithm: KMeansAlgorithm,
 }
 
 impl KMeansTrainingParams {
-    /// Generate a new instance of self
+    /// Lloyd's with these settings
     ///
-    /// Balancing is off. Chain [`KMeansTrainingParams::with_balancing`] to turn
+    /// [`KMeansTrainingParams::default`] is e-means instead. Balancing is off. Chain [`KMeansTrainingParams::with_balancing`] to turn
     /// it on.
     ///
     /// ### Params
@@ -397,6 +445,7 @@ impl KMeansTrainingParams {
             init,
             path,
             balanced: false,
+            algorithm: KMeansAlgorithm::Lloyd,
         }
     }
 
@@ -417,12 +466,28 @@ impl KMeansTrainingParams {
         self.balanced = balanced;
         self
     }
+
+    /// Pick the clustering algorithm
+    ///
+    /// ### Params
+    ///
+    /// * `algorithm` - [`KMeansAlgorithm::EMeans`] (the default) or
+    ///   [`KMeansAlgorithm::Lloyd`]
+    ///
+    /// ### Returns
+    ///
+    /// `self` with the algorithm set, for chaining off `new` or `default`.
+    pub fn with_algorithm(mut self, algorithm: KMeansAlgorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
 }
 
-/// Default implementation for CagraGpuSearchParams
+/// e-means at its default epoch budget. The Lloyd's fields keep 30 iterations
+/// with auto init and path for `with_algorithm(KMeansAlgorithm::Lloyd)`.
 impl Default for KMeansTrainingParams {
     fn default() -> Self {
-        Self::new(30, None, None)
+        Self::new(30, None, None).with_algorithm(KMeansAlgorithm::default())
     }
 }
 
@@ -3249,7 +3314,8 @@ where
 
 /// Train k-means centroids
 ///
-/// Unless a [LloydPath] is forced, uses GEMM assignment from
+/// Runs Lloyd's or e-means as `params_k_means.algorithm` says. For Lloyd's,
+/// unless a [LloydPath] is forced, uses GEMM assignment from
 /// `GEMM_DIM_THRESHOLD` dimensions up (with Hamerly's bounds for Euclidean)
 /// and SIMD Lloyd's below it.
 ///
@@ -3304,6 +3370,32 @@ where
 
     let params = params_k_means.unwrap_or_default();
 
+    if let KMeansAlgorithm::EMeans(em) = params.algorithm {
+        let start = Instant::now();
+        if verbosity.normal_verbosity() {
+            println!(
+                "Training e-means ({} centroids) ...",
+                n_centroids.separate_with_underscores()
+            );
+        }
+        let (centroids, _) = e_means_cpu(
+            data,
+            dim,
+            n,
+            n_centroids,
+            metric,
+            &em,
+            resolve_init(params.init, n_centroids),
+            seed,
+            false,
+            verbosity,
+        )?;
+        if verbosity.normal_verbosity() {
+            println!("... trained e-means in {:.2?}", start.elapsed());
+        }
+        return Ok(centroids);
+    }
+
     let data_norms: Vec<T> = match metric {
         Dist::SquaredEuclidean => (0..n)
             .into_par_iter()
@@ -3331,22 +3423,7 @@ where
 
     let init_method = resolve_init(params.init, n_centroids);
 
-    let mut centroids = match init_method {
-        KMeansInit::Random => fast_random_init(data, dim, n, n_centroids, seed),
-        KMeansInit::KMeansParallel => {
-            let init_norms: Vec<T> = match metric {
-                Dist::SquaredEuclidean => (0..n)
-                    .into_par_iter()
-                    .map(|i| T::calculate_l2_norm(&data[i * dim..(i + 1) * dim]))
-                    .collect(),
-                Dist::Cosine => data_norms.clone(),
-                Dist::Manhattan => {
-                    unreachable!("Manhattan distance not reachable for train_centroids().")
-                }
-            };
-            kmeans_parallel_init(data, &init_norms, dim, n, n_centroids, metric, seed)
-        }
-    };
+    let mut centroids = init_centroids(data, dim, n, n_centroids, metric, init_method, seed);
 
     if verbosity.detailed_verbosity() {
         let how = match init_method {

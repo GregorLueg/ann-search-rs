@@ -3,6 +3,7 @@
 //! kept on the heap, shared traits, etd.
 
 pub mod dist;
+pub mod e_means;
 pub mod gemm;
 pub mod graph_utils;
 pub mod heap_structs;

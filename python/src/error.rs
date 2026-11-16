@@ -56,7 +56,8 @@ impl From<AnnErr> for PyErr {
             | AnnSearchErrors::DistanceNotSupported(_)
             | AnnSearchErrors::TooFewSamplesForCentroids { .. }
             | AnnSearchErrors::InvalidLshBits { .. }
-            | AnnSearchErrors::LshTooManySamples { .. } => PyValueError::new_err(msg),
+            | AnnSearchErrors::LshTooManySamples { .. }
+            | AnnSearchErrors::InvalidEMeansParam { .. } => PyValueError::new_err(msg),
 
             // Filesystem.
             AnnSearchErrors::IoError(ref io) if io.kind() == std::io::ErrorKind::NotFound => {

@@ -3,65 +3,69 @@ set -euo pipefail
 
 TEMPLATE_DIR="docs/templates"
 OUTPUT_DIR="docs"
+RESULTS_DIR="docs/results"
 
 usage() {
-    echo "Usage: $0 --kind <standard|gpu|mlx|binary|quantised|knn_graph|all> [--dry-run]"
+    echo "Usage: $0 --kind <standard|gpu|mlx|binary|quantised|knn_graph|all> [--only <tag glob>] [--render-only] [--dry-run]" >&2
+    echo "  --only <glob>   rerun only tags matching <glob> or <glob>:*, e.g. kmknn or 'kmknn:*:cell:*'" >&2
+    echo "  --render-only   rebuild the doc from the template and cached results, run nothing" >&2
     exit 1
 }
 
 KIND=""
+ONLY=""
+RENDER_ONLY=false
 DRY_RUN=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --kind)    KIND="$2"; shift 2 ;;
-        --dry-run) DRY_RUN=true; shift ;;
-        *)         usage ;;
+        --kind)        KIND="$2"; shift 2 ;;
+        --only)        ONLY="$2"; shift 2 ;;
+        --render-only) RENDER_ONLY=true; shift ;;
+        --dry-run)     DRY_RUN=true; shift ;;
+        *)             usage ;;
     esac
 done
 
 [ -z "$KIND" ] && usage
 
 if [ "$KIND" = "all" ]; then
+    passthrough=()
+    [ -n "$ONLY" ] && passthrough+=(--only "$ONLY")
+    $RENDER_ONLY && passthrough+=(--render-only)
+    $DRY_RUN && passthrough+=(--dry-run)
     for k in standard gpu binary quantised knn_graph; do
-        echo "===== Running kind: $k =====" >&2
-        if $DRY_RUN; then
-            "$0" --kind "$k" --dry-run
-        else
-            "$0" --kind "$k"
-        fi
+        echo "===== Kind: $k =====" >&2
+        "$0" --kind "$k" ${passthrough[@]+"${passthrough[@]}"}
     done
-    if $DRY_RUN; then
-        echo "Dry run complete for all kinds, no docs written"
-    else
-        echo "Generated all benchmark docs"
-    fi
     exit 0
 fi
 
 TEMPLATE="${TEMPLATE_DIR}/benchmarks_${KIND}.md.tmpl"
 OUTPUT="${OUTPUT_DIR}/benchmarks_${KIND}.md"
+CACHE_DIR="${RESULTS_DIR}/${KIND}"
 
 if [ ! -f "$TEMPLATE" ]; then
     echo "Template not found: $TEMPLATE" >&2
     exit 1
 fi
 
-# Only clobber the generated doc when we are actually going to refill it. A
-# dry-run must leave $OUTPUT untouched.
-if ! $DRY_RUN; then
-    cp "$TEMPLATE" "$OUTPUT"
-    VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-    # Dirty only when code differs; regenerated docs and results don't count.
-    COMMIT=$(git describe --always)
-    if [ -n "$(git status --porcelain -- src examples Cargo.toml Cargo.lock)" ]; then
-        COMMIT="${COMMIT}-dirty"
-    fi
-    RUNINFO="*ann-search-rs ${VERSION} (commit ${COMMIT}), run on $(date +%Y-%m-%d).*"
-    RUNINFO="$RUNINFO" perl -pi -e 's/<!-- RUNINFO -->/$ENV{RUNINFO}/' "$OUTPUT"
+# Each cached table starts with this line, so a doc assembled from runs at
+# different commits says so per table.
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+# Dirty only when code differs; regenerated docs and results don't count.
+COMMIT=$(git describe --always)
+if [ -n "$(git status --porcelain -- src examples benches Cargo.toml Cargo.lock)" ]; then
+    COMMIT="${COMMIT}-dirty"
 fi
+STAMP="ann-search-rs ${VERSION} (commit ${COMMIT}), run on $(date +%Y-%m-%d)"
 
-run_and_replace() {
+# Tags contain `:`, which is awkward in file names; store them with `.`.
+cache_file() {
+    echo "${CACHE_DIR}/${1//:/.}.txt"
+}
+
+run_and_cache() {
     local tag="$1"
     shift
     local cmd=("$@")
@@ -86,8 +90,9 @@ run_and_replace() {
         | sed -n '/^=\{10,\}/,$p' \
         | sed '/^[[:space:]]*$/d' > "$result_file" || true
 
+    # A failed run keeps the previous cached table rather than blanking it.
     if [ ! -s "$result_file" ]; then
-        echo "WARNING: no table output for ${tag}" >&2
+        echo "WARNING: no table output for ${tag}, cache left as is" >&2
         if [ -s "$err_file" ]; then
             echo "--- stderr ---" >&2
             tail -5 "$err_file" >&2
@@ -98,17 +103,26 @@ run_and_replace() {
     fi
 
     rm -f "$err_file"
-
-    perl -pi -e "
-        if (/<!-- BENCH:\Q${tag}\E -->/) {
-            open my \$fh, '<', '${result_file}' or die;
-            local \$/;
-            \$_ = <\$fh>;
-            close \$fh;
-        }
-    " "$OUTPUT"
-
+    mkdir -p "$CACHE_DIR"
+    { echo "$STAMP"; cat "$result_file"; } > "$(cache_file "$tag")"
     rm -f "$result_file"
+}
+
+render() {
+    CACHE_DIR="$CACHE_DIR" perl -pe '
+        if (/<!-- BENCH:(.+?) -->/) {
+            my $tag = $1;
+            (my $name = $tag) =~ tr/:/./;
+            if (open my $fh, "<", "$ENV{CACHE_DIR}/$name.txt") {
+                local $/;
+                $_ = <$fh>;
+                close $fh;
+            } else {
+                warn "WARNING: no cached result for $tag\n";
+            }
+        }
+        s/<!-- RUNINFO -->/*Each table starts with the ann-search-rs version and commit it was run on.*/;
+    ' "$TEMPLATE" > "$OUTPUT"
 }
 
 case "$KIND" in
@@ -415,19 +429,29 @@ case "$KIND" in
         ;;
 esac
 
-for entry in "${BENCHMARKS[@]}"; do
-    tag="${entry%%|*}"
-    cmd="${entry#*|}"
-    # Published tables run on faer, which is what non-macOS builds get. The
-    # default `accelerate` feature only changes macOS and would flatter the
-    # GEMM-heavy rows there.
-    cmd="${cmd/cargo run /cargo run --no-default-features }"
-    # shellcheck disable=SC2086
-    run_and_replace "$tag" $cmd
-done
+if ! $RENDER_ONLY; then
+    matched=0
+    for entry in "${BENCHMARKS[@]}"; do
+        tag="${entry%%|*}"
+        cmd_str="${entry#*|}"
+        # shellcheck disable=SC2053
+        if [ -n "$ONLY" ] && [[ $tag != $ONLY && $tag != $ONLY:* ]]; then
+            continue
+        fi
+        matched=$((matched + 1))
+        # Published tables run on faer, which is what non-macOS builds get. The
+        # default `accelerate` feature only changes macOS and would flatter the
+        # GEMM-heavy rows there.
+        cmd_str="${cmd_str/cargo run /cargo run --no-default-features }"
+        # shellcheck disable=SC2086
+        run_and_cache "$tag" $cmd_str
+    done
+    [ "$matched" -eq 0 ] && echo "No ${KIND} tags match '${ONLY}'" >&2
+fi
 
 if $DRY_RUN; then
     echo "Dry run complete, $OUTPUT untouched"
 else
+    render
     echo "Generated: $OUTPUT"
 fi

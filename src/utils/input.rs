@@ -284,6 +284,8 @@ mod tests {
         let expected = reference(5, 4);
         let mat = faer_mat(5, 4);
 
+        // `mut` is only used by the ndarray pushes below
+        #[cfg_attr(not(feature = "ndarray"), allow(unused_mut))]
         let mut results = vec![
             mat.as_ref().into_row_major(),
             (&mat).into_row_major(),

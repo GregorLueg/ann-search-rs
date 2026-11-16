@@ -2,9 +2,9 @@
 
 use faer::RowRef;
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
 
 use crate::prelude::*;
+use crate::quantised::pq_search::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::sample_vectors;
 use crate::utils::pack_knn_results;
@@ -161,16 +161,7 @@ where
             verbosity,
         )?;
 
-        let mut quantised_codes = vec![0u8; n * m];
-        quantised_codes
-            .par_chunks_mut(m)
-            .enumerate()
-            .for_each(|(vec_idx, chunk)| {
-                let vec_start = vec_idx * dim;
-                let vec = &vectors_flat[vec_start..vec_start + dim];
-                let codes = codebook.encode(vec);
-                chunk.copy_from_slice(&codes);
-            });
+        let quantised_codes = codebook.encode_batch(&vectors_flat, n);
 
         log.finish();
 
@@ -181,6 +172,94 @@ where
             n,
             metric,
         })
+    }
+
+    /// Map a query into codebook space
+    ///
+    /// ### Params
+    ///
+    /// * `q` - Query, length `dim`
+    /// * `out` - Output, length `dim`; unit length under cosine
+    #[inline]
+    fn prepare(&self, q: &[T], out: &mut [T]) {
+        out.copy_from_slice(q);
+        if self.metric == Dist::Cosine {
+            normalise_vector(out);
+        }
+    }
+
+    /// Score one block of prepared queries, see [`exhaustive_block`]
+    ///
+    /// ### Params
+    ///
+    /// * `qs` - Queries in codebook space, `nb * dim`
+    /// * `k` - Neighbours per query
+    /// * `luts` - Scratch lookup tables
+    /// * `heaps` - Scratch heaps
+    ///
+    /// ### Returns
+    ///
+    /// Per query `(ids, distances)`, nearest first
+    fn score_block(
+        &self,
+        qs: &[T],
+        k: usize,
+        luts: &mut Vec<T>,
+        heaps: &mut Vec<BoundedMaxHeap<T>>,
+    ) -> Vec<(Vec<usize>, Vec<T>)> {
+        exhaustive_block(
+            qs,
+            &self.quantised_codes,
+            self.codebook.codebooks_t(),
+            self.codebook.m(),
+            self.codebook.subvec_dim(),
+            self.codebook.n_centroids(),
+            lut_scale(self.metric),
+            k,
+            luts,
+            heaps,
+        )
+    }
+
+    /// Score blocks of queries in parallel
+    ///
+    /// ### Params
+    ///
+    /// * `nq` - Number of queries
+    /// * `block` - Queries per block, see [`exhaustive_block`]
+    /// * `k` - Neighbours per query
+    /// * `prepare` - Writes query `i` in codebook space into the slice
+    /// * `progress` - Ticked once per query
+    ///
+    /// ### Returns
+    ///
+    /// Per query `(ids, distances)` in input order, nearest first
+    fn run_blocks<P: Fn(usize, &mut [T]) + Sync>(
+        &self,
+        nq: usize,
+        block: usize,
+        k: usize,
+        prepare: P,
+        progress: &QueryProgress,
+    ) -> Vec<(Vec<usize>, Vec<T>)> {
+        let dim = self.dim;
+        (0..nq.div_ceil(block))
+            .into_par_iter()
+            .map_init(
+                || (Vec::new(), Vec::new(), Vec::new()),
+                |(qs, luts, heaps): &mut (Vec<T>, Vec<T>, Vec<BoundedMaxHeap<T>>), b| {
+                    let rows = b * block..((b + 1) * block).min(nq);
+                    qs.resize(rows.len() * dim, T::zero());
+                    for (j, i) in rows.clone().enumerate() {
+                        prepare(i, &mut qs[j * dim..(j + 1) * dim]);
+                    }
+                    let out = self.score_block(qs, k, luts, heaps);
+                    rows.for_each(|_| progress.tick());
+                    out
+                },
+            )
+            .flatten()
+            .collect()
     }
 
     /// Query the index for approximate nearest neighbours
@@ -203,32 +282,55 @@ where
         k: usize,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.check_dim(query_vec.len())?;
+        let mut q = vec![T::zero(); self.dim];
+        self.prepare(query_vec, &mut q);
+        let mut out = self.score_block(&q, k, &mut Vec::new(), &mut Vec::new());
+        Ok(out.pop().expect("one query in, one result out"))
+    }
 
-        let mut query_vec = query_vec.to_vec();
-        if self.metric == Dist::Cosine {
-            normalise_vector(&mut query_vec);
-        }
-
-        let lookup_tables = self.build_lookup_tables_direct(&query_vec);
-
-        let mut heap: BinaryHeap<(OrderedFloat<T>, usize)> = BinaryHeap::with_capacity(k + 1);
-
-        for vec_idx in 0..self.n {
-            let dist = self.compute_distance_adc(vec_idx, &lookup_tables);
-
-            if heap.len() < k {
-                heap.push((OrderedFloat(dist), vec_idx));
-            } else if dist < heap.peek().unwrap().0 .0 {
-                heap.pop();
-                heap.push((OrderedFloat(dist), vec_idx));
-            }
-        }
-
-        let mut results: Vec<_> = heap.into_iter().collect();
-        results.sort_unstable_by_key(|&(dist, _)| dist);
-        let (distances, indices) = results.into_iter().map(|(d, i)| (d.0, i)).unzip();
-
-        Ok((indices, distances))
+    /// Query many vectors at once
+    ///
+    /// From `BATCH_MIN_QUERIES` queries up, scores blocks of
+    /// `EXH_QUERY_BLOCK` queries against each tile of codes, so the codes
+    /// are read once per block rather than once per query. Below it, one query
+    /// per task. Both give identical results.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Row-major queries, `nq * query_dim`
+    /// * `query_dim` - Query dimensionality, must match the index
+    /// * `k` - Number of neighbours to return
+    /// * `return_dist` - Whether to return distances
+    /// * `verbosity` - Prints start, progress and end at `Normal`
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)`, one row per query
+    pub fn query_batch(
+        &self,
+        queries: &[T],
+        query_dim: usize,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        self.check_dim(query_dim)?;
+        let nq = queries.len() / query_dim;
+        let progress = QueryProgress::new("Exhaustive-PQ index", nq, false, verbosity);
+        let block = if nq >= BATCH_MIN_QUERIES {
+            EXH_QUERY_BLOCK
+        } else {
+            1
+        };
+        let results = self.run_blocks(
+            nq,
+            block,
+            k,
+            |i, q| self.prepare(&queries[i * query_dim..(i + 1) * query_dim], q),
+            &progress,
+        );
+        progress.finish();
+        Ok(pack_knn_results(results, return_dist))
     }
 
     /// Query using a matrix row reference
@@ -237,7 +339,6 @@ where
     ///
     /// * `query_row` - Row reference
     /// * `k` - Number of neighbours to return
-    /// * `nprobe` - Number of clusters to search
     ///
     /// ### Returns
     ///
@@ -259,8 +360,8 @@ where
 
     /// Generate kNN graph from vectors stored in the index
     ///
-    /// Reconstructs each vector from PQ codes and performs exhaustive
-    /// search to build a complete kNN graph.
+    /// Reconstructs each vector from its PQ codes and scores blocks of them
+    /// exhaustively, as [`ExhaustivePqIndex::query_batch`] does.
     ///
     /// ### Params
     ///
@@ -280,20 +381,19 @@ where
     ) -> KnnOptionResult<T> {
         let m = self.codebook.m();
         let progress = QueryProgress::new("Exhaustive-PQ index", self.n, true, verbosity);
-
-        let results: Vec<(Vec<usize>, Vec<T>)> = (0..self.n)
-            .into_par_iter()
-            .map(|i| {
-                let codes = &self.quantised_codes[i * m..(i + 1) * m];
-
-                // Reconstruct by decoding PQ codes
-                let reconstructed = self.codebook.decode(codes);
-
-                progress.tick();
-
-                self.query(&reconstructed, k)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let results = self.run_blocks(
+            self.n,
+            EXH_QUERY_BLOCK,
+            k,
+            |i, q| {
+                self.codebook
+                    .decode_into(&self.quantised_codes[i * m..(i + 1) * m], q);
+                if self.metric == Dist::Cosine {
+                    normalise_vector(q);
+                }
+            },
+            &progress,
+        );
         progress.finish();
 
         Ok(pack_knn_results(results, return_dist))
@@ -327,6 +427,11 @@ where
     type Elem = T;
 
     const KIND: &'static str = "exhaustive_pq";
+
+    fn load_aux(&mut self, _dir: &std::path::Path) -> Result<(), AnnSearchErrors> {
+        self.codebook.rebuild_codebooks_t();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -766,5 +871,51 @@ mod tests {
             saw_a_real_distance,
             "fixture is degenerate: every neighbour sits at cosine distance ~0"
         );
+    }
+
+    /// Deterministic pseudo-random rows with no exact distance ties
+    fn noisy_matrix(n: usize, dim: usize, seed: u64) -> Mat<f32> {
+        let mut state = seed;
+        Mat::from_fn(n, dim, |_, _| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        })
+    }
+
+    /// Row-major copy of a matrix
+    fn flat(mat: &Mat<f32>) -> Vec<f32> {
+        (0..mat.nrows())
+            .flat_map(|i| (0..mat.ncols()).map(move |j| mat[(i, j)]))
+            .collect()
+    }
+
+    /// Blocks of queries against code tiles have to give the same answer as
+    /// one query at a time.
+    #[test]
+    fn test_query_batch_matches_query() {
+        let dim = 32;
+        let data = noisy_matrix(700, dim, 7);
+        let index = ExhaustivePqIndex::build(
+            data.as_ref(),
+            8,
+            Dist::SquaredEuclidean,
+            None,
+            Some(16),
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let queries = flat(&noisy_matrix(BATCH_MIN_QUERIES + 37, dim, 11));
+        let (ids, dists) = index
+            .query_batch(&queries, dim, 10, true, Verbosity::Quiet)
+            .unwrap();
+        let dists = dists.unwrap();
+        for (i, q) in queries.chunks_exact(dim).enumerate() {
+            let (want_ids, want_d) = index.query(q, 10).unwrap();
+            assert_eq!(ids[i], want_ids, "row {i}");
+            assert_eq!(dists[i], want_d, "row {i}");
+        }
     }
 }

@@ -1,0 +1,8 @@
+ann-search-rs 0.12.2 (commit v0.12.2-24-gf213303-dirty), run on 2026-11-13
+============================================================
+250_000 samples, dim 32, k 15, euclidean distance
+>>> Using data that simulating manifold hypothesis. <<<
+CPU exhaustive (ground truth): 16808.3 ms
+backend   cold build ms  warm build ms     recall
+wgpu              521.3          423.9     0.9945
+mlx               509.3          488.8     0.9945

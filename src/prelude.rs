@@ -7,6 +7,7 @@
 pub use crate::cpu::nndescent::NNDescentKnnParams;
 pub use crate::errors::AnnSearchErrors;
 pub use crate::utils::dist::*;
+pub use crate::utils::e_means::{EMeansBatchLaw, EMeansParams, KMeansAlgorithm};
 pub use crate::utils::graph_utils::ThreadLocalSearchState;
 pub use crate::utils::heap_structs::*;
 pub use crate::utils::input::AnnMatrix;
