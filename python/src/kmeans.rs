@@ -39,37 +39,60 @@ enum Choice {
 ///
 /// ### Returns
 ///
-/// The resolved [`Choice`], or a `ValueError` naming the offending knob.
+/// The resolved [`Choice`], or the message naming the offending knob.
+///
+/// ### Note
+///
+/// Returns a plain `String` rather than a `PyErr` so the unit tests stay free
+/// of the CPython API: the test binary is not linked against libpython, and
+/// touching a `PyErr` there fails at link time.
 fn resolve(
     algorithm: &str,
     epochs: Option<f64>,
     iters: Option<usize>,
     balanced: bool,
-) -> PyResult<Choice> {
+) -> Result<Choice, String> {
     match algorithm {
         "emeans" => {
             if iters.is_some() || balanced {
-                return Err(PyValueError::new_err(
-                    "kmeans_iters and kmeans_balanced only apply to \
-                     kmeans_algorithm='lloyd'; e-means takes kmeans_epochs",
-                ));
+                return Err("kmeans_iters and kmeans_balanced only apply to \
+                     kmeans_algorithm='lloyd'; e-means takes kmeans_epochs"
+                    .to_string());
             }
             Ok(Choice::EMeans(epochs))
         }
         "lloyd" => {
             if epochs.is_some() {
-                return Err(PyValueError::new_err(
-                    "kmeans_epochs only applies to kmeans_algorithm='emeans'",
-                ));
+                return Err("kmeans_epochs only applies to kmeans_algorithm='emeans'".to_string());
             }
             Ok(Choice::Lloyd(
                 iters.unwrap_or(LLOYD_DEFAULT_ITERS),
                 balanced,
             ))
         }
-        other => Err(PyValueError::new_err(format!(
+        other => Err(format!(
             "kmeans_algorithm must be 'emeans' or 'lloyd', got '{other}'"
-        ))),
+        )),
+    }
+}
+
+/// CPU params for a resolved [`Choice`].
+///
+/// ### Params
+///
+/// * `choice` - Output of [`resolve`]
+///
+/// ### Returns
+///
+/// `None` for e-means at its defaults, so the builder takes its own path
+fn cpu_params(choice: Choice) -> Option<KMeansTrainingParams> {
+    match choice {
+        Choice::EMeans(None) => None,
+        Choice::EMeans(Some(e)) => Some(
+            KMeansTrainingParams::default()
+                .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(e))),
+        ),
+        Choice::Lloyd(i, b) => Some(KMeansTrainingParams::new(i, None, None).with_balancing(b)),
     }
 }
 
@@ -96,14 +119,9 @@ pub(crate) fn kmeans_params(
     iters: Option<usize>,
     balanced: bool,
 ) -> PyResult<Option<KMeansTrainingParams>> {
-    Ok(match resolve(algorithm, epochs, iters, balanced)? {
-        Choice::EMeans(None) => None,
-        Choice::EMeans(Some(e)) => Some(
-            KMeansTrainingParams::default()
-                .with_algorithm(KMeansAlgorithm::EMeans(EMeansParams::new(e))),
-        ),
-        Choice::Lloyd(i, b) => Some(KMeansTrainingParams::new(i, None, None).with_balancing(b)),
-    })
+    resolve(algorithm, epochs, iters, balanced)
+        .map(cpu_params)
+        .map_err(PyValueError::new_err)
 }
 
 /// Assemble [`KMeansGpuParams`] from the knobs worth exposing.
@@ -140,7 +158,8 @@ pub(crate) fn kmeans_gpu_params(
     balanced: bool,
     quantise_to_f16: bool,
 ) -> PyResult<Option<KMeansGpuParams>> {
-    Ok(match resolve(algorithm, epochs, iters, balanced)? {
+    let choice = resolve(algorithm, epochs, iters, balanced).map_err(PyValueError::new_err)?;
+    Ok(match choice {
         Choice::EMeans(None) if !quantise_to_f16 => None,
         Choice::EMeans(e) => {
             let em = e.map(EMeansParams::new).unwrap_or_default();
@@ -166,16 +185,24 @@ pub(crate) fn kmeans_gpu_params(
 mod tests {
     use super::*;
 
+    /// The CPU assembler without the `PyErr` conversion, see [`resolve`]
+    fn cpu(
+        algorithm: &str,
+        epochs: Option<f64>,
+        iters: Option<usize>,
+        balanced: bool,
+    ) -> Result<Option<KMeansTrainingParams>, String> {
+        resolve(algorithm, epochs, iters, balanced).map(cpu_params)
+    }
+
     #[test]
     fn test_untouched_knobs_defer_to_the_crate() {
-        assert!(kmeans_params("emeans", None, None, false)
-            .unwrap()
-            .is_none());
+        assert!(cpu("emeans", None, None, false).unwrap().is_none());
     }
 
     #[test]
     fn test_epochs_are_carried_through() {
-        let params = kmeans_params("emeans", Some(2.5), None, false)
+        let params = cpu("emeans", Some(2.5), None, false)
             .unwrap()
             .expect("epochs force a params struct");
         assert_eq!(
@@ -186,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_lloyd_carries_iterations_and_balancing() {
-        let params = kmeans_params("lloyd", None, Some(7), true)
+        let params = cpu("lloyd", None, Some(7), true)
             .unwrap()
             .expect("lloyd forces a params struct");
         assert_eq!(params.algorithm, KMeansAlgorithm::Lloyd);
@@ -196,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_lloyd_without_iterations_uses_the_default_cap() {
-        let params = kmeans_params("lloyd", None, None, false)
+        let params = cpu("lloyd", None, None, false)
             .unwrap()
             .expect("lloyd forces a params struct");
         assert_eq!(params.iters, LLOYD_DEFAULT_ITERS);
@@ -204,9 +231,9 @@ mod tests {
 
     #[test]
     fn test_mismatched_knobs_are_rejected() {
-        assert!(kmeans_params("emeans", None, Some(10), false).is_err());
-        assert!(kmeans_params("emeans", None, None, true).is_err());
-        assert!(kmeans_params("lloyd", Some(5.0), None, false).is_err());
-        assert!(kmeans_params("hamerly", None, None, false).is_err());
+        assert!(cpu("emeans", None, Some(10), false).is_err());
+        assert!(cpu("emeans", None, None, true).is_err());
+        assert!(cpu("lloyd", Some(5.0), None, false).is_err());
+        assert!(cpu("hamerly", None, None, false).is_err());
     }
 }

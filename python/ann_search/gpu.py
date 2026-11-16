@@ -56,7 +56,7 @@ class _BaseGpuIndex(BaseAnnIndex):
     _FORCE_DTYPE: ClassVar[np.dtype | None] = _GPU_DTYPE
     _SERIALISABLE: ClassVar[bool] = False
     # Not a `_Handle`: no save/load. `_SERIALISABLE` keeps the base off those.
-    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[invalid-attribute-override]
+    _HANDLE: ClassVar[type[_GpuHandle]]  # ty: ignore[incompatible-attribute-override]
 
 
 class ExhaustiveGpuIndex(_BaseGpuIndex):
