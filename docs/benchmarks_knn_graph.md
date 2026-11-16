@@ -436,18 +436,18 @@ speed-up. The timings only mean something once the fill count is at 100%.
 <summary><b>Clustered GPU NN-Descent (250k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
-ann-search-rs 0.13.0 (commit v0.12.2-38-g4bc6780), run on 2026-11-16
+ann-search-rs 0.13.0 (commit v0.12.2-55-gc4208e5), run on 2026-11-16
 ===================================================================================================================
 Benchmark: 250k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -         690.28       0.9957        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=1)            1         450.65       0.9957        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=2)            2        1057.65       0.9995        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=4)            4        1012.86       0.9994        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=8)            8        1007.59       0.9994        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=16)          16        1130.88       0.9993        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (unbatched)                 -         535.47       0.9957        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=1)            1         451.10       0.9957        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=2)            2         927.44       0.9995        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=4)            4         974.71       0.9994        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=8)            8        1001.50       0.9994        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=16)          16        1098.29       0.9993        3_750_000 / 3_750_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -458,18 +458,18 @@ NNDescent-GPU (clustered, c=16)          16        1130.88       0.9993        3
 <summary><b>Clustered GPU NN-Descent (250k samples; 64 dimensions)</b>:</summary>
 </br>
 <pre><code>
-ann-search-rs 0.13.0 (commit v0.12.2-38-g4bc6780), run on 2026-11-16
+ann-search-rs 0.13.0 (commit v0.12.2-55-gc4208e5), run on 2026-11-16
 ===================================================================================================================
 Benchmark: 250k samples, 64D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -         935.55       0.9955        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=1)            1         723.22       0.9956        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=2)            2        1513.65       0.9995        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=4)            4        1469.71       0.9994        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=8)            8        1509.50       0.9994        3_750_000 / 3_750_000     100.00
-NNDescent-GPU (clustered, c=16)          16        1588.07       0.9993        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (unbatched)                 -         821.84       0.9955        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=1)            1         720.57       0.9955        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=2)            2        1432.82       0.9995        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=4)            4        1459.23       0.9994        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=8)            8        1475.14       0.9994        3_750_000 / 3_750_000     100.00
+NNDescent-GPU (clustered, c=16)          16        1551.38       0.9993        3_750_000 / 3_750_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
@@ -480,18 +480,18 @@ NNDescent-GPU (clustered, c=16)          16        1588.07       0.9993        3
 <summary><b>Clustered GPU NN-Descent (500k samples; 32 dimensions)</b>:</summary>
 </br>
 <pre><code>
-ann-search-rs 0.13.0 (commit v0.12.2-38-g4bc6780), run on 2026-11-16
+ann-search-rs 0.13.0 (commit v0.12.2-55-gc4208e5), run on 2026-11-16
 ===================================================================================================================
 Benchmark: 500k samples, 32D, k=15 (clustered vs unbatched GPU NN-Descent)
 ===================================================================================================================
 Method                             Clusters     Build (ms)     Recall@k                       Filled   Fill (%)
 -------------------------------------------------------------------------------------------------------------------
-NNDescent-GPU (unbatched)                 -        1048.33       0.9931        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=1)            1         940.66       0.9932        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=2)            2        1917.97       0.9991        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=4)            4        1920.30       0.9988        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=8)            8        1937.20       0.9989        7_500_000 / 7_500_000     100.00
-NNDescent-GPU (clustered, c=16)          16        2012.34       0.9989        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (unbatched)                 -        1101.06       0.9931        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=1)            1         976.12       0.9931        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=2)            2        1976.69       0.9991        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=4)            4        1965.24       0.9988        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=8)            8        1994.25       0.9989        7_500_000 / 7_500_000     100.00
+NNDescent-GPU (clustered, c=16)          16        2145.64       0.9989        7_500_000 / 7_500_000     100.00
 -------------------------------------------------------------------------------------------------------------------
 </code></pre>
 </details>
