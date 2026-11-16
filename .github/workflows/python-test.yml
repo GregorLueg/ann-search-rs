@@ -36,3 +36,4 @@ jobs:
       # degrades cleanly on a machine without a device, not that the kernels
       # are correct. Kernel correctness needs a runner with a GPU.
       cpu-only-args: '--no-default-features'
+      timeout-minutes: 45
