@@ -70,8 +70,6 @@ impl<T> KdFlatNode<T> {
     }
 }
 
-
-
 /// Per-tree build scratch, reused across every node of the tree.
 struct KdScratch<T> {
     /// Subsampled ids for spread and median estimation
