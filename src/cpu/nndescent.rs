@@ -7,7 +7,6 @@ use faer::{Accum, MatMut, MatRef, Par, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use rdst::RadixSort;
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -71,15 +70,113 @@ pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>
 /// `(new_temp, old_temp)` holding `(priority, pid)` entries.
 type CandScratch = (Vec<(u64, u32)>, Vec<(u64, u32)>);
 
+/// Per-row-block update buckets from one join worker: `buckets[b]` holds the
+/// records whose rows fall in block `b`.
+type PairBuckets<T> = Vec<Vec<PairUpdate<T>>>;
+
+/// One local-join pair, routed to the block(s) owning its rows.
+///
+/// The high bit of each id says whether the other end goes into that id's
+/// row, so a pair both of whose rows accept it and that sits inside one block
+/// is a single record. Ids fit in 31 bits (see [`SENTINEL_PID`]).
+#[derive(Clone, Copy)]
+struct PairUpdate<T> {
+    /// First endpoint, high bit set when `b` is offered to its row
+    a: u32,
+    /// Second endpoint, high bit set when `a` is offered to its row
+    b: u32,
+    /// Distance between the two
+    dist: T,
+}
+
+impl<T: Copy> PairUpdate<T> {
+    /// Direction flag in the high bit of each id.
+    const TO_ROW: u32 = 1 << 31;
+
+    /// Pack a pair and its directions.
+    ///
+    /// ### Params
+    ///
+    /// * `a` - First endpoint
+    /// * `b` - Second endpoint
+    /// * `dist` - Distance between them
+    /// * `into_a` - Offer `b` to `a`'s row
+    /// * `into_b` - Offer `a` to `b`'s row
+    ///
+    /// ### Returns
+    ///
+    /// The packed record.
+    #[inline(always)]
+    fn new(a: u32, b: u32, dist: T, into_a: bool, into_b: bool) -> Self {
+        Self {
+            a: a | ((into_a as u32) << 31),
+            b: b | ((into_b as u32) << 31),
+            dist,
+        }
+    }
+
+    /// Route a scored pair into the bucket(s) owning its accepting rows.
+    ///
+    /// ### Params
+    ///
+    /// * `buckets` - This worker's buckets, one per row block
+    /// * `block_size` - Rows per block
+    /// * `a` - First endpoint
+    /// * `b` - Second endpoint
+    /// * `dist` - Distance between them
+    /// * `into_a` - `dist` clears `a`'s threshold
+    /// * `into_b` - `dist` clears `b`'s threshold
+    ///
+    /// ### Returns
+    ///
+    /// Number of records written, one or two.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn route(
+        buckets: &mut [Vec<Self>],
+        block_size: usize,
+        a: u32,
+        b: u32,
+        dist: T,
+        into_a: bool,
+        into_b: bool,
+    ) -> usize {
+        let block_a = a as usize / block_size;
+        let block_b = b as usize / block_size;
+        if block_a == block_b {
+            buckets[block_a].push(Self::new(a, b, dist, into_a, into_b));
+            return 1;
+        }
+        let mut written = 0;
+        if into_a {
+            buckets[block_a].push(Self::new(a, b, dist, true, false));
+            written += 1;
+        }
+        if into_b {
+            buckets[block_b].push(Self::new(a, b, dist, false, true));
+            written += 1;
+        }
+        written
+    }
+}
+
 ////////////
 // Consts //
 ////////////
 
 /// Target byte budget for one chunk's update batch.
-///
-/// `radix_sort_unstable` allocates a scratch buffer the same size as the batch,
-/// so the live footprint while sorting is twice this figure.
 const UPDATE_TARGET_BYTES: usize = 200 * 1024 * 1024;
+
+/// Minimum row blocks per rayon thread when routing join updates to their
+/// owners, so small graphs still balance across threads. Not tuned.
+const APPLY_BLOCKS_PER_THREAD: usize = 4;
+
+/// Upper bound on the graph rows one apply block covers, in bytes.
+///
+/// Updates land in a block in arrival order, so the block's rows must stay
+/// cache-resident or every insert is a miss. Smaller blocks split more pairs
+/// across two blocks, which costs a second record.
+const APPLY_BLOCK_BYTES: usize = 512 * 1024;
 
 /// Floor on the number of source nodes per chunk.
 ///
@@ -275,11 +372,10 @@ struct BuildTimings {
     mark_old: Duration,
     /// The local join itself: candidate gather plus pairwise distances
     join: Duration,
-    /// Radix sorting each chunk's update batch by target
-    sort: Duration,
-    /// Merging sorted updates back into the graph rows
+    /// Merging routed updates back into the graph rows
     apply: Duration,
-    /// Updates emitted by the join, before deduplication or heap rejection
+    /// Update records emitted by the join, before deduplication or heap
+    /// rejection
     updates_emitted: usize,
     /// Updates that actually changed a graph row
     updates_accepted: usize,
@@ -297,8 +393,8 @@ impl BuildTimings {
     /// Print the descent breakdown as `Detailed` stage lines.
     fn report(&self) {
         println!(
-            " Descent phases: candidates {:.2?}, mark old {:.2?}, local join {:.2?}, radix sort {:.2?}, apply {:.2?}",
-            self.candidates, self.mark_old, self.join, self.sort, self.apply
+            " Descent phases: candidates {:.2?}, mark old {:.2?}, local join {:.2?}, apply {:.2?}",
+            self.candidates, self.mark_old, self.join, self.apply
         );
 
         let accept = if self.updates_emitted > 0 {
@@ -1009,8 +1105,8 @@ pub trait NNDescentQuery<T> {
 ///
 /// During construction, candidate updates are processed in chunks to bound
 /// peak memory to `O(chunk_size * max_candidates)` rather than
-/// `O(n * max_candidates)`. Each chunk emits both edge directions, sorts by
-/// target, and applies updates lock-free via disjoint pointer writes.
+/// `O(n * max_candidates)`. Each scored pair is routed to the cache-sized row
+/// block(s) owning its endpoints, and every block is applied by one task.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct NNDescent<T> {
     /// Original vectors, flattened row-major
@@ -1234,13 +1330,13 @@ where
     /// [`UPDATE_TARGET_BYTES`] divided by the real size of an `Update<T>`.
     #[inline]
     fn target_updates_per_chunk() -> usize {
-        UPDATE_TARGET_BYTES / std::mem::size_of::<Update<T>>()
+        UPDATE_TARGET_BYTES / std::mem::size_of::<PairUpdate<T>>()
     }
 
     /// Opening guess at the number of source nodes per chunk.
     ///
-    /// A source node emits one update per direction for every candidate pair
-    /// that clears the distance threshold, so the count scales with
+    /// A source node emits up to two records for every candidate pair that
+    /// clears the distance threshold, so the count scales with
     /// `|C_new| * |C_total|`, not with `max_candidates`. Only a starting point;
     /// [`Self::rescale_chunk_size`] corrects it from the second chunk on.
     ///
@@ -1736,6 +1832,11 @@ where
         }
 
         let mut cands = CandidateSets::new(self.n, max_candidates);
+        let by_threads = self
+            .n
+            .div_ceil(rayon::current_num_threads() * APPLY_BLOCKS_PER_THREAD);
+        let by_cache = APPLY_BLOCK_BYTES / (k * std::mem::size_of::<Neighbour<T>>());
+        let block_size = by_threads.min(by_cache).max(1);
 
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
@@ -1755,28 +1856,29 @@ where
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
                 let t = Instant::now();
-                let (mut chunk_updates, stats) =
-                    self.generate_updates_for_chunk(&cands, &graph, k, chunk_start, chunk_end);
+                let (buckets, emitted, stats) = self.generate_updates_for_chunk(
+                    &cands,
+                    &graph,
+                    k,
+                    chunk_start,
+                    chunk_end,
+                    block_size,
+                );
                 timings.join += t.elapsed();
-                timings.updates_emitted += chunk_updates.len();
+                timings.updates_emitted += emitted;
                 timings.cand_len_sum += stats.sum;
                 timings.cand_len_count += stats.count;
                 timings.cand_len_max = timings.cand_len_max.max(stats.max);
                 timings.pairs += stats.pairs;
 
                 let t = Instant::now();
-                chunk_updates.radix_sort_unstable();
-                timings.sort += t.elapsed();
-
-                let t = Instant::now();
-                self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
+                updates_count.fetch_add(
+                    self.apply_pair_updates(&buckets, &mut graph, k, block_size),
+                    Ordering::Relaxed,
+                );
                 timings.apply += t.elapsed();
 
-                chunk_size = self.rescale_chunk_size(
-                    chunk_size,
-                    chunk_end - chunk_start,
-                    chunk_updates.len(),
-                );
+                chunk_size = self.rescale_chunk_size(chunk_size, chunk_end - chunk_start, emitted);
                 chunk_start = chunk_end;
                 n_chunks += 1;
             }
@@ -1933,10 +2035,10 @@ where
         });
     }
 
-    /// Generate distance updates from a chunk of source nodes.
+    /// Generate routed distance updates from a chunk of source nodes.
     ///
-    /// Emits both edge directions `(p, q, d)` and `(q, p, d)` so that
-    /// the caller can sort by target and apply lock-free.
+    /// Each scored pair becomes one record per row block it has to reach (see
+    /// [`PairUpdate::route`]), so the apply pass needs no sort.
     ///
     /// ### Params
     ///
@@ -1945,10 +2047,12 @@ where
     /// * `k` - Neighbours per node
     /// * `chunk_start` - First source node index (inclusive)
     /// * `chunk_end` - Last source node index (exclusive)
+    /// * `block_size` - Rows per apply block
     ///
     /// ### Returns
     ///
-    /// Unsorted list of `(target, source, distance)` update triples
+    /// `(buckets, records, stats)`: one bucket set per join worker, the record
+    /// count across all of them, and the candidate-list statistics.
     fn generate_updates_for_chunk(
         &self,
         cands: &CandidateSets,
@@ -1956,7 +2060,8 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> (Vec<Update<T>>, CandStats) {
+        block_size: usize,
+    ) -> (Vec<PairBuckets<T>>, usize, CandStats) {
         match self.metric {
             Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
                 cands,
@@ -1964,6 +2069,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
             Dist::Cosine => self.generate_updates_for_chunk_impl::<CosineMetric>(
                 cands,
@@ -1971,6 +2077,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
             Dist::Manhattan => self.generate_updates_for_chunk_impl::<ManhattanMetric>(
                 cands,
@@ -1978,6 +2085,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
         }
     }
@@ -2014,6 +2122,14 @@ where
     /// New and old lists are concatenated into one tile, so the single loop
     /// `a in 0..n_new`, `b in a+1..n_total` covers the new-new upper triangle
     /// and the full new-old rectangle exactly once each.
+    ///
+    /// ### Params
+    ///
+    /// See [`Self::generate_updates_for_chunk`].
+    ///
+    /// ### Returns
+    ///
+    /// See [`Self::generate_updates_for_chunk`].
     fn generate_updates_for_chunk_impl<M: MetricFn<T>>(
         &self,
         cands: &CandidateSets,
@@ -2021,27 +2137,32 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> (Vec<Update<T>>, CandStats) {
+        block_size: usize,
+    ) -> (Vec<PairBuckets<T>>, usize, CandStats) {
         let dim = self.dim;
         let cosine = self.metric == Dist::Cosine;
         let two = T::one() + T::one();
+        let n_blocks = self.n.div_ceil(block_size);
 
-        (chunk_start..chunk_end)
+        let workers: Vec<(PairBuckets<T>, usize, CandStats)> = (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
                 || {
                     (
-                        Vec::<Update<T>>::with_capacity(16_384),
+                        (0..n_blocks)
+                            .map(|_| Vec::new())
+                            .collect::<PairBuckets<T>>(),
+                        0usize,
                         JoinScratch::<T>::new(),
                         CandStats::default(),
                     )
                 },
-                |(mut updates, mut scratch, mut stats), i| {
+                |(mut buckets, mut emitted, mut scratch, mut stats), i| {
                     let n_new = scratch.gather(self, graph, k, cands, i, cosine);
                     let n_total = scratch.ids.len();
                     stats.record(n_total);
                     if n_new == 0 || n_total < 2 {
-                        return (updates, scratch, stats);
+                        return (buckets, emitted, scratch, stats);
                     }
 
                     let use_gemm = self.gemm_join_applies(n_total);
@@ -2098,32 +2219,78 @@ where
                                 d
                             };
 
-                            if d <= ta {
-                                updates.push(Update::new(pa, pb, d));
-                            }
-                            if d <= tb {
-                                updates.push(Update::new(pb, pa, d));
-                            }
+                            emitted += PairUpdate::route(
+                                &mut buckets,
+                                block_size,
+                                pa,
+                                pb,
+                                d,
+                                d <= ta,
+                                d <= tb,
+                            );
                         }
                     }
 
-                    (updates, scratch, stats)
+                    (buckets, emitted, scratch, stats)
                 },
             )
-            .map(|(updates, _, stats)| (updates, stats))
-            .reduce(
-                || (Vec::new(), CandStats::default()),
-                |(mut a, sa), (mut b, sb)| {
-                    let merged = sa.merge(sb);
-                    if a.len() >= b.len() {
-                        a.extend_from_slice(&b);
-                        (a, merged)
-                    } else {
-                        b.extend_from_slice(&a);
-                        (b, merged)
+            .map(|(buckets, emitted, _, stats)| (buckets, emitted, stats))
+            .collect();
+
+        let emitted = workers.iter().map(|w| w.1).sum();
+        let stats = workers
+            .iter()
+            .fold(CandStats::default(), |acc, w| acc.merge(w.2));
+        let buckets = workers.into_iter().map(|w| w.0).collect();
+        (buckets, emitted, stats)
+    }
+
+    /// Merge one chunk's routed updates into the graph.
+    ///
+    /// Each row block is owned by one task, which walks every worker's bucket
+    /// for that block. The rows keep the top `k` by `(distance, id)` whatever
+    /// the arrival order, so no sort is needed.
+    ///
+    /// ### Params
+    ///
+    /// * `buckets` - Per-worker buckets from the join
+    /// * `graph` - Flat k-NN graph, rows sorted ascending
+    /// * `k` - Neighbours per node
+    /// * `block_size` - Rows per block, as used for routing
+    ///
+    /// ### Returns
+    ///
+    /// Number of row insertions that changed the graph.
+    fn apply_pair_updates(
+        &self,
+        buckets: &[PairBuckets<T>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
+        block_size: usize,
+    ) -> usize {
+        let id_mask = !PairUpdate::<T>::TO_ROW;
+        graph
+            .par_chunks_mut(block_size * k)
+            .enumerate()
+            .map(|(block, rows)| {
+                let base = block * block_size;
+                let mut changed = 0usize;
+                for worker in buckets {
+                    for u in &worker[block] {
+                        let (a, b) = ((u.a & id_mask) as usize, (u.b & id_mask) as usize);
+                        if u.a & PairUpdate::<T>::TO_ROW != 0 {
+                            let row = &mut rows[(a - base) * k..(a - base + 1) * k];
+                            changed += insert_sorted(row, b as u32, u.dist) as usize;
+                        }
+                        if u.b & PairUpdate::<T>::TO_ROW != 0 {
+                            let row = &mut rows[(b - base) * k..(b - base + 1) * k];
+                            changed += insert_sorted(row, a as u32, u.dist) as usize;
+                        }
                     }
-                },
-            )
+                }
+                changed
+            })
+            .sum()
     }
 
     /// Calculate distance between two indexed points under the index metric
