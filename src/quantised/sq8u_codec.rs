@@ -74,6 +74,7 @@ where
     ///
     /// For cosine the rows are normalised before calibration, so the codec
     /// stores unit vectors and an inner product is the cosine similarity.
+    /// That takes a copy of `data`; [`Sq8uCodec::from_owned`] avoids it.
     ///
     /// ### Params
     ///
@@ -94,26 +95,72 @@ where
         metric: Dist,
         params: Option<UniformQuantParams>,
     ) -> Result<Self, AnnSearchErrors> {
-        if metric == Dist::Manhattan {
-            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        if metric == Dist::Cosine {
+            return Self::from_owned(data[..n * dim].to_vec(), n, dim, metric, params);
         }
+        Self::encode(&data[..n * dim], n, dim, metric, params)
+    }
 
-        // Cosine is an inner product on unit rows, so normalise before the
-        // quantiser sees the data rather than carrying norms through it.
-        let owned;
-        let data = if metric == Dist::Cosine {
-            let mut rows = data[..n * dim].to_vec();
-            rows.par_chunks_mut(dim).for_each(|row| {
+    /// Calibrate and encode a dataset the caller no longer needs.
+    ///
+    /// Same result as [`Sq8uCodec::new`], but cosine normalises `data` in
+    /// place instead of copying it.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Row-major flattened vectors of length `n * dim`, consumed
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality
+    /// * `metric` - Distance metric; Manhattan is not supported
+    /// * `params` - Calibration settings, `None` for the default
+    ///
+    /// ### Returns
+    ///
+    /// The encoded codec, or an error on an unsupported metric or bad
+    /// calibration settings
+    pub fn from_owned(
+        mut data: Vec<T>,
+        n: usize,
+        dim: usize,
+        metric: Dist,
+        params: Option<UniformQuantParams>,
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Cosine {
+            data[..n * dim].par_chunks_mut(dim).for_each(|row| {
                 let norm = T::calculate_l2_norm(row);
                 if norm > T::epsilon() {
                     row.iter_mut().for_each(|x| *x /= norm);
                 }
             });
-            owned = rows;
-            &owned[..]
-        } else {
-            &data[..n * dim]
-        };
+        }
+        Self::encode(&data[..n * dim], n, dim, metric, params)
+    }
+
+    /// Calibrate the quantiser on rows already in their final form and
+    /// encode them.
+    ///
+    /// ### Params
+    ///
+    /// * `data` - Row-major flattened vectors, unit rows for cosine
+    /// * `n` - Number of vectors
+    /// * `dim` - Dimensionality
+    /// * `metric` - Distance metric; Manhattan is not supported
+    /// * `params` - Calibration settings, `None` for the default
+    ///
+    /// ### Returns
+    ///
+    /// The encoded codec, or an error on an unsupported metric or bad
+    /// calibration settings
+    fn encode(
+        data: &[T],
+        n: usize,
+        dim: usize,
+        metric: Dist,
+        params: Option<UniformQuantParams>,
+    ) -> Result<Self, AnnSearchErrors> {
+        if metric == Dist::Manhattan {
+            return Err(AnnSearchErrors::DistanceNotSupported(metric));
+        }
 
         let quantiser = UniformQuantiser::train(data, n, dim, params)?;
 

@@ -11,6 +11,7 @@ use crate::quantised::hnsw_quantised::codec::GraphCodec;
 use crate::quantised::sq8u_codec::*;
 use crate::quantised::uniform_quant::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -196,6 +197,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -238,19 +240,13 @@ where
             );
         }
 
-        let mut reordered = Vec::with_capacity(n * dim);
-        for &old_id in &original_ids {
-            let old_id = old_id as usize;
-            reordered.extend_from_slice(&vectors_flat[old_id * dim..(old_id + 1) * dim]);
-        }
-        drop(vectors_flat);
+        permute_rows_in_place(&mut vectors_flat, dim, &original_ids);
 
         // 5. quantise
         if verbosity.detailed_verbosity() {
             println!(" Quantising vectors ...");
         }
-        let codec = Sq8uCodec::new(&reordered, n, dim, metric, quant_params)?;
-        drop(reordered);
+        let codec = Sq8uCodec::from_owned(vectors_flat, n, dim, metric, quant_params)?;
 
         log.finish();
 

@@ -630,7 +630,10 @@ where
         let (flat, n, dim) = data.into_row_major();
 
         let start = Instant::now();
-        let codec = Sq8uCodec::new(&flat, n, dim, *metric, quant_params)?;
+        // The float vectors are not retained: everything downstream of here
+        // works on codes. Re-ranking against the originals is the caller's
+        // job until the refiner lands.
+        let codec = Sq8uCodec::from_owned(flat, n, dim, *metric, quant_params)?;
         if verbosity.detailed_verbosity() {
             println!(
                 " Encoded {} vectors (dim {}) in {:.2?}",
@@ -639,10 +642,6 @@ where
                 start.elapsed()
             );
         }
-        // The float vectors are not retained: everything downstream of here
-        // works on codes. Re-ranking against the originals is the caller's
-        // job until the refiner lands.
-        drop(flat);
 
         let params = GraphBuildParams::new(m, ef_construction, seed, verbosity);
         let index = Self::from_codec(codec, &params);

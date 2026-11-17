@@ -11,6 +11,7 @@ use crate::quantised::pq_search::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::pack_knn_results;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -255,6 +256,7 @@ where
             let residuals = T::subtract_simd(vec, centroid);
             training_residuals.extend_from_slice(&residuals);
         }
+        drop(training_data);
 
         // 4. train PQ on residuals
         let start = Instant::now();
@@ -268,6 +270,7 @@ where
             seed + 1000,
             verbosity,
         )?;
+        drop(training_residuals);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained product quantiser (m = {}) in {:.2?}",
@@ -288,8 +291,6 @@ where
             nlist,
             &metric,
         );
-
-        let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 6. encode all vectors with product quantiser
         if verbosity.detailed_verbosity() {
@@ -313,6 +314,9 @@ where
                     codebook.encode_rows(tile, codes);
                 },
             );
+
+        let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
+        drop(vectors_flat);
 
         let mut idx = Self {
             quantised_codes,
@@ -683,14 +687,7 @@ where
             new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
-        let mut new_codes = Vec::with_capacity(self.quantised_codes.len());
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * m;
-            new_codes.extend_from_slice(&self.quantised_codes[start..start + m]);
-        }
-
-        self.quantised_codes = new_codes;
+        permute_rows_in_place(&mut self.quantised_codes, m, &new_to_old);
         self.all_indices.clear();
         self.all_indices.shrink_to_fit();
 

@@ -10,6 +10,7 @@ use thousands::Separable;
 use crate::prelude::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -210,6 +211,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -256,8 +258,11 @@ where
         // 4. generate a flat version for better cache locality
         let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
 
+        let encoded = encode_bf16_quantisation(&vectors_flat);
+        drop(vectors_flat);
+
         let mut idx = Self {
-            vectors_flat: encode_bf16_quantisation(&vectors_flat),
+            vectors_flat: encoded,
             dim,
             n,
             norms,
@@ -533,24 +538,10 @@ where
             new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
-        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
-        let mut new_norms = if self.norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * self.dim;
-            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
-            if !self.norms.is_empty() {
-                new_norms.push(self.norms[old_id]);
-            }
+        permute_rows_in_place(&mut self.vectors_flat, self.dim, &new_to_old);
+        if !self.norms.is_empty() {
+            permute_rows_in_place(&mut self.norms, 1, &new_to_old);
         }
-
-        self.vectors_flat = new_vectors_flat;
-        self.norms = new_norms;
         self.all_indices.clear();
         self.all_indices.shrink_to_fit();
 

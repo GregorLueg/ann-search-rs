@@ -363,6 +363,7 @@ where
             let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
             training_residuals.extend_from_slice(&T::subtract_simd(vec, centroid));
         }
+        drop(training_data);
 
         let start = Instant::now();
         let codebook = OptimisedProductQuantiser::train(
@@ -375,6 +376,7 @@ where
             seed + 1000,
             verbosity,
         )?;
+        drop(training_residuals);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained optimised product quantiser (m = {}) in {:.2?}",
@@ -482,6 +484,8 @@ where
             .collect();
 
         log.finish();
+
+        drop(vectors_flat);
 
         let mut idx = Self {
             quantised_codes,
