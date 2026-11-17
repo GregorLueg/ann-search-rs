@@ -3987,7 +3987,10 @@ mod tests {
                     &index.vectors_flat[pid * dim..(pid + 1) * dim],
                 );
                 let rel = (d - exact).abs() / exact.max(f32::MIN_POSITIVE);
-                assert!(rel <= 1e-6, "stored distance for ({i}, {pid}) is off by {rel}");
+                assert!(
+                    rel <= 1e-6,
+                    "stored distance for ({i}, {pid}) is off by {rel}"
+                );
             }
         }
     }
