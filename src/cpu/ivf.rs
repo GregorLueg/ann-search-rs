@@ -42,6 +42,11 @@ const BATCH_MIN_QUERIES: usize = 1024;
 /// `|q|^2 + |x|^2 - 2 q.x` misranks across the k-th distance in `f32`.
 const RERANK_EXTRA: usize = 8;
 
+/// Most queries of one cell group per GEMM. Bounds the per-thread query and
+/// distance tiles at this many rows, so their size no longer follows how many
+/// queries of a block happen to probe one popular cell.
+const GEMM_QUERY_TILE: usize = 256;
+
 /// Rows of a cell per GEMM tile, bounding the distance tile the heaps scan.
 /// Flat across the sizes tried, so not critical.
 const CELL_ROW_TILE: usize = 512;
@@ -228,6 +233,9 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        // the sample is a large fraction of the data and would otherwise live
+        // through assignment and the layout pass
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -304,8 +312,8 @@ where
         Ok(idx)
     }
 
-    /// Function will optimise memory layout and put vectors sorted by cluster
-    /// id
+    /// Reorder the vectors (and norms) in place so each cell is one
+    /// contiguous slab
     ///
     /// ### Returns
     ///
@@ -319,24 +327,10 @@ where
             new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
-        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
-        let mut new_norms = if self.norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * self.dim;
-            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..start + self.dim]);
-            if !self.norms.is_empty() {
-                new_norms.push(self.norms[old_id]);
-            }
+        permute_rows_in_place(&mut self.vectors_flat, self.dim, &new_to_old);
+        if !self.norms.is_empty() {
+            permute_rows_in_place(&mut self.norms, 1, &new_to_old);
         }
-
-        self.vectors_flat = new_vectors_flat;
-        self.norms = new_norms;
 
         // Offsets index `vectors_flat` directly; `all_indices` is no longer needed
         self.all_indices.clear();
@@ -525,7 +519,8 @@ where
     /// Within a block the `(cell, query)` pairs are sorted by
     /// cell, so each probed cell is visited once: when at least
     /// [`GEMM_MIN_GROUP`] queries want it, their dot products against the
-    /// cell's contiguous rows come from one GEMM, otherwise from the four-row
+    /// cell's contiguous rows come from GEMMs of at most [`GEMM_QUERY_TILE`]
+    /// queries each, otherwise from the four-row
     /// SIMD scan. Euclidean scores with `|q|^2 + |x|^2 - 2 q.x`, keeps
     /// [`RERANK_EXTRA`] candidates past `k`, and recomputes those exactly
     /// before cutting to `k`, so returned distances and their order carry no
@@ -642,51 +637,54 @@ where
                                 self.scan_cell(start, end, q, q_norm[qi], &mut heaps[bi]);
                             }
                         } else {
-                            let g = group.len();
-                            q_tile.clear();
-                            for &pk in group {
-                                let qi = block[(pk & 0xFFFF_FFFF) as usize] as usize;
-                                q_tile.extend_from_slice(&queries[qi * dim..(qi + 1) * dim]);
-                            }
-                            let q_mat = MatRef::from_row_major_slice(q_tile, g, dim);
-                            for r0 in (start..end).step_by(CELL_ROW_TILE) {
-                                let r1 = (r0 + CELL_ROW_TILE).min(end);
-                                let rows = r1 - r0;
-                                d_tile.resize(g * rows, T::zero());
-                                gemm(
-                                    MatMut::from_row_major_slice_mut(
-                                        &mut d_tile[..g * rows],
-                                        g,
-                                        rows,
-                                    ),
-                                    Accum::Replace,
-                                    q_mat,
-                                    MatRef::from_row_major_slice(
-                                        &self.vectors_flat[r0 * dim..r1 * dim],
-                                        rows,
-                                        dim,
-                                    )
-                                    .transpose(),
-                                    T::one(),
-                                    Par::Seq,
-                                );
-                                for (gi, &pk) in group.iter().enumerate() {
-                                    let bi = (pk & 0xFFFF_FFFF) as usize;
-                                    let qn = q_norm[block[bi] as usize];
-                                    let heap = &mut heaps[bi];
-                                    let dots = &d_tile[gi * rows..(gi + 1) * rows];
-                                    if cosine {
-                                        for (j, &d) in dots.iter().enumerate() {
-                                            let dist = cosine_from_dot(d, qn * self.norms[r0 + j]);
-                                            if dist < heap.threshold() {
-                                                heap.push(dist, r0 + j);
+                            for sub in group.chunks(GEMM_QUERY_TILE) {
+                                let g = sub.len();
+                                q_tile.clear();
+                                for &pk in sub {
+                                    let qi = block[(pk & 0xFFFF_FFFF) as usize] as usize;
+                                    q_tile.extend_from_slice(&queries[qi * dim..(qi + 1) * dim]);
+                                }
+                                let q_mat = MatRef::from_row_major_slice(q_tile, g, dim);
+                                for r0 in (start..end).step_by(CELL_ROW_TILE) {
+                                    let r1 = (r0 + CELL_ROW_TILE).min(end);
+                                    let rows = r1 - r0;
+                                    d_tile.resize(g * rows, T::zero());
+                                    gemm(
+                                        MatMut::from_row_major_slice_mut(
+                                            &mut d_tile[..g * rows],
+                                            g,
+                                            rows,
+                                        ),
+                                        Accum::Replace,
+                                        q_mat,
+                                        MatRef::from_row_major_slice(
+                                            &self.vectors_flat[r0 * dim..r1 * dim],
+                                            rows,
+                                            dim,
+                                        )
+                                        .transpose(),
+                                        T::one(),
+                                        Par::Seq,
+                                    );
+                                    for (gi, &pk) in sub.iter().enumerate() {
+                                        let bi = (pk & 0xFFFF_FFFF) as usize;
+                                        let qn = q_norm[block[bi] as usize];
+                                        let heap = &mut heaps[bi];
+                                        let dots = &d_tile[gi * rows..(gi + 1) * rows];
+                                        if cosine {
+                                            for (j, &d) in dots.iter().enumerate() {
+                                                let dist =
+                                                    cosine_from_dot(d, qn * self.norms[r0 + j]);
+                                                if dist < heap.threshold() {
+                                                    heap.push(dist, r0 + j);
+                                                }
                                             }
-                                        }
-                                    } else {
-                                        for (j, &d) in dots.iter().enumerate() {
-                                            let dist = qn + x_sq[r0 + j] - two * d;
-                                            if dist < heap.threshold() {
-                                                heap.push(dist, r0 + j);
+                                        } else {
+                                            for (j, &d) in dots.iter().enumerate() {
+                                                let dist = qn + x_sq[r0 + j] - two * d;
+                                                if dist < heap.threshold() {
+                                                    heap.push(dist, r0 + j);
+                                                }
                                             }
                                         }
                                     }
