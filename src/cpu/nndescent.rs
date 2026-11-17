@@ -1627,13 +1627,13 @@ where
         seed: usize,
         verbosity: Verbosity,
     ) -> Self {
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         // Every stage gathers rows by id, so put tree neighbours next to each
         // other in memory first. Undone before returning.
         let start = Instant::now();
         let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
-        let vectors_flat = permute_rows(&vectors_flat, dim, &new_to_old);
+        permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
         if verbosity.detailed_verbosity() {
             println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
         }
@@ -1691,12 +1691,9 @@ where
         for (new_id, &old_id) in new_to_old.iter().enumerate() {
             old_to_new[old_id as usize] = new_id as u32;
         }
-        builder.vectors_flat = permute_rows(&builder.vectors_flat, dim, &old_to_new);
+        permute_rows_in_place(&mut builder.vectors_flat, dim, &old_to_new);
         if !builder.norms.is_empty() {
-            builder.norms = old_to_new
-                .iter()
-                .map(|&i| builder.norms[i as usize])
-                .collect();
+            permute_rows_in_place(&mut builder.norms, 1, &old_to_new);
         }
         builder.graph = vec![(SENTINEL_PID as u32, T::max_value()); n * k];
         builder
