@@ -238,9 +238,9 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
-        let norms = if metric == Dist::Cosine {
+        let mut norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
                     let start = i * dim;
@@ -272,6 +272,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -344,19 +345,9 @@ where
             );
         }
 
-        let mut reordered = Vec::with_capacity(vectors_flat.len());
-        let mut reordered_norms = if norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(n)
-        };
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * dim;
-            reordered.extend_from_slice(&vectors_flat[start..start + dim]);
-            if !norms.is_empty() {
-                reordered_norms.push(norms[old_id]);
-            }
+        permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
+        if !norms.is_empty() {
+            permute_rows_in_place(&mut norms, 1, &new_to_old);
         }
 
         // Spill lists index the *reordered* rows, so translate the secondary
@@ -382,10 +373,10 @@ where
         log.finish();
 
         Ok(Self {
-            vectors_flat: reordered,
+            vectors_flat,
             dim,
             n,
-            norms: reordered_norms,
+            norms,
             metric,
             centroids,
             centroids_norm,

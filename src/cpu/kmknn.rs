@@ -221,6 +221,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -288,16 +289,12 @@ where
                 max_cluster_radius_sq = max_d_sq;
             }
         }
-        let mut new_vectors_flat = Vec::with_capacity(n * dim);
-        for &old_id in &new_to_old {
-            let start = old_id as usize * dim;
-            new_vectors_flat.extend_from_slice(&vectors_flat[start..start + dim]);
-        }
+        permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
 
         log.finish();
 
         Ok(Self {
-            vectors_flat: new_vectors_flat,
+            vectors_flat,
             dim,
             n,
             metric,

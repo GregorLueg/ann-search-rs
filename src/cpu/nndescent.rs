@@ -1299,11 +1299,14 @@ where
         // Diversification only shapes what the query walks. Extraction and
         // NSG keep the full kNN graph.
         let query_graph: Vec<u32> = if diversify_prob > T::zero() {
-            builder
+            // the narrowing collect reuses the 8-byte pair buffer in place
+            let mut ids: Vec<u32> = builder
                 .diversify_graph(&graph, k, diversify_prob, seed)
                 .into_iter()
                 .map(|(pid, _)| pid)
-                .collect()
+                .collect();
+            ids.shrink_to_fit();
+            ids
         } else {
             graph.iter().map(|&(pid, _)| pid).collect()
         };
