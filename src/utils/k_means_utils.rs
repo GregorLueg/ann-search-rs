@@ -205,6 +205,10 @@ where
 /// threads busy to the end; the tile width barely moves the kernel itself.
 const GEMM_TILE_SIZE: usize = 512;
 
+/// Bytes of shifted rows built per block by the SOAR shifted rule, so the
+/// shifted copy stays a fraction of the data. Not tuned.
+const SOAR_SHIFT_BLOCK_BYTES: usize = 32 * 1024 * 1024;
+
 /// Centroids per GEMM assignment block. Speed is flat in this; it exists to
 /// cap the per-thread dot tile at `GEMM_TILE_SIZE * GEMM_CENTROID_TILE`
 /// elements regardless of k.
@@ -3089,8 +3093,9 @@ where
 /// each point in exactly two inverted lists.
 ///
 /// [`SoarRule::Shifted`] deliberately reuses [`assign_all_parallel`] on a
-/// shifted copy of the data rather than introducing a scoring kernel of its
-/// own, which means it inherits the tiled GEMM path for free. The other two
+/// shifted copy of the data, built a block of rows at a time, rather
+/// than introducing a scoring kernel of its own, which means it inherits the
+/// tiled GEMM path for free. The other two
 /// arms are plain `O(n * k * dim)` scans with no GEMM path.
 ///
 /// ### Params
@@ -3179,62 +3184,78 @@ where
             let one_plus_mu = T::one() + mu;
 
             // x_tilde = (1 + mu) * x - mu * c_1, on the unit sphere for cosine.
-            let mut shifted = vec![T::zero(); n * dim];
-            shifted
-                .par_chunks_mut(dim)
-                .enumerate()
-                .for_each(|(i, out)| {
-                    let c1 = primary[i] as usize;
-                    let vec = &data[i * dim..(i + 1) * dim];
-                    let cent = &centroids[c1 * dim..(c1 + 1) * dim];
-                    let (inv_v, inv_c) = if cosine {
-                        (safe_recip(data_norms[i]), safe_recip(centroid_norms[c1]))
-                    } else {
-                        (T::one(), T::one())
-                    };
-                    for d in 0..dim {
-                        out[d] = one_plus_mu * (vec[d] * inv_v) - mu * (cent[d] * inv_c);
-                    }
-                });
-
-            let shifted_norms: Vec<T> = if cosine {
+            // Shifted and assigned a block of rows at a time: each point's
+            // secondary depends on its own row only, and a whole shifted copy
+            // would double the data.
+            let block = (SOAR_SHIFT_BLOCK_BYTES / (dim.max(1) * std::mem::size_of::<T>())).max(1);
+            let mut out: Vec<u32> = Vec::with_capacity(n);
+            let mut shifted: Vec<T> = Vec::new();
+            for start in (0..n).step_by(block) {
+                let end = (start + block).min(n);
+                let m = end - start;
+                shifted.clear();
+                shifted.resize(m * dim, T::zero());
                 shifted
-                    .par_chunks(dim)
-                    .map(|v| T::calculate_l2_norm(v))
-                    .collect()
-            } else {
-                vec![T::one(); n]
-            };
+                    .par_chunks_mut(dim)
+                    .enumerate()
+                    .for_each(|(local, row)| {
+                        let i = start + local;
+                        let c1 = primary[i] as usize;
+                        let vec = &data[i * dim..(i + 1) * dim];
+                        let cent = &centroids[c1 * dim..(c1 + 1) * dim];
+                        let (inv_v, inv_c) = if cosine {
+                            (safe_recip(data_norms[i]), safe_recip(centroid_norms[c1]))
+                        } else {
+                            (T::one(), T::one())
+                        };
+                        for d in 0..dim {
+                            row[d] = one_plus_mu * (vec[d] * inv_v) - mu * (cent[d] * inv_c);
+                        }
+                    });
 
-            let assigned = assign_all_parallel(
-                &shifted,
-                &shifted_norms,
-                dim,
-                n,
-                centroids,
-                centroid_norms,
-                k,
-                metric,
-            );
+                let shifted_norms: Vec<T> = if cosine {
+                    shifted
+                        .par_chunks(dim)
+                        .map(|v| T::calculate_l2_norm(v))
+                        .collect()
+                } else {
+                    vec![T::one(); m]
+                };
 
-            let mut out = assigned;
-            // The shift moves away from `c_1`, so collisions thin out as `mu`
-            // grows, but at small `mu` they are common. Repair against the
-            // shifted point, which is what the rule actually ranks.
-            out.par_iter_mut().enumerate().for_each(|(i, slot)| {
-                if *slot == primary[i] {
-                    *slot = nearest_excluding(
-                        &shifted[i * dim..(i + 1) * dim],
-                        shifted_norms[i],
-                        centroids,
-                        centroid_norms,
-                        dim,
-                        k,
-                        primary[i] as usize,
-                        metric,
-                    );
-                }
-            });
+                let mut assigned = assign_all_parallel(
+                    &shifted,
+                    &shifted_norms,
+                    dim,
+                    m,
+                    centroids,
+                    centroid_norms,
+                    k,
+                    metric,
+                );
+
+                // The shift moves away from `c_1`, so collisions thin out as
+                // `mu` grows, but at small `mu` they are common. Repair against
+                // the shifted point, which is what the rule actually ranks.
+                assigned
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(local, slot)| {
+                        let i = start + local;
+                        if *slot == primary[i] {
+                            *slot = nearest_excluding(
+                                &shifted[local * dim..(local + 1) * dim],
+                                shifted_norms[local],
+                                centroids,
+                                centroid_norms,
+                                dim,
+                                k,
+                                primary[i] as usize,
+                                metric,
+                            );
+                        }
+                    });
+                out.extend(assigned);
+            }
             out
         }
 

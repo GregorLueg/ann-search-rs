@@ -261,15 +261,16 @@ where
 
         // For normalised vectors (cosine), ||q-v||² = 2(1 - <q,v>) so Euclidean distance
         // on residuals correctly approximates cosine distance
-        let mut training_residuals = Vec::with_capacity(training_data.len());
-        for (vec_idx, &cluster_id) in training_assignments.iter().enumerate() {
-            let vec_start = vec_idx * dim;
-            let vec = &training_data[vec_start..vec_start + dim];
-            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
-            let residuals = T::subtract_simd(vec, centroid);
-            training_residuals.extend_from_slice(&residuals);
-        }
-        drop(training_data);
+        // residuals in place: the sample is not needed once they exist
+        let mut training_residuals = training_data;
+        training_residuals
+            .par_chunks_mut(dim)
+            .zip(training_assignments.par_iter())
+            .for_each(|(row, &cluster_id)| {
+                let centroid =
+                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
+                row.iter_mut().zip(centroid).for_each(|(x, &c)| *x = *x - c);
+            });
 
         // 4. train OPQ on residuals
         let start = Instant::now();
