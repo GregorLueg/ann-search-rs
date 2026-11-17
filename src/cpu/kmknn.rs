@@ -4,6 +4,7 @@
 
 use faer::{Accum, MatMut, MatRef, Par, RowRef};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::BinaryHeap;
 use thousands::Separable;
 
@@ -846,16 +847,69 @@ where
         return_dist: bool,
         verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
+        self.query_batch_cow(Cow::Borrowed(queries), query_dim, k, return_dist, verbosity)
+    }
+
+    /// [`KmknnIndex::query_batch`] on a query buffer the caller hands over,
+    /// so Cosine normalises it in place instead of copying it.
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Row-major queries, `nq * query_dim`, consumed
+    /// * `query_dim` - Query dimensionality, must match the index
+    /// * `k` - Number of neighbours to return
+    /// * `return_dist` - Whether to return distances
+    /// * `verbosity` - Prints start, progress and end at `Normal`
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)`, one row per query
+    pub(crate) fn query_batch_owned(
+        &self,
+        queries: Vec<T>,
+        query_dim: usize,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
+        self.query_batch_cow(Cow::Owned(queries), query_dim, k, return_dist, verbosity)
+    }
+
+    /// Shared body of [`KmknnIndex::query_batch`] and
+    /// [`KmknnIndex::query_batch_owned`]
+    ///
+    /// ### Params
+    ///
+    /// * `queries` - Row-major queries, borrowed or owned
+    /// * `query_dim` - Query dimensionality, must match the index
+    /// * `k` - Number of neighbours to return
+    /// * `return_dist` - Whether to return distances
+    /// * `verbosity` - Prints start, progress and end at `Normal`
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(knn_indices, optional distances)`, one row per query
+    fn query_batch_cow(
+        &self,
+        queries: Cow<[T]>,
+        query_dim: usize,
+        k: usize,
+        return_dist: bool,
+        verbosity: Verbosity,
+    ) -> KnnOptionResult<T> {
         self.check_dim(query_dim)?;
         let nq = queries.len() / query_dim;
         let progress = QueryProgress::new("kMkNN index", nq, false, verbosity);
         let results = if nq >= BATCH_MIN_QUERIES {
             if self.metric == Dist::Cosine {
-                let mut q = queries[..nq * query_dim].to_vec();
-                q.par_chunks_exact_mut(query_dim).for_each(normalise_vector);
+                // copies only when borrowed
+                let mut q = queries.into_owned();
+                q[..nq * query_dim]
+                    .par_chunks_exact_mut(query_dim)
+                    .for_each(normalise_vector);
                 self.search_batched(&q, nq, k, &progress)
             } else {
-                self.search_batched(queries, nq, k, &progress)
+                self.search_batched(&queries, nq, k, &progress)
             }
         } else {
             queries

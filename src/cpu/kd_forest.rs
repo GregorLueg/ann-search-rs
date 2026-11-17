@@ -556,9 +556,10 @@ where
 /// recursively splits along coordinate axes, selecting randomly from the top
 /// highest-spread dimensions for diversity across trees.
 ///
-/// For Cosine metric, trees are built on normalised vectors so that
-/// axis-aligned splits respect angular geometry. The normalised copy is
-/// discarded after construction; only the raw vectors are stored.
+/// For Cosine metric, the vectors are normalised in place before the trees
+/// are built, so axis-aligned splits respect angular geometry, and stored as
+/// unit rows with unit norms. Indices saved by earlier versions hold raw rows
+/// with their real norms; the distances read both alike.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct KdTreeIndex<T> {
     /// Original vector data, flattened for cache locality
@@ -615,34 +616,6 @@ impl<T> DimensionValidation for KdTreeIndex<T> {
 // Index build //
 /////////////////
 
-/// Unit-normalised copy of the vectors, the space Kd trees split for Cosine.
-///
-/// ### Params
-///
-/// * `vectors_flat` - Flattened vector data
-/// * `norms` - L2 norm per row
-/// * `dim` - Dimensionality
-///
-/// ### Returns
-///
-/// The normalised copy; zero rows stay zero.
-pub(crate) fn normalised_copy<T: AnnSearchFloat>(
-    vectors_flat: &[T],
-    norms: &[T],
-    dim: usize,
-) -> Vec<T> {
-    let mut nv = vectors_flat.to_vec();
-    for (i, &norm) in norms.iter().enumerate() {
-        if norm > T::zero() {
-            let start = i * dim;
-            for d in 0..dim {
-                nv[start + d] /= norm;
-            }
-        }
-    }
-    nv
-}
-
 impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -672,28 +645,28 @@ where
         verbosity: Verbosity,
     ) -> Self {
         let log = BuildLog::new("KdForest index", verbosity);
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
+        // for cosine, store and split unit rows so that axis-aligned splits
+        // approximate angular partitions. Zero rows keep a zero norm.
         let norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * dim;
-                    let end = start + dim;
-                    T::calculate_l2_norm(&vectors_flat[start..end])
+            vectors_flat
+                .chunks_mut(dim)
+                .map(|row| {
+                    let norm = T::calculate_l2_norm(row);
+                    if norm > T::zero() {
+                        row.iter_mut().for_each(|x| *x /= norm);
+                        T::one()
+                    } else {
+                        T::zero()
+                    }
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        // for cosine, build trees on normalised vectors so that axis-aligned
-        // splits approximate angular partitions.
-        let trees = if metric == Dist::Cosine {
-            let normalised = normalised_copy(&vectors_flat, &norms, dim);
-            KdTrees::build(&normalised, n, dim, n_trees, metric, seed)
-        } else {
-            KdTrees::build(&vectors_flat, n, dim, n_trees, metric, seed)
-        };
+        let trees = KdTrees::build(&vectors_flat, n, dim, n_trees, metric, seed);
 
         let mut idx = KdTreeIndex {
             trees,
