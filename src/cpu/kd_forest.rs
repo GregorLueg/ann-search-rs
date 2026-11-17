@@ -795,6 +795,32 @@ where
         k: usize,
         search_k: Option<usize>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let (rows, dists) = self.query_rows(query_vec, k, search_k)?;
+        let ids = rows
+            .into_iter()
+            .map(|r| self.original_ids[r] as usize)
+            .collect();
+        Ok((ids, dists))
+    }
+
+    /// [`KdTreeIndex::query`] returning rows of the reordered
+    /// `vectors_flat` instead of original ids.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - Leaf item budget, as for [`KdTreeIndex::query`]
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(rows, distances)` sorted by distance (nearest first)
+    pub(crate) fn query_rows(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         self.check_dim(query_vec.len())?;
 
         let limit = search_k.unwrap_or(k * self.n_trees * 20);
@@ -849,16 +875,11 @@ where
             }
         });
 
-        let results: Vec<(usize, T)> = top_k
+        Ok(top_k
             .data()
             .iter()
-            .map(|(OrderedFloat(dist), idx)| {
-                let original_idx = self.original_ids[*idx] as usize;
-                (original_idx, *dist)
-            })
-            .collect();
-
-        Ok(results.into_iter().unzip())
+            .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
+            .unzip())
     }
 
     /// Query using a matrix row reference
