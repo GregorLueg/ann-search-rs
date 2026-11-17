@@ -9,6 +9,8 @@ Requires `ann-search-rs` 0.13.1
 
 - Faster NN-Descent and NSG builds from `ann-search-rs` 0.13.1. Distances can
   differ at rounding level at the same seed.
+- Lower peak memory when building and querying most indices, from
+  `ann-search-rs` 0.13.1. RNN-Descent results can differ at the same seed.
 
 ## 0.7.0
 

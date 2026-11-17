@@ -9,6 +9,10 @@ own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
   index and NSG): join updates go straight to their rows instead of through a
   sort, and the joins score four candidates at a time. Distances can differ at
   rounding level at the same seed.
+- Lower peak memory when building and querying most indices: the data is no
+  longer copied for training samples, row reordering or storage. RNN-Descent
+  keeps one copy of the vectors instead of two and its results can differ at
+  the same seed; Kd-forest Cosine distances can differ at rounding level.
 
 ## 0.13.0
 
