@@ -89,12 +89,6 @@ where
         let line = LINE_SIZE;
         let dim_padded = dim.next_multiple_of(line);
 
-        let vectors_padded = if dim_padded != dim {
-            pad_vectors(&vectors_flat, n, dim, dim_padded)
-        } else {
-            vectors_flat.clone()
-        };
-
         // Compute norms on the ORIGINAL vectors_flat (not padded)
         let norms = if metric == Dist::Cosine {
             (0..n)
@@ -106,6 +100,12 @@ where
                 .collect()
         } else {
             Vec::new()
+        };
+
+        let vectors_padded = if dim_padded != dim {
+            pad_vectors(&vectors_flat, n, dim, dim_padded)
+        } else {
+            vectors_flat
         };
 
         log.finish();
@@ -127,19 +127,25 @@ where
     /// ### Params
     ///
     /// * `client` - Compute client for this index's device
+    /// * `rows` - The stored rows already through [`Self::metric_rows`], if
+    ///   the caller holds them; saves a second normalised copy under Cosine
     ///
     /// ### Returns
     ///
     /// The vectors on the device, unit-normalised for Cosine.
-    fn resident_db(&self, client: &Client) -> Result<&GpuTensor<T>, AnnSearchErrors> {
+    fn resident_db(
+        &self,
+        client: &Client,
+        rows: Option<&[T]>,
+    ) -> Result<&GpuTensor<T>, AnnSearchErrors> {
         if let Some(db) = self.db_gpu.get() {
             return Ok(db);
         }
-        let vectors = GpuTensor::<T>::from_slice(
-            &self.metric_rows(&self.vectors_flat),
-            vec![self.n, self.dim_padded],
-            client,
-        )?;
+        let rows = match rows {
+            Some(r) => std::borrow::Cow::Borrowed(r),
+            None => self.metric_rows(&self.vectors_flat),
+        };
+        let vectors = GpuTensor::<T>::from_slice(&rows, vec![self.n, self.dim_padded], client)?;
         // A concurrent first query may have won the race; either upload is
         // the same data, so keep whichever landed.
         let _ = self.db_gpu.set(vectors);
@@ -200,7 +206,7 @@ where
 
         let query_data = BatchData::new(&vectors_query_padded, n_query);
         let client = self.device.client();
-        let db_gpu = self.resident_db(&client)?;
+        let db_gpu = self.resident_db(&client, None)?;
 
         let res = query_batch_gpu_resident::<T>(
             k,
@@ -242,7 +248,7 @@ where
         let queries = self.metric_rows(&self.vectors_flat);
         let query_data = BatchData::new(&queries, self.n);
         let client = self.device.client();
-        let db_gpu = self.resident_db(&client)?;
+        let db_gpu = self.resident_db(&client, Some(&queries))?;
 
         let (indices, distances) = query_batch_gpu_resident::<T>(
             k,

@@ -27,6 +27,7 @@ use faer::Mat;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use std::borrow::Cow;
 use std::iter::Sum;
 use std::time::Instant;
 
@@ -2878,10 +2879,10 @@ where
     }
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
-    let data_padded = if dim_padded != dim {
-        pad_vectors(data, n, dim, dim_padded)
+    let data_padded: Cow<[T]> = if dim_padded != dim {
+        Cow::Owned(pad_vectors(data, n, dim, dim_padded))
     } else {
-        data.to_vec()
+        Cow::Borrowed(data)
     };
 
     let e_means = matches!(params.algorithm, KMeansAlgorithm::EMeans(_));
@@ -3089,15 +3090,15 @@ where
     }
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
-    let data_padded = if dim_padded != dim {
-        pad_vectors(data, n, dim, dim_padded)
+    let data_padded: Cow<[T]> = if dim_padded != dim {
+        Cow::Owned(pad_vectors(data, n, dim, dim_padded))
     } else {
-        data.to_vec()
+        Cow::Borrowed(data)
     };
-    let cents_padded = if dim_padded != dim {
-        pad_vectors(centroids, n_centroids, dim, dim_padded)
+    let cents_padded: Cow<[T]> = if dim_padded != dim {
+        Cow::Owned(pad_vectors(centroids, n_centroids, dim, dim_padded))
     } else {
-        centroids.to_vec()
+        Cow::Borrowed(centroids)
     };
 
     let data_gpu = GpuTensor::<T>::from_slice(&data_padded, vec![n, dim_padded], client)?;

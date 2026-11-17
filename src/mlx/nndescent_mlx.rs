@@ -26,12 +26,13 @@ use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
-use crate::cpu::nndescent::{leaf_order, permute_rows};
+use crate::cpu::nndescent::leaf_order;
 use crate::cpu::vamana::compute_medoid;
 use crate::mlx::ffi::*;
 use crate::mlx::forest_mlx::forest_init_mlx;
 use crate::prelude::*;
 use crate::utils::nndescent_utils::unpack_knn_graph;
+use crate::utils::permute_rows_in_place;
 use crate::utils::rp_forest::{
     compact_knn_rows, default_forest_trees, unpermute_knn_rows, ForestRouter,
 };
@@ -1450,7 +1451,7 @@ pub fn build_knn_graph_mlx(
         return Err(AnnSearchErrors::DistanceNotSupported(metric));
     }
     let log = BuildLog::new("NNDescent-MLX kNN graph", verbosity);
-    let (vectors_flat, n, dim) = data.into_row_major();
+    let (mut vectors_flat, n, dim) = data.into_row_major();
     let k = k.unwrap_or(30);
     let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
     let use_cosine = metric == Dist::Cosine;
@@ -1486,10 +1487,11 @@ pub fn build_knn_graph_mlx(
     };
 
     // The local join gathers rows by neighbour id, so put tree neighbours
-    // next to each other in memory first. Undone on the output graph.
+    // next to each other in memory first. Undone on the rows and the output
+    // graph before returning.
     let start = Instant::now();
     let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
-    let permuted = permute_rows(&vectors_flat, dim, &new_to_old);
+    permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
     let permuted_norms: Vec<f32> = if use_cosine {
         new_to_old.iter().map(|&i| norms[i as usize]).collect()
     } else {
@@ -1499,8 +1501,12 @@ pub fn build_knn_graph_mlx(
         println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
     }
 
-    let out = nndescent_core_mlx(&permuted, &permuted_norms, n, dim, &cfg, verbosity)?;
-    drop(permuted);
+    let out = nndescent_core_mlx(&vectors_flat, &permuted_norms, n, dim, &cfg, verbosity)?;
+    let mut old_to_new = vec![0u32; n];
+    for (new_id, &old_id) in new_to_old.iter().enumerate() {
+        old_to_new[old_id as usize] = new_id as u32;
+    }
+    permute_rows_in_place(&mut vectors_flat, dim, &old_to_new);
     let knn_graph = unpermute_knn_rows(
         &compact_knn_rows(&out.graph_idx, &out.graph_dist, n, k, build_k),
         k,

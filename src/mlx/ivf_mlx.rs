@@ -37,6 +37,7 @@ use crate::mlx::ffi::*;
 use crate::mlx::k_means_mlx::*;
 use crate::prelude::*;
 use crate::utils::k_means_utils::sample_vectors;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use crate::utils::DimensionValidation;
 
@@ -479,20 +480,20 @@ fn normalise_rows(data: &mut [f32], dim: usize) {
 ///
 /// ### Params
 ///
-/// * `vectors_flat` - Row-major vectors
+/// * `vectors_flat` - Row-major vectors, reordered in place
 /// * `dim` - Row length
 /// * `assignments` - Cluster per vector
 /// * `nlist` - Number of clusters
 ///
 /// ### Returns
 ///
-/// `(reordered vectors, original index per position, CSR offsets)`
+/// `(original index per position, CSR offsets)`
 fn reorganise_by_cluster(
-    vectors_flat: &[f32],
+    vectors_flat: &mut [f32],
     dim: usize,
     assignments: &[u32],
     nlist: usize,
-) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<u32>) {
     let mut offsets = vec![0u32; nlist + 1];
     for &c in assignments {
         offsets[c as usize + 1] += 1;
@@ -506,15 +507,8 @@ fn reorganise_by_cluster(
         original[cursor[c as usize] as usize] = i as u32;
         cursor[c as usize] += 1;
     }
-    let mut reordered = vec![0f32; vectors_flat.len()];
-    reordered
-        .par_chunks_exact_mut(dim)
-        .zip(original.par_iter())
-        .for_each(|(dst, &src)| {
-            let src = src as usize;
-            dst.copy_from_slice(&vectors_flat[src * dim..(src + 1) * dim]);
-        });
-    (reordered, original, offsets)
+    permute_rows_in_place(vectors_flat, dim, &original);
+    (original, offsets)
 }
 
 /////////////////
@@ -624,7 +618,7 @@ impl IvfIndexMlx {
         install_error_handler();
         let log = BuildLog::new("IVF-MLX index", verbosity);
 
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
         let nlist = nlist
             .unwrap_or((n as f32).sqrt() as usize)
             .clamp(1, n.max(1));
@@ -644,6 +638,7 @@ impl IvfIndexMlx {
             &stream,
             Verbosity::Quiet,
         )?;
+        drop(training);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -662,8 +657,8 @@ impl IvfIndexMlx {
             );
         }
 
-        let (mut vectors_flat, original_indices, cluster_offsets) =
-            reorganise_by_cluster(&vectors_flat, dim, &assignments, nlist);
+        let (original_indices, cluster_offsets) =
+            reorganise_by_cluster(&mut vectors_flat, dim, &assignments, nlist);
         if metric == Dist::Cosine {
             normalise_rows(&mut vectors_flat, dim);
         }

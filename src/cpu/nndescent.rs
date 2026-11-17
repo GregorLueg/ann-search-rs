@@ -301,31 +301,6 @@ pub(crate) fn leaf_order<T: AnnSearchFloat>(
     perms.pop().unwrap()
 }
 
-/// Gather rows into a new buffer: row `i` of the result is row `order[i]`.
-///
-/// ### Params
-///
-/// * `vectors_flat` - Flattened vector data
-/// * `dim` - Dimensionality of vectors
-/// * `order` - Source row for each output row
-///
-/// ### Returns
-///
-/// The permuted rows.
-pub(crate) fn permute_rows<T: AnnSearchFloat>(
-    vectors_flat: &[T],
-    dim: usize,
-    order: &[u32],
-) -> Vec<T> {
-    let mut out = vec![T::zero(); vectors_flat.len()];
-    out.par_chunks_mut(dim.max(1))
-        .zip(order.par_iter())
-        .for_each(|(row, &src)| {
-            row.copy_from_slice(&vectors_flat[src as usize * dim..(src as usize + 1) * dim]);
-        });
-    out
-}
-
 /// Resolve the optional build parameters shared by both NN-Descent builds.
 ///
 /// ### Params
