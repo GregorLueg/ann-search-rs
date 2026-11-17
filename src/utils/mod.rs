@@ -106,6 +106,45 @@ where
     (out, n, dim)
 }
 
+/// Gather rows in place: afterwards row `i` holds what was row `order[i]`.
+///
+/// Follows the permutation's cycles with one row of scratch, so peak memory
+/// stays at the buffer itself rather than doubling it as a gather into a new
+/// buffer would. Sequential, since each step of a cycle depends on the last.
+///
+/// ### Params
+///
+/// * `data` - Flattened row-major rows, `order.len() * dim` elements
+/// * `dim` - Elements per row
+/// * `order` - Source row for each output row; must be a permutation
+pub(crate) fn permute_rows_in_place<T: Copy>(data: &mut [T], dim: usize, order: &[u32]) {
+    let n = order.len();
+    debug_assert_eq!(data.len(), n * dim);
+    if dim == 0 {
+        return;
+    }
+    let mut done = vec![false; n];
+    let mut scratch: Vec<T> = Vec::with_capacity(dim);
+    for start in 0..n {
+        if done[start] || order[start] as usize == start {
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(&data[start * dim..(start + 1) * dim]);
+        let mut dst = start;
+        loop {
+            done[dst] = true;
+            let src = order[dst] as usize;
+            if src == start {
+                data[dst * dim..(dst + 1) * dim].copy_from_slice(&scratch);
+                break;
+            }
+            data.copy_within(src * dim..(src + 1) * dim, dst * dim);
+            dst = src;
+        }
+    }
+}
+
 ////////////////
 // Validation //
 ////////////////
@@ -361,5 +400,31 @@ pub fn prefetch_read<T>(ptr: *const T) {
             in(reg) ptr,
             options(readonly, preserves_flags, nostack)
         );
+    }
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::seq::SliceRandom;
+
+    #[test]
+    fn test_permute_rows_in_place_matches_gather() {
+        let (n, dim) = (1_000, 3);
+        let data: Vec<f32> = (0..n * dim).map(|v| v as f32).collect();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.shuffle(&mut StdRng::seed_from_u64(42));
+
+        let expected: Vec<f32> = order
+            .iter()
+            .flat_map(|&src| data[src as usize * dim..(src as usize + 1) * dim].to_vec())
+            .collect();
+        let mut got = data.clone();
+        permute_rows_in_place(&mut got, dim, &order);
+        assert_eq!(got, expected);
     }
 }

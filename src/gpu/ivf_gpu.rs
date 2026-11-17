@@ -4,9 +4,7 @@
 use cubecl::prelude::*;
 use cubecl::Device;
 use cubecl_utils_rs::prelude::*;
-use num_traits::Float;
 use rayon::prelude::*;
-use std::iter::Sum;
 use thousands::*;
 
 use crate::gpu::dist_gpu::*;
@@ -16,6 +14,7 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::Dist;
 use crate::utils::k_means_utils::*;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -60,13 +59,13 @@ struct CandidateScratch<T: AnnSearchFloat + CubeclFloat> {
 
 /// Reorganise vectors by cluster for contiguous access
 ///
-/// Helper function that re-organises the vectors by cluster, i.e.,
-/// [cluster_0_vecs, cluster_1_vecs, ...]. This helps for subsequent GPU
-/// launches.
+/// Re-orders the vectors in place by cluster, i.e.
+/// [cluster_0_vecs, cluster_1_vecs, ...], so each cell is one contiguous
+/// slab for the GPU launches.
 ///
 /// ### Params
 ///
-/// * `vectors_flat` - Original flat vectors
+/// * `vectors_flat` - Flat vectors, reordered in place
 /// * `dim` - Dimensionality of the data set
 /// * `n` - Number of samples in the index
 /// * `assignments` - Cluster assignments
@@ -74,14 +73,14 @@ struct CandidateScratch<T: AnnSearchFloat + CubeclFloat> {
 ///
 /// ### Returns
 ///
-/// `(reordered flat vec, reordered indices, offsets)`
-fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
-    vectors_flat: &[T],
+/// `(reordered indices, offsets)`
+fn reorganise_by_cluster<T: Copy>(
+    vectors_flat: &mut [T],
     dim: usize,
     n: usize,
     assignments: &[u32],
     nlist: usize,
-) -> (Vec<T>, Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<u32>) {
     // Count vectors per cluster
     let mut counts = vec![0u32; nlist];
     for &cluster in assignments {
@@ -94,24 +93,17 @@ fn reorganise_by_cluster<T: Float + Copy + Send + Sync + Sum>(
         offsets[i + 1] = offsets[i] + counts[i];
     }
 
-    let mut vectors_reorg = vec![T::zero(); n * dim];
     let mut indices_reorg = vec![0u32; n];
     let mut write_pos = offsets.clone();
-
-    for vec_idx in 0..n {
-        let cluster = assignments[vec_idx] as usize;
-        let pos = write_pos[cluster] as usize;
-        write_pos[cluster] += 1;
-
+    for (vec_idx, &cluster) in assignments.iter().enumerate() {
+        let pos = write_pos[cluster as usize] as usize;
+        write_pos[cluster as usize] += 1;
         indices_reorg[pos] = vec_idx as u32;
-
-        let src_start = vec_idx * dim;
-        let dst_start = pos * dim;
-        vectors_reorg[dst_start..dst_start + dim]
-            .copy_from_slice(&vectors_flat[src_start..src_start + dim]);
     }
 
-    (vectors_reorg, indices_reorg, offsets)
+    permute_rows_in_place(vectors_flat, dim, &indices_reorg);
+
+    (indices_reorg, offsets)
 }
 
 /////////////////
@@ -244,7 +236,7 @@ where
         }
         let log = BuildLog::new("IVF-GPU index", verbosity);
 
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -270,6 +262,7 @@ where
             &client,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -290,8 +283,8 @@ where
             );
         }
 
-        let (vectors_by_cluster, original_indices, cluster_offsets) =
-            reorganise_by_cluster(&vectors_flat, dim, n, &assignments, nlist);
+        let (original_indices, cluster_offsets) =
+            reorganise_by_cluster(&mut vectors_flat, dim, n, &assignments, nlist);
 
         let sorted_size_prefix = {
             let mut sizes: Vec<usize> = cluster_offsets
@@ -311,9 +304,9 @@ where
 
         // Pad vectors and centroids for GPU
         let mut vectors_padded = if dim_padded != dim {
-            pad_vectors(&vectors_by_cluster, n, dim, dim_padded)
+            pad_vectors(&vectors_flat, n, dim, dim_padded)
         } else {
-            vectors_by_cluster
+            vectors_flat
         };
 
         let mut centroids_padded = if dim_padded != dim {
@@ -330,8 +323,6 @@ where
             normalise_rows(&mut centroids_padded, dim_padded);
         }
 
-        let vectors_cpu = vectors_padded.clone();
-
         let vectors_gpu =
             GpuTensor::<T>::from_slice(&vectors_padded, vec![n, dim_padded], &client)?;
 
@@ -342,7 +333,7 @@ where
 
         Ok(Self {
             vectors_gpu,
-            vectors_cpu,
+            vectors_cpu: vectors_padded,
             original_indices,
             cluster_offsets,
             centroids_gpu,
@@ -535,7 +526,7 @@ where
             self.calculate_safe_batch_size(nprobe, &GpuLimits::from_client(&client))
         });
 
-        let (indices_reorg, dist_reorg) = self.query_internal(
+        let (mut indices_reorg, mut dist_reorg) = self.query_internal(
             &self.vectors_cpu,
             self.n,
             k,
@@ -556,9 +547,9 @@ where
         };
 
         for (reorg_idx, orig_idx) in self.original_indices.iter().enumerate() {
-            indices[*orig_idx as usize] = indices_reorg[reorg_idx].clone();
+            indices[*orig_idx as usize] = std::mem::take(&mut indices_reorg[reorg_idx]);
             if return_dist {
-                dist[*orig_idx as usize] = dist_reorg[reorg_idx].clone();
+                dist[*orig_idx as usize] = std::mem::take(&mut dist_reorg[reorg_idx]);
             }
         }
 
@@ -1321,7 +1312,8 @@ mod tests {
         ];
         let assignments = vec![0u32, 1, 0, 1];
 
-        let (reorg, indices, offsets) = reorganise_by_cluster(&vectors, 4, 4, &assignments, 2);
+        let mut reorg = vectors.clone();
+        let (indices, offsets) = reorganise_by_cluster(&mut reorg, 4, 4, &assignments, 2);
 
         assert_eq!(reorg.len(), 16);
         assert_eq!(indices.len(), 4);

@@ -63,6 +63,10 @@ const SECTION_ALIGN: usize = 64;
 /// dominates at low dim with a larger one.
 const F16_CHUNK: usize = 64;
 
+/// Rows encoded per write when an f16 store is streamed to disk, so the
+/// staging buffer stays a few MB instead of half the data.
+const F16_WRITE_ROWS: usize = 4096;
+
 ///////////////////
 // StoreEncoding //
 ///////////////////
@@ -206,24 +210,25 @@ fn fingerprint(n: usize, dim: usize, types: [u8; 2], norm_bytes: &[u8]) -> u64 {
     h
 }
 
-/// Round rows to f16.
+/// Round values to f16.
 ///
 /// ### Params
 ///
-/// * `vectors_flat` - Rows at the index float type
+/// * `src` - Values at the index float type
+/// * `out` - Raw f16 bits, same length as `src`
 ///
 /// ### Returns
 ///
-/// The raw f16 bits, or `None` when a finite value overflows the f16 range.
-fn encode_f16<T: AnnSearchFloat>(vectors_flat: &[T]) -> Option<Vec<u16>> {
-    vectors_flat
-        .par_iter()
-        .map(|&x| {
-            let x = x.to_f64().expect("float to f64 cannot fail");
-            let h = f16::from_f64(x);
-            (!h.is_infinite() || x.is_infinite()).then_some(h.to_bits())
-        })
-        .collect()
+/// `false` when a finite value overflows the f16 range.
+fn encode_f16_into<T: AnnSearchFloat>(src: &[T], out: &mut [u16]) -> bool {
+    let mut ok = true;
+    for (o, &x) in out.iter_mut().zip(src) {
+        let x = x.to_f64().expect("float to f64 cannot fail");
+        let h = f16::from_f64(x);
+        ok &= !h.is_infinite() || x.is_infinite();
+        *o = h.to_bits();
+    }
+    ok
 }
 
 /// Decode f16 bits into a buffer of the index float type.
@@ -398,29 +403,28 @@ where
         let float_type = float_type_of::<T>()
             .ok_or_else(|| invalid(&path, "element type has no store encoding"))?;
 
-        let half_rows = match encoding {
+        // f16 stores the norms of the rounded rows. They precede the rows in
+        // the file, so the rows are rounded once here for the norms and again
+        // while streaming, rather than held whole.
+        let half_norms: Option<Vec<T>> = match encoding {
             StoreEncoding::Full => None,
             StoreEncoding::F16 => Some(
-                encode_f16(vectors_flat)
+                vectors_flat
+                    .par_chunks_exact(dim.max(1))
+                    .map_init(
+                        || (vec![0u16; dim], vec![T::zero(); dim]),
+                        |(bits, buf), row| {
+                            encode_f16_into(row, bits).then(|| {
+                                decode_f16_into(bits, buf);
+                                T::calculate_l2_norm(buf)
+                            })
+                        },
+                    )
+                    .collect::<Option<Vec<T>>>()
                     .ok_or_else(|| invalid(&path, "values exceed the f16 range"))?,
             ),
         };
-        let half_norms: Option<Vec<T>> = half_rows.as_ref().map(|bits| {
-            bits.par_chunks_exact(dim.max(1))
-                .map_init(
-                    || vec![T::zero(); dim],
-                    |buf, row| {
-                        decode_f16_into(row, buf);
-                        T::calculate_l2_norm(buf)
-                    },
-                )
-                .collect()
-        });
         let norms = half_norms.as_deref().unwrap_or(norms);
-        let row_bytes: &[u8] = match &half_rows {
-            Some(bits) => bytemuck::cast_slice(bits),
-            None => bytemuck::cast_slice(vectors_flat),
-        };
 
         std::fs::create_dir_all(dir)?;
 
@@ -442,7 +446,21 @@ where
         writer.write_all(&header)?;
         writer.write_all(norm_bytes)?;
         writer.write_all(&[0u8; SECTION_ALIGN][..pad])?;
-        writer.write_all(row_bytes)?;
+        match encoding {
+            StoreEncoding::Full => writer.write_all(bytemuck::cast_slice(vectors_flat))?,
+            StoreEncoding::F16 => {
+                let mut bits = vec![0u16; F16_WRITE_ROWS * dim];
+                for rows in vectors_flat.chunks(F16_WRITE_ROWS * dim.max(1)) {
+                    let bits = &mut bits[..rows.len()];
+                    bits.par_chunks_mut(dim.max(1))
+                        .zip(rows.par_chunks(dim.max(1)))
+                        .for_each(|(out, row)| {
+                            encode_f16_into(row, out);
+                        });
+                    writer.write_all(bytemuck::cast_slice(bits))?;
+                }
+            }
+        }
         // BufWriter flushes on Drop but swallows the error; surface it instead
         writer.flush()?;
         drop(writer);
@@ -1087,6 +1105,34 @@ mod tests {
 
         // Nothing was written for the refused store
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A store longer than one streamed write chunk holds every row, rounded
+    /// to f16, with the norm of the rounded row.
+    #[test]
+    fn test_f16_store_spans_write_chunks() {
+        let (n, dim) = (F16_WRITE_ROWS + 904, 5);
+        let vectors: Vec<f32> = (0..n * dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let dir = TempDir::new().unwrap();
+        VectorStore::create(
+            dir.path(),
+            &vectors,
+            &vec![0.0; n],
+            n,
+            dim,
+            StoreEncoding::F16,
+        )
+        .unwrap();
+        let store = VectorStore::<f32>::open(dir.path()).unwrap();
+        for i in [0, F16_WRITE_ROWS - 1, F16_WRITE_ROWS, n - 1] {
+            let want: Vec<f32> = vectors[i * dim..(i + 1) * dim]
+                .iter()
+                .map(|&x| f16::from_f32(x).to_f32())
+                .collect();
+            assert_eq!(&store.row(i)[..], &want[..]);
+            let norm = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((store.norms()[i] - norm).abs() < 1e-6);
+        }
     }
 
     /// Rows longer than one decode chunk, at both float types, score the same

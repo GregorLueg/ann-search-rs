@@ -492,7 +492,7 @@ where
     T: AnnSearchFloat,
 {
     let (queries, _, dim) = query_mat.into_row_major();
-    index.query_batch(&queries, dim, k, return_dist, verbosity)
+    index.query_batch_owned(queries, dim, k, return_dist, verbosity)
 }
 
 /// Helper function to self query a kMkNN index

@@ -504,6 +504,7 @@ where
         &client,
         Verbosity::Quiet,
     )?;
+    drop(training_data);
     if detailed {
         println!(
             " Trained k-means ({} centroids, {} samples) in {:.2?}",

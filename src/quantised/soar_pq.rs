@@ -351,12 +351,16 @@ where
             &metric,
         );
 
-        let mut training_residuals = Vec::with_capacity(training_data.len());
-        for (vec_idx, &cluster_id) in training_primary.iter().enumerate() {
-            let vec = &training_data[vec_idx * dim..(vec_idx + 1) * dim];
-            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
-            training_residuals.extend_from_slice(&T::subtract_simd(vec, centroid));
-        }
+        // residuals in place: the sample is not needed once they exist
+        let mut training_residuals = training_data;
+        training_residuals
+            .par_chunks_mut(dim)
+            .zip(training_primary.par_iter())
+            .for_each(|(row, &cluster_id)| {
+                let centroid =
+                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
+                row.iter_mut().zip(centroid).for_each(|(x, &c)| *x = *x - c);
+            });
 
         let start = Instant::now();
         let codebook = ProductQuantiser::train(
@@ -369,6 +373,7 @@ where
             seed + 1000,
             verbosity,
         )?;
+        drop(training_residuals);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained product quantiser (m = {}) in {:.2?}",
@@ -467,6 +472,8 @@ where
         }
 
         log.finish();
+
+        drop(vectors_flat);
 
         let mut idx = Self {
             quantised_codes,

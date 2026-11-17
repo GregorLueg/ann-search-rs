@@ -1142,28 +1142,12 @@ where
             old_to_new[old_id as usize] = new_id as u32;
         }
 
-        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
-        let mut new_norms = if self.norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * self.dim;
-            let end = start + self.dim;
-
-            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..end]);
-
-            if !self.norms.is_empty() {
-                new_norms.push(self.norms[old_id]);
-            }
+        permute_rows_in_place(&mut self.vectors_flat, self.dim, &new_to_old);
+        if !self.norms.is_empty() {
+            permute_rows_in_place(&mut self.norms, 1, &new_to_old);
         }
 
         self.trees.remap(&old_to_new);
-        self.vectors_flat = new_vectors_flat;
-        self.norms = new_norms;
 
         new_to_old
     }

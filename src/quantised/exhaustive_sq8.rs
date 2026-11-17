@@ -119,7 +119,7 @@ where
     ) -> Result<Self, AnnSearchErrors> {
         let log = BuildLog::new("Exhaustive-SQ8 index", verbosity);
         let (flat, n, dim) = data.into_row_major();
-        let codec = Sq8uCodec::new(&flat, n, dim, metric, quant_params)?;
+        let codec = Sq8uCodec::from_owned(flat, n, dim, metric, quant_params)?;
         log.finish();
 
         Ok(Self {

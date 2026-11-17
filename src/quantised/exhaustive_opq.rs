@@ -145,15 +145,16 @@ where
                 .for_each(|chunk| normalise_vector(chunk));
         }
 
-        let (training_data, _) = if n > 500_000 {
-            let (data, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (data, 250_000)
+        let sampled;
+        let training_data: &[T] = if n > 500_000 {
+            sampled = sample_vectors(&vectors_flat, dim, n, 250_000, seed).0;
+            &sampled
         } else {
-            (vectors_flat.clone(), n)
+            &vectors_flat
         };
 
         let codebook = OptimisedProductQuantiser::train(
-            &training_data,
+            training_data,
             dim,
             m,
             n_pq_centroids,

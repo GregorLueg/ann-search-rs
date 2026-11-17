@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use std::time::Instant;
 use thousands::*;
 
-use crate::cpu::nndescent::{leaf_order, permute_rows};
+use crate::cpu::nndescent::leaf_order;
 use crate::cpu::vamana::compute_medoid;
 use crate::gpu::cagra_gpu_search::*;
 use crate::gpu::forest_gpu::*;
@@ -51,6 +51,7 @@ use crate::gpu::*;
 use crate::prelude::*;
 use crate::utils::dist::cosine_from_dot;
 use crate::utils::nndescent_utils::{unpack_knn_graph, SENTINEL_PID};
+use crate::utils::permute_rows_in_place;
 use crate::utils::rp_forest::unpermute_knn_rows;
 pub use crate::utils::rp_forest::{compact_knn_rows, default_forest_trees};
 use crate::utils::verbosity::BuildLog;
@@ -2450,19 +2451,17 @@ where
         let client = self._device.client();
         let dim_padded = self.dim_padded;
 
-        let mut vectors_padded = if dim_padded != self.dim {
-            pad_vectors(&self.vectors_flat, self.n, self.dim, dim_padded)
-        } else {
-            self.vectors_flat.clone()
+        let vectors_gpu = {
+            let rows = device_rows(
+                &self.vectors_flat,
+                self.n,
+                self.dim,
+                dim_padded,
+                self.metric,
+            );
+            GpuTensor::<T>::from_slice(&rows, vec![self.n, dim_padded], &client)?
         };
-        if self.metric == Dist::Cosine {
-            normalise_rows(&mut vectors_padded, dim_padded);
-        }
-        self.vectors_gpu = Some(GpuTensor::<T>::from_slice(
-            &vectors_padded,
-            vec![self.n, dim_padded],
-            &client,
-        )?);
+        self.vectors_gpu = Some(vectors_gpu);
 
         self.nav_graph_gpu = Some(GpuTensor::<u32>::from_slice(
             &self.nav_graph,
@@ -2726,7 +2725,7 @@ where
     }
     let log = BuildLog::new("NNDescent-GPU kNN graph", verbosity);
 
-    let (vectors_flat, n, dim) = data.into_row_major();
+    let (mut vectors_flat, n, dim) = data.into_row_major();
     let k = k.unwrap_or(30);
     let build_k = build_k.unwrap_or((1.5 * k as f32) as usize).max(k);
     let max_iters = max_iters.unwrap_or(DEFAULT_MAX_ITERS);
@@ -2737,16 +2736,6 @@ where
 
     let dim_padded = dim.next_multiple_of(LINE_SIZE);
 
-    // The local join gathers rows by neighbour id, so put tree neighbours
-    // next to each other in memory first. Undone on the output graph.
-    let start = Instant::now();
-    let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
-    let permuted = permute_rows(&vectors_flat, dim, &new_to_old);
-    if verbosity.detailed_verbosity() {
-        println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
-    }
-    let vectors_padded = device_rows(&permuted, n, dim, dim_padded, metric);
-
     let norms = if metric == Dist::Cosine {
         (0..n)
             .into_par_iter()
@@ -2755,6 +2744,17 @@ where
     } else {
         Vec::new()
     };
+
+    // The local join gathers rows by neighbour id, so put tree neighbours
+    // next to each other in memory first. Undone on the rows and the output
+    // graph before returning.
+    let start = Instant::now();
+    let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
+    permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
+    if verbosity.detailed_verbosity() {
+        println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
+    }
+    let vectors_padded = device_rows(&vectors_flat, n, dim, dim_padded, metric);
 
     if verbosity.detailed_verbosity() {
         println!(
@@ -2798,7 +2798,11 @@ where
     )?;
 
     drop(vectors_padded);
-    drop(permuted);
+    let mut old_to_new = vec![0u32; n];
+    for (new_id, &old_id) in new_to_old.iter().enumerate() {
+        old_to_new[old_id as usize] = new_id as u32;
+    }
+    permute_rows_in_place(&mut vectors_flat, dim, &old_to_new);
     let knn_graph = unpermute_knn_rows(
         &compact_knn_rows(&graph_idx, &graph_dist, n, k, build_k),
         k,

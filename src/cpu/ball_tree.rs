@@ -398,9 +398,9 @@ where
             return Err(AnnSearchErrors::DistanceNotSupported(metric));
         }
 
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
-        let norms = if metric == Dist::Cosine {
+        let mut norms = if metric == Dist::Cosine {
             (0..n)
                 .map(|i| {
                     let start = i * dim;
@@ -441,17 +441,10 @@ where
         // Store the vectors in leaf order so every leaf scan reads one
         // contiguous block. A single tree holds each item exactly once, so the
         // permutation is itself the new-to-old map.
-        let mut reordered = Vec::with_capacity(vectors_flat.len());
-        for &old in &perm {
-            let old = old as usize;
-            reordered.extend_from_slice(&vectors_flat[old * dim..(old + 1) * dim]);
+        permute_rows_in_place(&mut vectors_flat, dim, &perm);
+        if !norms.is_empty() {
+            permute_rows_in_place(&mut norms, 1, &perm);
         }
-        let vectors_flat = reordered;
-        let norms: Vec<T> = if norms.is_empty() {
-            norms
-        } else {
-            perm.iter().map(|&old| norms[old as usize]).collect()
-        };
         let original_ids = perm;
 
         let centers_data_norm = if metric == Dist::Cosine {

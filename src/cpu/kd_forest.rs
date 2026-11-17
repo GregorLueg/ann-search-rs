@@ -556,9 +556,10 @@ where
 /// recursively splits along coordinate axes, selecting randomly from the top
 /// highest-spread dimensions for diversity across trees.
 ///
-/// For Cosine metric, trees are built on normalised vectors so that
-/// axis-aligned splits respect angular geometry. The normalised copy is
-/// discarded after construction; only the raw vectors are stored.
+/// For Cosine metric, the vectors are normalised in place before the trees
+/// are built, so axis-aligned splits respect angular geometry, and stored as
+/// unit rows with unit norms. Indices saved by earlier versions hold raw rows
+/// with their real norms; the distances read both alike.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct KdTreeIndex<T> {
     /// Original vector data, flattened for cache locality
@@ -615,34 +616,6 @@ impl<T> DimensionValidation for KdTreeIndex<T> {
 // Index build //
 /////////////////
 
-/// Unit-normalised copy of the vectors, the space Kd trees split for Cosine.
-///
-/// ### Params
-///
-/// * `vectors_flat` - Flattened vector data
-/// * `norms` - L2 norm per row
-/// * `dim` - Dimensionality
-///
-/// ### Returns
-///
-/// The normalised copy; zero rows stay zero.
-pub(crate) fn normalised_copy<T: AnnSearchFloat>(
-    vectors_flat: &[T],
-    norms: &[T],
-    dim: usize,
-) -> Vec<T> {
-    let mut nv = vectors_flat.to_vec();
-    for (i, &norm) in norms.iter().enumerate() {
-        if norm > T::zero() {
-            let start = i * dim;
-            for d in 0..dim {
-                nv[start + d] /= norm;
-            }
-        }
-    }
-    nv
-}
-
 impl<T> KdTreeIndex<T>
 where
     T: AnnSearchFloat,
@@ -672,28 +645,28 @@ where
         verbosity: Verbosity,
     ) -> Self {
         let log = BuildLog::new("KdForest index", verbosity);
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
+        // for cosine, store and split unit rows so that axis-aligned splits
+        // approximate angular partitions. Zero rows keep a zero norm.
         let norms = if metric == Dist::Cosine {
-            (0..n)
-                .map(|i| {
-                    let start = i * dim;
-                    let end = start + dim;
-                    T::calculate_l2_norm(&vectors_flat[start..end])
+            vectors_flat
+                .chunks_mut(dim)
+                .map(|row| {
+                    let norm = T::calculate_l2_norm(row);
+                    if norm > T::zero() {
+                        row.iter_mut().for_each(|x| *x /= norm);
+                        T::one()
+                    } else {
+                        T::zero()
+                    }
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        // for cosine, build trees on normalised vectors so that axis-aligned
-        // splits approximate angular partitions.
-        let trees = if metric == Dist::Cosine {
-            let normalised = normalised_copy(&vectors_flat, &norms, dim);
-            KdTrees::build(&normalised, n, dim, n_trees, metric, seed)
-        } else {
-            KdTrees::build(&vectors_flat, n, dim, n_trees, metric, seed)
-        };
+        let trees = KdTrees::build(&vectors_flat, n, dim, n_trees, metric, seed);
 
         let mut idx = KdTreeIndex {
             trees,
@@ -735,27 +708,12 @@ where
             old_to_new[old_id as usize] = new_id as u32;
         }
 
-        let mut new_vectors_flat = Vec::with_capacity(self.vectors_flat.len());
-        let mut new_norms = if self.norms.is_empty() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(self.n)
-        };
-
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * self.dim;
-            let end = start + self.dim;
-            new_vectors_flat.extend_from_slice(&self.vectors_flat[start..end]);
-
-            if !self.norms.is_empty() {
-                new_norms.push(self.norms[old_id]);
-            }
+        permute_rows_in_place(&mut self.vectors_flat, self.dim, &new_to_old);
+        if !self.norms.is_empty() {
+            permute_rows_in_place(&mut self.norms, 1, &new_to_old);
         }
 
         self.trees.remap(&old_to_new);
-        self.vectors_flat = new_vectors_flat;
-        self.norms = new_norms;
 
         new_to_old
     }
@@ -805,6 +763,32 @@ where
     /// Tuple of `(indices, distances)` sorted by distance (nearest first)
     #[inline]
     pub fn query(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        search_k: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
+        let (rows, dists) = self.query_rows(query_vec, k, search_k)?;
+        let ids = rows
+            .into_iter()
+            .map(|r| self.original_ids[r] as usize)
+            .collect();
+        Ok((ids, dists))
+    }
+
+    /// [`KdTreeIndex::query`] returning rows of the reordered
+    /// `vectors_flat` instead of original ids.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours to return
+    /// * `search_k` - Leaf item budget, as for [`KdTreeIndex::query`]
+    ///
+    /// ### Returns
+    ///
+    /// Tuple of `(rows, distances)` sorted by distance (nearest first)
+    pub(crate) fn query_rows(
         &self,
         query_vec: &[T],
         k: usize,
@@ -864,16 +848,11 @@ where
             }
         });
 
-        let results: Vec<(usize, T)> = top_k
+        Ok(top_k
             .data()
             .iter()
-            .map(|(OrderedFloat(dist), idx)| {
-                let original_idx = self.original_ids[*idx] as usize;
-                (original_idx, *dist)
-            })
-            .collect();
-
-        Ok(results.into_iter().unzip())
+            .map(|(OrderedFloat(dist), idx)| (*idx, *dist))
+            .unzip())
     }
 
     /// Query using a matrix row reference

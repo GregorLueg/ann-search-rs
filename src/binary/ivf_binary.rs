@@ -183,6 +183,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",
@@ -344,6 +345,7 @@ where
             seed,
             Verbosity::Quiet,
         )?;
+        drop(training_data);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained k-means ({} centroids, {} samples) in {:.2?}",

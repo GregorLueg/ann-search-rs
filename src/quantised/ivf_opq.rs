@@ -12,6 +12,7 @@ use crate::quantised::pq_search::*;
 use crate::quantised::quantisers::*;
 use crate::utils::k_means_utils::*;
 use crate::utils::pack_knn_results;
+use crate::utils::permute_rows_in_place;
 use crate::utils::verbosity::{BuildLog, QueryProgress};
 use std::time::Instant;
 
@@ -260,14 +261,16 @@ where
 
         // For normalised vectors (cosine), ||q-v||² = 2(1 - <q,v>) so Euclidean distance
         // on residuals correctly approximates cosine distance
-        let mut training_residuals = Vec::with_capacity(training_data.len());
-        for (vec_idx, &cluster_id) in training_assignments.iter().enumerate() {
-            let vec_start = vec_idx * dim;
-            let vec = &training_data[vec_start..vec_start + dim];
-            let centroid = &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
-            let residuals = T::subtract_simd(vec, centroid);
-            training_residuals.extend_from_slice(&residuals);
-        }
+        // residuals in place: the sample is not needed once they exist
+        let mut training_residuals = training_data;
+        training_residuals
+            .par_chunks_mut(dim)
+            .zip(training_assignments.par_iter())
+            .for_each(|(row, &cluster_id)| {
+                let centroid =
+                    &centroids[cluster_id as usize * dim..(cluster_id as usize + 1) * dim];
+                row.iter_mut().zip(centroid).for_each(|(x, &c)| *x = *x - c);
+            });
 
         // 4. train OPQ on residuals
         let start = Instant::now();
@@ -281,6 +284,7 @@ where
             seed + 1000,
             verbosity,
         )?;
+        drop(training_residuals);
         if verbosity.detailed_verbosity() {
             println!(
                 " Trained optimised product quantiser (m = {}) in {:.2?}",
@@ -301,8 +305,6 @@ where
             nlist,
             &metric,
         );
-
-        let (all_indices, offsets) = build_csr_layout(assignments.clone(), n, nlist);
 
         // 6. encode all vectors with product quantiser
         if verbosity.detailed_verbosity() {
@@ -333,6 +335,9 @@ where
             .chunks_exact(dim)
             .flat_map(|c| codebook.rotate(c))
             .collect();
+
+        let (all_indices, offsets) = build_csr_layout(assignments, n, nlist);
+        drop(vectors_flat);
 
         let mut idx = Self {
             quantised_codes,
@@ -727,14 +732,7 @@ where
             new_to_old.extend_from_slice(&self.all_indices[start..end]);
         }
 
-        let mut new_codes = Vec::with_capacity(self.quantised_codes.len());
-        for &old_id in &new_to_old {
-            let old_id = old_id as usize;
-            let start = old_id * m;
-            new_codes.extend_from_slice(&self.quantised_codes[start..start + m]);
-        }
-
-        self.quantised_codes = new_codes;
+        permute_rows_in_place(&mut self.quantised_codes, m, &new_to_old);
         self.all_indices.clear();
         self.all_indices.shrink_to_fit();
 

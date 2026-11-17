@@ -7,7 +7,6 @@ use faer::{Accum, MatMut, MatRef, Par, RowRef};
 use fixedbitset::FixedBitSet;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
-use rdst::RadixSort;
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -71,15 +70,113 @@ pub type QueryCandF64 = RefCell<BinaryHeap<Reverse<(OrderedFloat<f64>, usize)>>>
 /// `(new_temp, old_temp)` holding `(priority, pid)` entries.
 type CandScratch = (Vec<(u64, u32)>, Vec<(u64, u32)>);
 
+/// Per-row-block update buckets from one join worker: `buckets[b]` holds the
+/// records whose rows fall in block `b`.
+type PairBuckets<T> = Vec<Vec<PairUpdate<T>>>;
+
+/// One local-join pair, routed to the block(s) owning its rows.
+///
+/// The high bit of each id says whether the other end goes into that id's
+/// row, so a pair both of whose rows accept it and that sits inside one block
+/// is a single record. Ids fit in 31 bits (see [`SENTINEL_PID`]).
+#[derive(Clone, Copy)]
+struct PairUpdate<T> {
+    /// First endpoint, high bit set when `b` is offered to its row
+    a: u32,
+    /// Second endpoint, high bit set when `a` is offered to its row
+    b: u32,
+    /// Distance between the two
+    dist: T,
+}
+
+impl<T: Copy> PairUpdate<T> {
+    /// Direction flag in the high bit of each id.
+    const TO_ROW: u32 = 1 << 31;
+
+    /// Pack a pair and its directions.
+    ///
+    /// ### Params
+    ///
+    /// * `a` - First endpoint
+    /// * `b` - Second endpoint
+    /// * `dist` - Distance between them
+    /// * `into_a` - Offer `b` to `a`'s row
+    /// * `into_b` - Offer `a` to `b`'s row
+    ///
+    /// ### Returns
+    ///
+    /// The packed record.
+    #[inline(always)]
+    fn new(a: u32, b: u32, dist: T, into_a: bool, into_b: bool) -> Self {
+        Self {
+            a: a | ((into_a as u32) << 31),
+            b: b | ((into_b as u32) << 31),
+            dist,
+        }
+    }
+
+    /// Route a scored pair into the bucket(s) owning its accepting rows.
+    ///
+    /// ### Params
+    ///
+    /// * `buckets` - This worker's buckets, one per row block
+    /// * `block_size` - Rows per block
+    /// * `a` - First endpoint
+    /// * `b` - Second endpoint
+    /// * `dist` - Distance between them
+    /// * `into_a` - `dist` clears `a`'s threshold
+    /// * `into_b` - `dist` clears `b`'s threshold
+    ///
+    /// ### Returns
+    ///
+    /// Number of records written, one or two.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn route(
+        buckets: &mut [Vec<Self>],
+        block_size: usize,
+        a: u32,
+        b: u32,
+        dist: T,
+        into_a: bool,
+        into_b: bool,
+    ) -> usize {
+        let block_a = a as usize / block_size;
+        let block_b = b as usize / block_size;
+        if block_a == block_b {
+            buckets[block_a].push(Self::new(a, b, dist, into_a, into_b));
+            return 1;
+        }
+        let mut written = 0;
+        if into_a {
+            buckets[block_a].push(Self::new(a, b, dist, true, false));
+            written += 1;
+        }
+        if into_b {
+            buckets[block_b].push(Self::new(a, b, dist, false, true));
+            written += 1;
+        }
+        written
+    }
+}
+
 ////////////
 // Consts //
 ////////////
 
 /// Target byte budget for one chunk's update batch.
-///
-/// `radix_sort_unstable` allocates a scratch buffer the same size as the batch,
-/// so the live footprint while sorting is twice this figure.
 const UPDATE_TARGET_BYTES: usize = 200 * 1024 * 1024;
+
+/// Minimum row blocks per rayon thread when routing join updates to their
+/// owners, so small graphs still balance across threads. Not tuned.
+const APPLY_BLOCKS_PER_THREAD: usize = 4;
+
+/// Upper bound on the graph rows one apply block covers, in bytes.
+///
+/// Updates land in a block in arrival order, so the block's rows must stay
+/// cache-resident or every insert is a miss. Smaller blocks split more pairs
+/// across two blocks, which costs a second record.
+const APPLY_BLOCK_BYTES: usize = 512 * 1024;
 
 /// Floor on the number of source nodes per chunk.
 ///
@@ -204,31 +301,6 @@ pub(crate) fn leaf_order<T: AnnSearchFloat>(
     perms.pop().unwrap()
 }
 
-/// Gather rows into a new buffer: row `i` of the result is row `order[i]`.
-///
-/// ### Params
-///
-/// * `vectors_flat` - Flattened vector data
-/// * `dim` - Dimensionality of vectors
-/// * `order` - Source row for each output row
-///
-/// ### Returns
-///
-/// The permuted rows.
-pub(crate) fn permute_rows<T: AnnSearchFloat>(
-    vectors_flat: &[T],
-    dim: usize,
-    order: &[u32],
-) -> Vec<T> {
-    let mut out = vec![T::zero(); vectors_flat.len()];
-    out.par_chunks_mut(dim.max(1))
-        .zip(order.par_iter())
-        .for_each(|(row, &src)| {
-            row.copy_from_slice(&vectors_flat[src as usize * dim..(src as usize + 1) * dim]);
-        });
-    out
-}
-
 /// Resolve the optional build parameters shared by both NN-Descent builds.
 ///
 /// ### Params
@@ -275,11 +347,10 @@ struct BuildTimings {
     mark_old: Duration,
     /// The local join itself: candidate gather plus pairwise distances
     join: Duration,
-    /// Radix sorting each chunk's update batch by target
-    sort: Duration,
-    /// Merging sorted updates back into the graph rows
+    /// Merging routed updates back into the graph rows
     apply: Duration,
-    /// Updates emitted by the join, before deduplication or heap rejection
+    /// Update records emitted by the join, before deduplication or heap
+    /// rejection
     updates_emitted: usize,
     /// Updates that actually changed a graph row
     updates_accepted: usize,
@@ -297,8 +368,8 @@ impl BuildTimings {
     /// Print the descent breakdown as `Detailed` stage lines.
     fn report(&self) {
         println!(
-            " Descent phases: candidates {:.2?}, mark old {:.2?}, local join {:.2?}, radix sort {:.2?}, apply {:.2?}",
-            self.candidates, self.mark_old, self.join, self.sort, self.apply
+            " Descent phases: candidates {:.2?}, mark old {:.2?}, local join {:.2?}, apply {:.2?}",
+            self.candidates, self.mark_old, self.join, self.apply
         );
 
         let accept = if self.updates_emitted > 0 {
@@ -607,6 +678,13 @@ trait MetricFn<T: AnnSearchFloat> {
     /// `norm_a` and `norm_b` are the pre-fetched L2 norms, meaningful for
     /// Cosine only.
     fn distance_from_tile(vec_a: &[T], norm_a: T, vec_b: &[T], norm_b: T) -> T;
+
+    /// Distance from one tile row to four others, sharing the loads of
+    /// `vec_a`. Defaults to four single calls.
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], norm_a: T, vecs: [&[T]; 4], norms: [T; 4]) -> [T; 4] {
+        std::array::from_fn(|i| Self::distance_from_tile(vec_a, norm_a, vecs[i], norms[i]))
+    }
 }
 
 /// Squared Euclidean metric.
@@ -621,6 +699,11 @@ impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
     fn distance_from_tile(vec_a: &[T], _norm_a: T, vec_b: &[T], _norm_b: T) -> T {
         T::euclidean_simd(vec_a, vec_b)
     }
+
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], _norm_a: T, vecs: [&[T]; 4], _norms: [T; 4]) -> [T; 4] {
+        T::euclidean_simd_batch_4(vec_a, vecs)
+    }
 }
 
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
@@ -632,6 +715,19 @@ impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
         } else {
             T::one()
         }
+    }
+
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], norm_a: T, vecs: [&[T]; 4], norms: [T; 4]) -> [T; 4] {
+        let dots = T::dot_simd_batch_4(vec_a, vecs);
+        std::array::from_fn(|i| {
+            let denom = norm_a * norms[i];
+            if denom > T::zero() {
+                T::one() - dots[i] / denom
+            } else {
+                T::one()
+            }
+        })
     }
 }
 
@@ -700,6 +796,9 @@ struct JoinScratch<T> {
     tile: Vec<T>,
     /// Dot products, row-major `n_new * n_total`, filled only on the GEMM path
     dots: Vec<T>,
+    /// Distances from the current new candidate to every later tile row,
+    /// filled only off the GEMM path
+    row_d: Vec<T>,
 }
 
 impl<T: AnnSearchFloat> JoinScratch<T> {
@@ -714,6 +813,7 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
             sq: Vec::new(),
             tile: Vec::new(),
             dots: Vec::new(),
+            row_d: Vec::new(),
         }
     }
 
@@ -1009,8 +1109,8 @@ pub trait NNDescentQuery<T> {
 ///
 /// During construction, candidate updates are processed in chunks to bound
 /// peak memory to `O(chunk_size * max_candidates)` rather than
-/// `O(n * max_candidates)`. Each chunk emits both edge directions, sorts by
-/// target, and applies updates lock-free via disjoint pointer writes.
+/// `O(n * max_candidates)`. Each scored pair is routed to the cache-sized row
+/// block(s) owning its endpoints, and every block is applied by one task.
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct NNDescent<T> {
     /// Original vectors, flattened row-major
@@ -1174,11 +1274,14 @@ where
         // Diversification only shapes what the query walks. Extraction and
         // NSG keep the full kNN graph.
         let query_graph: Vec<u32> = if diversify_prob > T::zero() {
-            builder
+            // the narrowing collect reuses the 8-byte pair buffer in place
+            let mut ids: Vec<u32> = builder
                 .diversify_graph(&graph, k, diversify_prob, seed)
                 .into_iter()
                 .map(|(pid, _)| pid)
-                .collect()
+                .collect();
+            ids.shrink_to_fit();
+            ids
         } else {
             graph.iter().map(|&(pid, _)| pid).collect()
         };
@@ -1234,13 +1337,13 @@ where
     /// [`UPDATE_TARGET_BYTES`] divided by the real size of an `Update<T>`.
     #[inline]
     fn target_updates_per_chunk() -> usize {
-        UPDATE_TARGET_BYTES / std::mem::size_of::<Update<T>>()
+        UPDATE_TARGET_BYTES / std::mem::size_of::<PairUpdate<T>>()
     }
 
     /// Opening guess at the number of source nodes per chunk.
     ///
-    /// A source node emits one update per direction for every candidate pair
-    /// that clears the distance threshold, so the count scales with
+    /// A source node emits up to two records for every candidate pair that
+    /// clears the distance threshold, so the count scales with
     /// `|C_new| * |C_total|`, not with `max_candidates`. Only a starting point;
     /// [`Self::rescale_chunk_size`] corrects it from the second chunk on.
     ///
@@ -1341,7 +1444,17 @@ where
             // in blocks rather than all pairs.
             for block in leaf.chunks(LEAF_JOIN_BLOCK) {
                 for (a, &p) in block.iter().enumerate() {
-                    for &q in &block[a + 1..] {
+                    let rest = &block[a + 1..];
+                    let mut quads = rest.chunks_exact(4);
+                    for quad in &mut quads {
+                        let qs = [quad[0], quad[1], quad[2], quad[3]];
+                        let ds = self.distance_4(p as usize, qs);
+                        for (&q, d) in qs.iter().zip(ds) {
+                            insert_sorted(row(p), q, d);
+                            insert_sorted(row(q), p, d);
+                        }
+                    }
+                    for &q in quads.remainder() {
                         let d = self.distance(p as usize, q as usize);
                         insert_sorted(row(p), q, d);
                         insert_sorted(row(q), p, d);
@@ -1492,13 +1605,13 @@ where
         seed: usize,
         verbosity: Verbosity,
     ) -> Self {
-        let (vectors_flat, n, dim) = data.into_row_major();
+        let (mut vectors_flat, n, dim) = data.into_row_major();
 
         // Every stage gathers rows by id, so put tree neighbours next to each
         // other in memory first. Undone before returning.
         let start = Instant::now();
         let new_to_old = leaf_order(&vectors_flat, dim, metric, seed);
-        let vectors_flat = permute_rows(&vectors_flat, dim, &new_to_old);
+        permute_rows_in_place(&mut vectors_flat, dim, &new_to_old);
         if verbosity.detailed_verbosity() {
             println!(" Reordered rows to leaf order in {:.2?}", start.elapsed());
         }
@@ -1556,12 +1669,9 @@ where
         for (new_id, &old_id) in new_to_old.iter().enumerate() {
             old_to_new[old_id as usize] = new_id as u32;
         }
-        builder.vectors_flat = permute_rows(&builder.vectors_flat, dim, &old_to_new);
+        permute_rows_in_place(&mut builder.vectors_flat, dim, &old_to_new);
         if !builder.norms.is_empty() {
-            builder.norms = old_to_new
-                .iter()
-                .map(|&i| builder.norms[i as usize])
-                .collect();
+            permute_rows_in_place(&mut builder.norms, 1, &old_to_new);
         }
         builder.graph = vec![(SENTINEL_PID as u32, T::max_value()); n * k];
         builder
@@ -1736,6 +1846,11 @@ where
         }
 
         let mut cands = CandidateSets::new(self.n, max_candidates);
+        let by_threads = self
+            .n
+            .div_ceil(rayon::current_num_threads() * APPLY_BLOCKS_PER_THREAD);
+        let by_cache = APPLY_BLOCK_BYTES / (k * std::mem::size_of::<Neighbour<T>>());
+        let block_size = by_threads.min(by_cache).max(1);
 
         for iter in 0..max_iter {
             let updates_count = AtomicUsize::new(0);
@@ -1755,28 +1870,29 @@ where
                 let chunk_end = (chunk_start + chunk_size).min(self.n);
 
                 let t = Instant::now();
-                let (mut chunk_updates, stats) =
-                    self.generate_updates_for_chunk(&cands, &graph, k, chunk_start, chunk_end);
+                let (buckets, emitted, stats) = self.generate_updates_for_chunk(
+                    &cands,
+                    &graph,
+                    k,
+                    chunk_start,
+                    chunk_end,
+                    block_size,
+                );
                 timings.join += t.elapsed();
-                timings.updates_emitted += chunk_updates.len();
+                timings.updates_emitted += emitted;
                 timings.cand_len_sum += stats.sum;
                 timings.cand_len_count += stats.count;
                 timings.cand_len_max = timings.cand_len_max.max(stats.max);
                 timings.pairs += stats.pairs;
 
                 let t = Instant::now();
-                chunk_updates.radix_sort_unstable();
-                timings.sort += t.elapsed();
-
-                let t = Instant::now();
-                self.apply_sorted_updates(&chunk_updates, &mut graph, k, &updates_count);
+                updates_count.fetch_add(
+                    self.apply_pair_updates(&buckets, &mut graph, k, block_size),
+                    Ordering::Relaxed,
+                );
                 timings.apply += t.elapsed();
 
-                chunk_size = self.rescale_chunk_size(
-                    chunk_size,
-                    chunk_end - chunk_start,
-                    chunk_updates.len(),
-                );
+                chunk_size = self.rescale_chunk_size(chunk_size, chunk_end - chunk_start, emitted);
                 chunk_start = chunk_end;
                 n_chunks += 1;
             }
@@ -1933,10 +2049,10 @@ where
         });
     }
 
-    /// Generate distance updates from a chunk of source nodes.
+    /// Generate routed distance updates from a chunk of source nodes.
     ///
-    /// Emits both edge directions `(p, q, d)` and `(q, p, d)` so that
-    /// the caller can sort by target and apply lock-free.
+    /// Each scored pair becomes one record per row block it has to reach (see
+    /// [`PairUpdate::route`]), so the apply pass needs no sort.
     ///
     /// ### Params
     ///
@@ -1945,10 +2061,12 @@ where
     /// * `k` - Neighbours per node
     /// * `chunk_start` - First source node index (inclusive)
     /// * `chunk_end` - Last source node index (exclusive)
+    /// * `block_size` - Rows per apply block
     ///
     /// ### Returns
     ///
-    /// Unsorted list of `(target, source, distance)` update triples
+    /// `(buckets, records, stats)`: one bucket set per join worker, the record
+    /// count across all of them, and the candidate-list statistics.
     fn generate_updates_for_chunk(
         &self,
         cands: &CandidateSets,
@@ -1956,7 +2074,8 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> (Vec<Update<T>>, CandStats) {
+        block_size: usize,
+    ) -> (Vec<PairBuckets<T>>, usize, CandStats) {
         match self.metric {
             Dist::SquaredEuclidean => self.generate_updates_for_chunk_impl::<SqEuclidMetric>(
                 cands,
@@ -1964,6 +2083,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
             Dist::Cosine => self.generate_updates_for_chunk_impl::<CosineMetric>(
                 cands,
@@ -1971,6 +2091,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
             Dist::Manhattan => self.generate_updates_for_chunk_impl::<ManhattanMetric>(
                 cands,
@@ -1978,6 +2099,7 @@ where
                 k,
                 chunk_start,
                 chunk_end,
+                block_size,
             ),
         }
     }
@@ -2014,6 +2136,14 @@ where
     /// New and old lists are concatenated into one tile, so the single loop
     /// `a in 0..n_new`, `b in a+1..n_total` covers the new-new upper triangle
     /// and the full new-old rectangle exactly once each.
+    ///
+    /// ### Params
+    ///
+    /// See [`Self::generate_updates_for_chunk`].
+    ///
+    /// ### Returns
+    ///
+    /// See [`Self::generate_updates_for_chunk`].
     fn generate_updates_for_chunk_impl<M: MetricFn<T>>(
         &self,
         cands: &CandidateSets,
@@ -2021,27 +2151,32 @@ where
         k: usize,
         chunk_start: usize,
         chunk_end: usize,
-    ) -> (Vec<Update<T>>, CandStats) {
+        block_size: usize,
+    ) -> (Vec<PairBuckets<T>>, usize, CandStats) {
         let dim = self.dim;
         let cosine = self.metric == Dist::Cosine;
         let two = T::one() + T::one();
+        let n_blocks = self.n.div_ceil(block_size);
 
-        (chunk_start..chunk_end)
+        let workers: Vec<(PairBuckets<T>, usize, CandStats)> = (chunk_start..chunk_end)
             .into_par_iter()
             .fold(
                 || {
                     (
-                        Vec::<Update<T>>::with_capacity(16_384),
+                        (0..n_blocks)
+                            .map(|_| Vec::new())
+                            .collect::<PairBuckets<T>>(),
+                        0usize,
                         JoinScratch::<T>::new(),
                         CandStats::default(),
                     )
                 },
-                |(mut updates, mut scratch, mut stats), i| {
+                |(mut buckets, mut emitted, mut scratch, mut stats), i| {
                     let n_new = scratch.gather(self, graph, k, cands, i, cosine);
                     let n_total = scratch.ids.len();
                     stats.record(n_total);
                     if n_new == 0 || n_total < 2 {
-                        return (updates, scratch, stats);
+                        return (buckets, emitted, scratch, stats);
                     }
 
                     let use_gemm = self.gemm_join_applies(n_total);
@@ -2054,6 +2189,29 @@ where
                         let pa = scratch.ids[a];
                         let ta = scratch.thresh[a];
                         let na = scratch.norms[a];
+
+                        if !use_gemm {
+                            // Score the rest of the tile four rows at a time.
+                            let tile = &scratch.tile;
+                            let norms = &scratch.norms;
+                            let row = |t: usize| &tile[t * dim..(t + 1) * dim];
+                            let qa = row(a);
+                            scratch.row_d.resize(n_total, T::zero());
+                            let mut b = a + 1;
+                            while b + 4 <= n_total {
+                                let out = M::distance_from_tile_4(
+                                    qa,
+                                    na,
+                                    [row(b), row(b + 1), row(b + 2), row(b + 3)],
+                                    [norms[b], norms[b + 1], norms[b + 2], norms[b + 3]],
+                                );
+                                scratch.row_d[b..b + 4].copy_from_slice(&out);
+                                b += 4;
+                            }
+                            for t in b..n_total {
+                                scratch.row_d[t] = M::distance_from_tile(qa, na, row(t), norms[t]);
+                            }
+                        }
 
                         for b in (a + 1)..n_total {
                             let pb = scratch.ids[b];
@@ -2074,12 +2232,7 @@ where
                                     (scratch.sq[a] + scratch.sq[b] - two * dot).max(T::zero())
                                 }
                             } else {
-                                M::distance_from_tile(
-                                    &scratch.tile[a * dim..(a + 1) * dim],
-                                    na,
-                                    &scratch.tile[b * dim..(b + 1) * dim],
-                                    scratch.norms[b],
-                                )
+                                scratch.row_d[b]
                             };
 
                             let tb = scratch.thresh[b];
@@ -2098,32 +2251,78 @@ where
                                 d
                             };
 
-                            if d <= ta {
-                                updates.push(Update::new(pa, pb, d));
-                            }
-                            if d <= tb {
-                                updates.push(Update::new(pb, pa, d));
-                            }
+                            emitted += PairUpdate::route(
+                                &mut buckets,
+                                block_size,
+                                pa,
+                                pb,
+                                d,
+                                d <= ta,
+                                d <= tb,
+                            );
                         }
                     }
 
-                    (updates, scratch, stats)
+                    (buckets, emitted, scratch, stats)
                 },
             )
-            .map(|(updates, _, stats)| (updates, stats))
-            .reduce(
-                || (Vec::new(), CandStats::default()),
-                |(mut a, sa), (mut b, sb)| {
-                    let merged = sa.merge(sb);
-                    if a.len() >= b.len() {
-                        a.extend_from_slice(&b);
-                        (a, merged)
-                    } else {
-                        b.extend_from_slice(&a);
-                        (b, merged)
+            .map(|(buckets, emitted, _, stats)| (buckets, emitted, stats))
+            .collect();
+
+        let emitted = workers.iter().map(|w| w.1).sum();
+        let stats = workers
+            .iter()
+            .fold(CandStats::default(), |acc, w| acc.merge(w.2));
+        let buckets = workers.into_iter().map(|w| w.0).collect();
+        (buckets, emitted, stats)
+    }
+
+    /// Merge one chunk's routed updates into the graph.
+    ///
+    /// Each row block is owned by one task, which walks every worker's bucket
+    /// for that block. The rows keep the top `k` by `(distance, id)` whatever
+    /// the arrival order, so no sort is needed.
+    ///
+    /// ### Params
+    ///
+    /// * `buckets` - Per-worker buckets from the join
+    /// * `graph` - Flat k-NN graph, rows sorted ascending
+    /// * `k` - Neighbours per node
+    /// * `block_size` - Rows per block, as used for routing
+    ///
+    /// ### Returns
+    ///
+    /// Number of row insertions that changed the graph.
+    fn apply_pair_updates(
+        &self,
+        buckets: &[PairBuckets<T>],
+        graph: &mut [Neighbour<T>],
+        k: usize,
+        block_size: usize,
+    ) -> usize {
+        let id_mask = !PairUpdate::<T>::TO_ROW;
+        graph
+            .par_chunks_mut(block_size * k)
+            .enumerate()
+            .map(|(block, rows)| {
+                let base = block * block_size;
+                let mut changed = 0usize;
+                for worker in buckets {
+                    for u in &worker[block] {
+                        let (a, b) = ((u.a & id_mask) as usize, (u.b & id_mask) as usize);
+                        if u.a & PairUpdate::<T>::TO_ROW != 0 {
+                            let row = &mut rows[(a - base) * k..(a - base + 1) * k];
+                            changed += insert_sorted(row, b as u32, u.dist) as usize;
+                        }
+                        if u.b & PairUpdate::<T>::TO_ROW != 0 {
+                            let row = &mut rows[(b - base) * k..(b - base + 1) * k];
+                            changed += insert_sorted(row, a as u32, u.dist) as usize;
+                        }
                     }
-                },
-            )
+                }
+                changed
+            })
+            .sum()
     }
 
     /// Calculate distance between two indexed points under the index metric
@@ -2142,6 +2341,35 @@ where
             Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
             Dist::Manhattan => self.manhattan_distance(i, j),
+        }
+    }
+
+    /// Distances from one indexed point to four others, sharing the loads of
+    /// the first. Manhattan has no batched kernel and falls back to four
+    /// single calls.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Index of the shared vector
+    /// * `js` - Indices of the four others
+    ///
+    /// ### Returns
+    ///
+    /// The four distances under `self.metric`, in input order.
+    #[inline]
+    fn distance_4(&self, i: usize, js: [u32; 4]) -> [T; 4] {
+        let dim = self.dim;
+        let row = |r: usize| &self.vectors_flat[r * dim..(r + 1) * dim];
+        let rows = js.map(|j| row(j as usize));
+        match self.metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(row(i), rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(row(i), rows);
+                std::array::from_fn(|t| {
+                    cosine_from_dot(dots[t], self.norms[i] * self.norms[js[t] as usize])
+                })
+            }
+            Dist::Manhattan => js.map(|j| self.manhattan_distance(i, j as usize)),
         }
     }
 
@@ -3695,11 +3923,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gemm_join_distances_are_exact() {
+    fn test_gemm_join_distances_match_fused_kernel() {
         // On the GEMM path selection happens against the norm expansion, which
         // cancels catastrophically on close pairs. Every accepted pair is
-        // therefore recomputed with the fused kernel, so the distances stored
-        // in the graph must match `euclidean_simd` exactly.
+        // therefore recomputed with a fused kernel, so the stored distances
+        // must match `euclidean_simd` up to accumulation order: the leaf join
+        // scores with the four-row kernel, a few ulp away.
         let n = 300;
         let mat = gemm_width_matrix(n);
         let index = NNDescent::<f32>::new(
@@ -3732,7 +3961,11 @@ mod tests {
                     &index.vectors_flat[i * dim..(i + 1) * dim],
                     &index.vectors_flat[pid * dim..(pid + 1) * dim],
                 );
-                assert_eq!(d, exact, "stored distance for ({i}, {pid}) is not exact");
+                let rel = (d - exact).abs() / exact.max(f32::MIN_POSITIVE);
+                assert!(
+                    rel <= 1e-6,
+                    "stored distance for ({i}, {pid}) is off by {rel}"
+                );
             }
         }
     }

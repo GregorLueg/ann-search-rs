@@ -285,7 +285,10 @@ impl RnnDescentBuildParams {
 /// is only queried once per query (not per node during build).
 #[cfg_attr(feature = "serialise", derive(serde::Serialize, serde::Deserialize))]
 pub struct RnnDescentIndex<T> {
-    /// Row-major flattened vectors
+    /// Row-major flattened vectors. Empty for a freshly built index: the
+    /// vectors then live in `forest`, the graph is over its row order and
+    /// `original_ids` maps back. Only indices saved by earlier versions fill
+    /// it, with the graph over input order.
     pub vectors_flat: Vec<T>,
     /// Dimensionality
     pub dim: usize,
@@ -318,7 +321,12 @@ where
     T: AnnSearchFloat,
 {
     fn vectors_flat(&self) -> &[T] {
-        &self.vectors_flat
+        // empty own copy: the vectors live in the forest
+        if self.vectors_flat.is_empty() {
+            &self.forest.vectors_flat
+        } else {
+            &self.vectors_flat
+        }
     }
     fn dim(&self) -> usize {
         self.dim
@@ -558,21 +566,18 @@ where
         let log = BuildLog::new("RNNDescent index", verbosity);
         let detailed = verbosity.detailed_verbosity();
         let (vectors_flat, n, dim) = data.into_row_major();
-        let norms = if metric_needs_norms(metric) {
-            precompute_norms(&vectors_flat, n, dim)
-        } else {
-            Vec::new()
-        };
 
         let n_trees =
             n_trees.unwrap_or_else(|| ((n as f64).powf(0.25) / 2.0 + 5.0).min(16.0) as usize);
 
         // Build the entry-point forest once, before the graph. Query time
-        // multi-seeds the beam from `forest.query()` results.
+        // multi-seeds the beam from `forest.query()` results. The forest owns
+        // the only copy of the vectors, and the graph is built over its row
+        // order.
         let mut timings = BuildTimings::default();
         let start = Instant::now();
         let forest = KdTreeIndex::new(
-            (&vectors_flat[..], n, dim),
+            (vectors_flat, n, dim),
             n_trees,
             metric,
             seed,
@@ -584,9 +589,15 @@ where
                 start.elapsed()
             );
         }
+        let norms = if metric_needs_norms(metric) {
+            precompute_norms(&forest.vectors_flat, n, dim)
+        } else {
+            Vec::new()
+        };
+        let original_ids = KnnValidation::original_ids(&forest).to_vec();
 
         let mut index = Self {
-            vectors_flat,
+            vectors_flat: Vec::new(),
             dim,
             n,
             r: params.r,
@@ -594,7 +605,7 @@ where
             norms,
             graph: Vec::new(),
             forest,
-            original_ids: (0..n as u32).collect(),
+            original_ids,
         };
 
         // Working flat graph in Neighbour<T> form during build.
@@ -775,7 +786,7 @@ where
 
                         let dim = self.dim;
                         let metric = self.metric;
-                        let flat = &self.vectors_flat;
+                        let flat = VectorDistance::vectors_flat(self);
                         let norms = &self.norms;
 
                         // Greedy-accept in ascending distance order, compacting
@@ -933,6 +944,17 @@ where
         applied
     }
 
+    /// Whether the graph runs over the forest's rows and vectors, rather
+    /// than its own copy in input order (indices saved by earlier versions).
+    ///
+    /// ### Returns
+    ///
+    /// `true` for a freshly built index
+    #[inline]
+    fn shares_forest_vectors(&self) -> bool {
+        self.vectors_flat.is_empty()
+    }
+
     /// Memory usage in bytes.
     pub fn memory_usage_bytes(&self) -> usize {
         std::mem::size_of_val(self)
@@ -1017,8 +1039,14 @@ where
             // candidates, so all of them can go straight into the result heap.
             let init_candidates = (ef / 2).max(2 * k).min(self.n);
             let search_k = init_candidates * 3;
-            let (seed_ids, seed_dists) =
-                self.forest.query(query, init_candidates, Some(search_k))?;
+            // Seeds must be rows of the graph: forest rows when sharing its
+            // vectors, input ids (= rows) in indices saved before that
+            let (seed_ids, seed_dists) = if self.shares_forest_vectors() {
+                self.forest
+                    .query_rows(query, init_candidates, Some(search_k))?
+            } else {
+                self.forest.query(query, init_candidates, Some(search_k))?
+            };
 
             for (id, d) in seed_ids.iter().zip(seed_dists.iter()) {
                 if state.is_visited(*id) {
@@ -1062,7 +1090,10 @@ where
             let take = k.min(state.results.len());
 
             Ok((
-                state.results.ids()[..take].to_vec(),
+                state.results.ids()[..take]
+                    .iter()
+                    .map(|&r| self.original_ids[r] as usize)
+                    .collect(),
                 state.results.dists()[..take].to_vec(),
             ))
         })
@@ -1114,7 +1145,7 @@ where
             .map(|i| {
                 let start = i * self.dim;
                 let end = start + self.dim;
-                let vec = &self.vectors_flat[start..end];
+                let vec = &VectorDistance::vectors_flat(self)[start..end];
 
                 progress.tick();
 
@@ -1123,7 +1154,13 @@ where
             .collect::<Result<Vec<_>, AnnSearchErrors>>()?;
         progress.finish();
 
-        Ok(pack_knn_results(results, return_dist))
+        // row `i` is internal row `i`; put it back at its original id
+        let mut ordered = vec![(Vec::new(), Vec::new()); self.n];
+        for (i, r) in results.into_iter().enumerate() {
+            ordered[self.original_ids[i] as usize] = r;
+        }
+
+        Ok(pack_knn_results(ordered, return_dist))
     }
 }
 
@@ -1420,5 +1457,67 @@ mod tests {
         let (a_ids, _) = a.query(&query, 3, None, None).unwrap();
         let (b_ids, _) = b.query(&query, 3, None, None).unwrap();
         assert_eq!(a_ids, b_ids);
+    }
+
+    #[test]
+    fn legacy_layout_matches_shared_forest_layout() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let (n, dim) = (400, 6);
+        let mut rng = StdRng::seed_from_u64(3);
+        let data: Vec<f32> = (0..n * dim).map(|_| rng.random::<f32>()).collect();
+        let mat = Mat::from_fn(n, dim, |i, j| data[i * dim + j]);
+        let index = build_default(&mat, Dist::SquaredEuclidean);
+        assert!(index.vectors_flat.is_empty());
+
+        // Rebuild the pre-sharing layout: own vectors and graph in input
+        // order, identity ids, the same forest.
+        let r = index.r;
+        let mut vectors_flat = vec![0.0_f32; n * dim];
+        let mut graph = vec![SENTINEL_PID as u32; n * r];
+        for (row, &orig) in index.original_ids.iter().enumerate() {
+            let orig = orig as usize;
+            vectors_flat[orig * dim..(orig + 1) * dim]
+                .copy_from_slice(&index.forest.vectors_flat[row * dim..(row + 1) * dim]);
+            for (slot, &pid) in graph[orig * r..(orig + 1) * r]
+                .iter_mut()
+                .zip(&index.graph[row * r..(row + 1) * r])
+            {
+                if pid as usize != SENTINEL_PID {
+                    *slot = index.original_ids[pid as usize];
+                }
+            }
+        }
+        let legacy = RnnDescentIndex {
+            vectors_flat,
+            dim,
+            n,
+            r,
+            metric: index.metric,
+            norms: Vec::new(),
+            graph,
+            forest: KdTreeIndex::new(
+                mat.as_ref(),
+                index.forest.n_trees,
+                index.metric,
+                42,
+                Verbosity::Quiet,
+            ),
+            original_ids: (0..n as u32).collect(),
+        };
+
+        for q in 0..20 {
+            let query = &data[q * dim..(q + 1) * dim];
+            let (a, da) = index.query(query, 10, None, None).unwrap();
+            let (b, db) = legacy.query(query, 10, None, None).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(da, db);
+        }
+        let (a, _) = index
+            .generate_knn(5, None, None, false, Verbosity::Quiet)
+            .unwrap();
+        let (b, _) = legacy
+            .generate_knn(5, None, None, false, Verbosity::Quiet)
+            .unwrap();
+        assert_eq!(a, b);
     }
 }

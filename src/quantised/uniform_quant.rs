@@ -18,6 +18,7 @@
 
 use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::prelude::*;
@@ -236,8 +237,8 @@ where
 
     /// Draw the calibration row sample.
     ///
-    /// Returns the whole dataset when it is small enough to use directly,
-    /// otherwise a shuffled subset of rows copied out row-wise.
+    /// Borrows the whole dataset when it is small enough to use directly,
+    /// otherwise copies out a shuffled subset of rows.
     ///
     /// ### Params
     ///
@@ -249,14 +250,19 @@ where
     /// ### Returns
     ///
     /// Row-major sample of length `m * dim`
-    fn sample_rows(data: &[T], n: usize, dim: usize, params: &UniformQuantParams) -> Vec<T> {
+    fn sample_rows<'a>(
+        data: &'a [T],
+        n: usize,
+        dim: usize,
+        params: &UniformQuantParams,
+    ) -> Cow<'a, [T]> {
         let want = params
             .sample_rows
             .unwrap_or(CALIBRATION_SAMPLE_ROWS)
             .clamp(1, n);
 
         if want == n {
-            return data[..n * dim].to_vec();
+            return Cow::Borrowed(&data[..n * dim]);
         }
 
         let mut rng = SmallRng::seed_from_u64(params.seed as u64);
@@ -267,7 +273,7 @@ where
         for &i in ids.iter().take(want) {
             out.extend_from_slice(&data[i * dim..(i + 1) * dim]);
         }
-        out
+        Cow::Owned(out)
     }
 
     /// Encode a vector into an existing code buffer.

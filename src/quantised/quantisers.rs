@@ -503,47 +503,53 @@ where
         }
 
         // reduced version to train for speed
-        // should capture the majority of structure
-        let (training_vecs, n_train) = if n > 50_000 {
-            let (data, _) = sample_vectors(vectors_flat, dim, n, 50_000, seed);
-            (data, 50_000)
-        } else {
-            (vectors_flat.to_vec(), n)
-        };
+        // should capture the majority of structure; scoped so the sample is
+        // gone before the final full-size rotation
+        {
+            let sampled;
+            let (training_vecs, n_train): (&[T], usize) = if n > 50_000 {
+                sampled = sample_vectors(vectors_flat, dim, n, 50_000, seed).0;
+                (&sampled, 50_000)
+            } else {
+                (vectors_flat, n)
+            };
 
-        let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
+            let rotation_iter = n_iter.unwrap_or(OPQ_ITER);
 
-        for iter in 0..rotation_iter {
-            if verbosity.detailed_verbosity() {
-                println!("  OPQ iteration {} / {}", iter + 1, rotation_iter);
+            for iter in 0..rotation_iter {
+                if verbosity.detailed_verbosity() {
+                    println!("  OPQ iteration {} / {}", iter + 1, rotation_iter);
+                }
+
+                // rotate vectors
+                let rotated = Self::apply_rotation(training_vecs, &rotation_matrix, dim, n_train);
+
+                let pq = ProductQuantiser::train(
+                    &rotated,
+                    dim,
+                    m,
+                    n_centroids,
+                    &Dist::SquaredEuclidean,
+                    max_iters,
+                    seed + iter,
+                    Verbosity::Quiet,
+                )?;
+
+                // encode and reconstruct
+                let codes = pq.encode_batch(&rotated, n_train);
+                drop(rotated);
+                let reconstructed: Vec<T> = (0..n_train)
+                    .into_par_iter()
+                    .flat_map(|vec_idx| {
+                        let vec_codes = &codes[vec_idx * pq.m()..(vec_idx + 1) * pq.m()];
+                        pq.decode(vec_codes)
+                    })
+                    .collect();
+
+                // update rotation via SVD
+                rotation_matrix =
+                    Self::compute_rotation(training_vecs, &reconstructed, dim, n_train);
             }
-
-            // rotate vectors
-            let rotated = Self::apply_rotation(&training_vecs, &rotation_matrix, dim, n_train);
-
-            let pq = ProductQuantiser::train(
-                &rotated,
-                dim,
-                m,
-                n_centroids,
-                &Dist::SquaredEuclidean,
-                max_iters,
-                seed + iter,
-                Verbosity::Quiet,
-            )?;
-
-            // encode and reconstruct
-            let codes = pq.encode_batch(&rotated, n_train);
-            let reconstructed: Vec<T> = (0..n_train)
-                .into_par_iter()
-                .flat_map(|vec_idx| {
-                    let vec_codes = &codes[vec_idx * pq.m()..(vec_idx + 1) * pq.m()];
-                    pq.decode(vec_codes)
-                })
-                .collect();
-
-            // update rotation via SVD
-            rotation_matrix = Self::compute_rotation(&training_vecs, &reconstructed, dim, n_train);
         }
 
         // final training
