@@ -3,6 +3,13 @@
 Changes to the `ann-search` Python package. The Rust crate it wraps,
 `ann-search-rs`, has its own changelog at [`../CHANGELOG.md`](../CHANGELOG.md).
 
+## 0.7.1
+
+Requires `ann-search-rs` 0.13.1
+
+- Faster NN-Descent and NSG builds from `ann-search-rs` 0.13.1. Distances can
+  differ at rounding level at the same seed.
+
 ## 0.7.0
 
 Requires `ann-search-rs` 0.13.0

@@ -3,6 +3,13 @@
 Changes to the `ann-search-rs` crate. The Python package `ann-search` has its
 own changelog at [`python/CHANGELOG.md`](python/CHANGELOG.md).
 
+## 0.13.1
+
+- Faster CPU NN-Descent builds (`build_knn_graph_nndescent()`, the NN-Descent
+  index and NSG): join updates go straight to their rows instead of through a
+  sort, and the joins score four candidates at a time. Distances can differ at
+  rounding level at the same seed.
+
 ## 0.13.0
 
 **Breaking**
