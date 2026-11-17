@@ -192,21 +192,6 @@ where
 
         // vectors used for clustering: unit-normalised for Cosine, raw for
         // squared euclidean.
-        let vectors_for_storage: Vec<T> = if metric == Dist::Cosine {
-            vectors_flat
-                .chunks(dim)
-                .zip(norms.iter())
-                .flat_map(|(v, &norm)| {
-                    if norm > T::epsilon() {
-                        v.iter().map(|&x| x / norm).collect::<Vec<_>>()
-                    } else {
-                        v.to_vec()
-                    }
-                })
-                .collect()
-        } else {
-            vectors_flat.clone()
-        };
 
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
@@ -239,6 +224,7 @@ where
                 start.elapsed()
             );
         }
+        drop(training_data);
 
         // normalise centroids for Cosine so routing dots are cosine similarities.
         if metric == Dist::Cosine {
@@ -258,22 +244,45 @@ where
             .map(|i| compute_l2_norm(&centroids[i * dim..(i + 1) * dim]))
             .collect();
 
-        let assignments = assign_all_parallel(
-            &vectors_for_storage,
-            &cluster_norms,
-            dim,
-            n,
-            &centroids,
-            &centroids_norm,
-            nlist,
-            &metric,
-        );
+        // Cosine routes on unit rows; that copy lives only for the assignment,
+        // the encoder below takes the raw rows.
+        let assignments = if metric == Dist::Cosine {
+            let mut unit = vectors_flat.clone();
+            unit.par_chunks_mut(dim)
+                .zip(norms.par_iter())
+                .for_each(|(v, &norm)| {
+                    if norm > T::epsilon() {
+                        v.iter_mut().for_each(|x| *x = *x / norm);
+                    }
+                });
+            assign_all_parallel(
+                &unit,
+                &cluster_norms,
+                dim,
+                n,
+                &centroids,
+                &centroids_norm,
+                nlist,
+                &metric,
+            )
+        } else {
+            assign_all_parallel(
+                &vectors_flat,
+                &cluster_norms,
+                dim,
+                n,
+                &centroids,
+                &centroids_norm,
+                nlist,
+                &metric,
+            )
+        };
 
         let (vector_indices, cluster_offsets) = build_csr_layout(assignments, n, nlist);
 
         // global, data-oblivious TurboQuant encoding of every vector.
         let quantiser =
-            TurboQuantQuantiser::new((&vectors_flat[..], n, dim), &metric, bits, seed as u64)?;
+            TurboQuantQuantiser::new((vectors_flat, n, dim), &metric, bits, seed as u64)?;
         let bits = quantiser.storage.bits;
 
         // per-vector raw norms and dot-corrections reordered into CSR slot order for the kernels.
@@ -391,9 +400,18 @@ where
         store_encoding: StoreEncoding,
     ) -> Result<Self, AnnSearchErrors> {
         // One walk of the caller's matrix, shared by the index and the store.
+        // The store is written first so the rows can then move into the build.
         let (vectors_flat, n, dim) = data.into_row_major();
+        let norms: Vec<T> = vectors_flat
+            .chunks_exact(dim)
+            .map(compute_l2_norm)
+            .collect();
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
+        drop(norms);
+
         let mut index = Self::build(
-            (&vectors_flat[..], n, dim),
+            (vectors_flat, n, dim),
             metric,
             nlist,
             k_means_params,
@@ -401,14 +419,6 @@ where
             seed,
             verbosity,
         )?;
-
-        let norms: Vec<T> = vectors_flat
-            .chunks_exact(dim)
-            .map(compute_l2_norm)
-            .collect();
-
-        let vector_store =
-            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
         index.store_fingerprint = Some(vector_store.fingerprint());
         index.vector_store = Some(vector_store);
 

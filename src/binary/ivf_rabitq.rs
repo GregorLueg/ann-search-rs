@@ -196,28 +196,13 @@ where
             Vec::new()
         };
 
-        let vectors_for_storage = if metric == Dist::Cosine {
-            vectors_flat
-                .chunks(dim)
-                .zip(norms.iter())
-                .flat_map(|(v, &norm)| {
-                    if norm > T::epsilon() {
-                        v.iter().map(|&x| x / norm).collect::<Vec<_>>()
-                    } else {
-                        v.to_vec()
-                    }
-                })
-                .collect()
-        } else {
-            vectors_flat.clone()
-        };
-
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let cluster_norms = if matches!(metric, Dist::Cosine) {
             vec![T::one(); n]
         } else {
-            norms
+            // empty outside Cosine, so the clone is free
+            norms.clone()
         };
 
         // subsample for training if large
@@ -243,6 +228,21 @@ where
                 n_train.separate_with_underscores(),
                 start.elapsed()
             );
+        }
+        drop(training_data);
+
+        // Cosine encodes unit rows. Done in place once nothing needs the raw
+        // rows any more, so the data is never held twice.
+        let mut vectors_for_storage = vectors_flat;
+        if metric == Dist::Cosine {
+            vectors_for_storage
+                .par_chunks_mut(dim)
+                .zip(norms.par_iter())
+                .for_each(|(v, &norm)| {
+                    if norm > T::epsilon() {
+                        v.iter_mut().for_each(|x| *x = *x / norm);
+                    }
+                });
         }
 
         // normalise centroids for Cosine
@@ -412,22 +412,6 @@ where
             })
             .collect();
 
-        let vectors_for_storage = if metric == Dist::Cosine {
-            vectors_flat
-                .chunks(dim)
-                .zip(norms.iter())
-                .flat_map(|(v, &norm)| {
-                    if norm > T::epsilon() {
-                        v.iter().map(|&x| x / norm).collect::<Vec<_>>()
-                    } else {
-                        v.to_vec()
-                    }
-                })
-                .collect()
-        } else {
-            vectors_flat.clone()
-        };
-
         let nlist = nlist.unwrap_or((n as f32).sqrt() as usize).max(1);
 
         let cluster_norms = if matches!(metric, Dist::Cosine) {
@@ -436,16 +420,23 @@ where
             norms.clone()
         };
 
-        let (training_data, n_train) = if n > 500_000 {
-            let (sampled, _) = sample_vectors(&vectors_flat, dim, n, 250_000, seed);
-            (sampled, 250_000)
+        // The store keeps the raw rows, so it is written before Cosine
+        // normalises them in place below.
+        let vector_store =
+            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
+        let store_fingerprint = Some(vector_store.fingerprint());
+
+        let sampled;
+        let (training_data, n_train): (&[T], usize) = if n > 500_000 {
+            sampled = sample_vectors(&vectors_flat, dim, n, 250_000, seed).0;
+            (&sampled, 250_000)
         } else {
-            (vectors_flat.clone(), n)
+            (&vectors_flat, n)
         };
 
         let start = Instant::now();
         let mut centroids_flat = train_centroids(
-            &training_data,
+            training_data,
             dim,
             n_train,
             nlist,
@@ -461,6 +452,20 @@ where
                 n_train.separate_with_underscores(),
                 start.elapsed()
             );
+        }
+
+        // Cosine encodes unit rows. Done in place once nothing needs the raw
+        // rows any more, so the data is never held twice.
+        let mut vectors_for_storage = vectors_flat;
+        if metric == Dist::Cosine {
+            vectors_for_storage
+                .par_chunks_mut(dim)
+                .zip(norms.par_iter())
+                .for_each(|(v, &norm)| {
+                    if norm > T::epsilon() {
+                        v.iter_mut().for_each(|x| *x = *x / norm);
+                    }
+                });
         }
 
         // Normalise centroids for Cosine
@@ -511,12 +516,6 @@ where
             &encoder,
             ex_bits,
         )?;
-
-        // Save vector store
-
-        let vector_store =
-            VectorStore::create(&save_path, &vectors_flat, &norms, n, dim, store_encoding)?;
-        let store_fingerprint = Some(vector_store.fingerprint());
 
         log.finish();
 
