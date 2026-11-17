@@ -703,6 +703,13 @@ trait MetricFn<T: AnnSearchFloat> {
     /// `norm_a` and `norm_b` are the pre-fetched L2 norms, meaningful for
     /// Cosine only.
     fn distance_from_tile(vec_a: &[T], norm_a: T, vec_b: &[T], norm_b: T) -> T;
+
+    /// Distance from one tile row to four others, sharing the loads of
+    /// `vec_a`. Defaults to four single calls.
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], norm_a: T, vecs: [&[T]; 4], norms: [T; 4]) -> [T; 4] {
+        std::array::from_fn(|i| Self::distance_from_tile(vec_a, norm_a, vecs[i], norms[i]))
+    }
 }
 
 /// Squared Euclidean metric.
@@ -717,6 +724,11 @@ impl<T: AnnSearchFloat> MetricFn<T> for SqEuclidMetric {
     fn distance_from_tile(vec_a: &[T], _norm_a: T, vec_b: &[T], _norm_b: T) -> T {
         T::euclidean_simd(vec_a, vec_b)
     }
+
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], _norm_a: T, vecs: [&[T]; 4], _norms: [T; 4]) -> [T; 4] {
+        T::euclidean_simd_batch_4(vec_a, vecs)
+    }
 }
 
 impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
@@ -728,6 +740,19 @@ impl<T: AnnSearchFloat> MetricFn<T> for CosineMetric {
         } else {
             T::one()
         }
+    }
+
+    #[inline(always)]
+    fn distance_from_tile_4(vec_a: &[T], norm_a: T, vecs: [&[T]; 4], norms: [T; 4]) -> [T; 4] {
+        let dots = T::dot_simd_batch_4(vec_a, vecs);
+        std::array::from_fn(|i| {
+            let denom = norm_a * norms[i];
+            if denom > T::zero() {
+                T::one() - dots[i] / denom
+            } else {
+                T::one()
+            }
+        })
     }
 }
 
@@ -796,6 +821,9 @@ struct JoinScratch<T> {
     tile: Vec<T>,
     /// Dot products, row-major `n_new * n_total`, filled only on the GEMM path
     dots: Vec<T>,
+    /// Distances from the current new candidate to every later tile row,
+    /// filled only off the GEMM path
+    row_d: Vec<T>,
 }
 
 impl<T: AnnSearchFloat> JoinScratch<T> {
@@ -810,6 +838,7 @@ impl<T: AnnSearchFloat> JoinScratch<T> {
             sq: Vec::new(),
             tile: Vec::new(),
             dots: Vec::new(),
+            row_d: Vec::new(),
         }
     }
 
@@ -1437,7 +1466,17 @@ where
             // in blocks rather than all pairs.
             for block in leaf.chunks(LEAF_JOIN_BLOCK) {
                 for (a, &p) in block.iter().enumerate() {
-                    for &q in &block[a + 1..] {
+                    let rest = &block[a + 1..];
+                    let mut quads = rest.chunks_exact(4);
+                    for quad in &mut quads {
+                        let qs = [quad[0], quad[1], quad[2], quad[3]];
+                        let ds = self.distance_4(p as usize, qs);
+                        for (&q, d) in qs.iter().zip(ds) {
+                            insert_sorted(row(p), q, d);
+                            insert_sorted(row(q), p, d);
+                        }
+                    }
+                    for &q in quads.remainder() {
                         let d = self.distance(p as usize, q as usize);
                         insert_sorted(row(p), q, d);
                         insert_sorted(row(q), p, d);
@@ -2176,6 +2215,29 @@ where
                         let ta = scratch.thresh[a];
                         let na = scratch.norms[a];
 
+                        if !use_gemm {
+                            // Score the rest of the tile four rows at a time.
+                            let tile = &scratch.tile;
+                            let norms = &scratch.norms;
+                            let row = |t: usize| &tile[t * dim..(t + 1) * dim];
+                            let qa = row(a);
+                            scratch.row_d.resize(n_total, T::zero());
+                            let mut b = a + 1;
+                            while b + 4 <= n_total {
+                                let out = M::distance_from_tile_4(
+                                    qa,
+                                    na,
+                                    [row(b), row(b + 1), row(b + 2), row(b + 3)],
+                                    [norms[b], norms[b + 1], norms[b + 2], norms[b + 3]],
+                                );
+                                scratch.row_d[b..b + 4].copy_from_slice(&out);
+                                b += 4;
+                            }
+                            for t in b..n_total {
+                                scratch.row_d[t] = M::distance_from_tile(qa, na, row(t), norms[t]);
+                            }
+                        }
+
                         for b in (a + 1)..n_total {
                             let pb = scratch.ids[b];
                             if pa == pb {
@@ -2195,12 +2257,7 @@ where
                                     (scratch.sq[a] + scratch.sq[b] - two * dot).max(T::zero())
                                 }
                             } else {
-                                M::distance_from_tile(
-                                    &scratch.tile[a * dim..(a + 1) * dim],
-                                    na,
-                                    &scratch.tile[b * dim..(b + 1) * dim],
-                                    scratch.norms[b],
-                                )
+                                scratch.row_d[b]
                             };
 
                             let tb = scratch.thresh[b];
@@ -2309,6 +2366,35 @@ where
             Dist::SquaredEuclidean => self.euclidean_distance(i, j),
             Dist::Cosine => self.cosine_distance(i, j),
             Dist::Manhattan => self.manhattan_distance(i, j),
+        }
+    }
+
+    /// Distances from one indexed point to four others, sharing the loads of
+    /// the first. Manhattan has no batched kernel and falls back to four
+    /// single calls.
+    ///
+    /// ### Params
+    ///
+    /// * `i` - Index of the shared vector
+    /// * `js` - Indices of the four others
+    ///
+    /// ### Returns
+    ///
+    /// The four distances under `self.metric`, in input order.
+    #[inline]
+    fn distance_4(&self, i: usize, js: [u32; 4]) -> [T; 4] {
+        let dim = self.dim;
+        let row = |r: usize| &self.vectors_flat[r * dim..(r + 1) * dim];
+        let rows = js.map(|j| row(j as usize));
+        match self.metric {
+            Dist::SquaredEuclidean => T::euclidean_simd_batch_4(row(i), rows),
+            Dist::Cosine => {
+                let dots = T::dot_simd_batch_4(row(i), rows);
+                std::array::from_fn(|t| {
+                    cosine_from_dot(dots[t], self.norms[i] * self.norms[js[t] as usize])
+                })
+            }
+            Dist::Manhattan => js.map(|j| self.manhattan_distance(i, j as usize)),
         }
     }
 
@@ -3862,11 +3948,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gemm_join_distances_are_exact() {
+    fn test_gemm_join_distances_match_fused_kernel() {
         // On the GEMM path selection happens against the norm expansion, which
         // cancels catastrophically on close pairs. Every accepted pair is
-        // therefore recomputed with the fused kernel, so the distances stored
-        // in the graph must match `euclidean_simd` exactly.
+        // therefore recomputed with a fused kernel, so the stored distances
+        // must match `euclidean_simd` up to accumulation order: the leaf join
+        // scores with the four-row kernel, a few ulp away.
         let n = 300;
         let mat = gemm_width_matrix(n);
         let index = NNDescent::<f32>::new(
@@ -3899,7 +3986,8 @@ mod tests {
                     &index.vectors_flat[i * dim..(i + 1) * dim],
                     &index.vectors_flat[pid * dim..(pid + 1) * dim],
                 );
-                assert_eq!(d, exact, "stored distance for ({i}, {pid}) is not exact");
+                let rel = (d - exact).abs() / exact.max(f32::MIN_POSITIVE);
+                assert!(rel <= 1e-6, "stored distance for ({i}, {pid}) is off by {rel}");
             }
         }
     }
