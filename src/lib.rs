@@ -571,6 +571,9 @@ where
 /// * `k` - Number of neighbours to return
 /// * `index` - The AnnoyIndex to query.
 /// * `search_budget` - Search budget per tree
+/// * `vote_threshold` - Score only items found in at least this many leaves.
+///   Faster at high dimension, slower at low; `None` scores everything. See
+///   [`AnnoyIndex::query_into`]
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
 /// * `verbosity` - See [`Verbosity`]
@@ -583,6 +586,7 @@ pub fn query_annoy_index<T>(
     index: &AnnoyIndex<T>,
     k: usize,
     search_budget: Option<usize>,
+    vote_threshold: Option<u8>,
     return_dist: bool,
     verbosity: Verbosity,
 ) -> KnnOptionResult<T>
@@ -598,7 +602,13 @@ where
         verbosity,
         AnnoyScratch::new,
         |scratch, i| {
-            index.query_into(&queries[i * dim..(i + 1) * dim], k, search_budget, scratch)?;
+            index.query_into(
+                &queries[i * dim..(i + 1) * dim],
+                k,
+                search_budget,
+                vote_threshold,
+                scratch,
+            )?;
             Ok(scratch.results().iter().map(|&(d, i)| (i, d)).unzip())
         },
     )
@@ -613,6 +623,8 @@ where
 /// * `k` - Number of neighbours to return
 /// * `index` - The AnnoyIndex to query.
 /// * `search_budget` - Search budget per tree
+/// * `vote_threshold` - Score only items found in at least this many leaves,
+///   see [`query_annoy_index`]
 /// * `return_dist` - Shall the distances between the different points be
 ///   returned
 /// * `verbosity` - See [`Verbosity`]
@@ -624,13 +636,14 @@ pub fn query_annoy_self<T>(
     index: &AnnoyIndex<T>,
     k: usize,
     search_budget: Option<usize>,
+    vote_threshold: Option<u8>,
     return_dist: bool,
     verbosity: Verbosity,
 ) -> KnnOptionResult<T>
 where
     T: AnnSearchFloat,
 {
-    index.generate_knn(k, search_budget, return_dist, verbosity)
+    index.generate_knn(k, search_budget, vote_threshold, return_dist, verbosity)
 }
 
 //////////////

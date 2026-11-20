@@ -39,6 +39,15 @@ const LOCAL_SUBTREE_BYTES: usize = 1 << 20;
 /// Points per rayon task in the level-synchronous side pass.
 const SIDE_PASS_CHUNK: usize = 4096;
 
+/// Default `search_k` per tree and requested neighbour: the budget is
+/// `k * n_trees * DEFAULT_BUDGET_PER_TREE`.
+const DEFAULT_BUDGET_PER_TREE: usize = 20;
+
+/// Default `search_k` factor with candidate voting. Voting scores only items
+/// several trees agree on, so it needs a longer walk for the same recall. Set
+/// from a few datasets, not tuned per dataset.
+const VOTE_BUDGET_PER_TREE: usize = 50;
+
 /// Marks a point whose node is not split at this level.
 const NO_NODE: u32 = u32::MAX;
 
@@ -1175,6 +1184,7 @@ where
 /// `visited` is cleared by unsetting only the bits the last query touched, so
 /// reset cost is bounded by the search budget rather than by `n`. Every visited
 /// item also lands in `candidates`, so that buffer is the list of bits to clear.
+/// The voting path does the same with `votes`, using `touched` as the list.
 pub struct AnnoyScratch<T> {
     /// One bit per item, marking what the current query has already scored
     visited: FixedBitSet,
@@ -1182,6 +1192,10 @@ pub struct AnnoyScratch<T> {
     candidates: Vec<(T, usize)>,
     /// Backtracking frontier over unexplored branches
     pq: BinaryHeap<BacktrackEntry>,
+    /// Leaf hits per item for the voting path, saturating at 255
+    votes: Vec<u8>,
+    /// Items with a non-zero vote count, in first-hit order
+    touched: Vec<u32>,
 }
 
 impl<T> Default for AnnoyScratch<T> {
@@ -1190,6 +1204,8 @@ impl<T> Default for AnnoyScratch<T> {
             visited: FixedBitSet::new(),
             candidates: Vec::new(),
             pq: BinaryHeap::new(),
+            votes: Vec::new(),
+            touched: Vec::new(),
         }
     }
 }
@@ -1242,7 +1258,8 @@ where
     /// * `query_vec` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
     /// * `search_k` - Budget of items to examine (higher = better recall,
-    ///   slower). Defaults to `k * n_trees * 20` if None
+    ///   slower). See [`Self::query_into`] for the default
+    /// * `vote_threshold` - Candidate voting, see [`Self::query_into`]
     ///
     /// ### Returns
     ///
@@ -1253,9 +1270,10 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
+        vote_threshold: Option<u8>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         let mut scratch = AnnoyScratch::new();
-        self.query_into(query_vec, k, search_k, &mut scratch)?;
+        self.query_into(query_vec, k, search_k, vote_threshold, &mut scratch)?;
 
         Ok(scratch.candidates.into_iter().map(|(d, i)| (i, d)).unzip())
     }
@@ -1267,11 +1285,22 @@ where
     /// the two output `Vec`s; callers issuing one query per point should use
     /// this directly.
     ///
+    /// With `vote_threshold` set to `v >= 2`, the walk only counts how many
+    /// leaves each item lands in, and exact distances are computed for items
+    /// reached at least `v` times. If fewer than `k` items reach `v`, every
+    /// reached item is scored. This trades a longer walk for fewer distance
+    /// calculations, so it pays when distances are expensive (high `dim`) and
+    /// costs speed when they are cheap.
+    ///
     /// ### Params
     ///
     /// * `query_vec` - Query vector (must match index dimensionality)
     /// * `k` - Number of neighbours to return
-    /// * `search_k` - Budget of items to examine, defaults to `k * n_trees * 20`
+    /// * `search_k` - Budget of leaf items to visit, counting repeats across
+    ///   trees. Defaults to `k * n_trees * DEFAULT_BUDGET_PER_TREE`, or
+    ///   `k * n_trees * VOTE_BUDGET_PER_TREE` with voting
+    /// * `vote_threshold` - Minimum leaf hits for an item to be scored.
+    ///   `None`, `Some(0)` and `Some(1)` score every reached item
     /// * `scratch` - Reusable buffers, reset on entry
     ///
     /// ### Returns
@@ -1282,17 +1311,20 @@ where
         query_vec: &[T],
         k: usize,
         search_k: Option<usize>,
+        vote_threshold: Option<u8>,
         scratch: &mut AnnoyScratch<T>,
     ) -> Result<(), AnnSearchErrors> {
         self.check_dim(query_vec.len())?;
 
-        let limit = search_k.unwrap_or(k * self.n_trees * 20);
+        let vote = vote_threshold.filter(|&v| v >= 2);
+        let per_tree = if vote.is_some() {
+            VOTE_BUDGET_PER_TREE
+        } else {
+            DEFAULT_BUDGET_PER_TREE
+        };
+        let limit = search_k.unwrap_or(k * self.n_trees * per_tree);
 
-        if scratch.visited.len() < self.n {
-            scratch.visited.grow(self.n);
-        }
         scratch.candidates.clear();
-        scratch.candidates.reserve(limit);
 
         let query_norm = if self.metric == Dist::Cosine {
             query_vec
@@ -1304,35 +1336,11 @@ where
             T::one()
         };
 
-        let AnnoyScratch {
-            visited,
-            candidates,
-            pq,
-        } = scratch;
-
-        self.trees.visit(query_vec, limit, pq, |leaf_items| {
-            for &item in leaf_items {
-                let item = item as usize;
-                if visited.contains(item) {
-                    continue;
-                }
-                visited.insert(item);
-
-                let dist = match self.metric {
-                    Dist::SquaredEuclidean => self.euclidean_distance_to_query(item, query_vec),
-                    Dist::Cosine => self.cosine_distance_to_query(item, query_vec, query_norm),
-                    Dist::Manhattan => unreachable!(),
-                };
-
-                candidates.push((dist, item));
-            }
-        });
-
-        // Clear only the visited bits touched; every scored item is in
-        // `candidates`.
-        for &(_, item) in candidates.iter() {
-            visited.remove(item);
+        match vote {
+            Some(v) => self.query_voted(query_vec, k, limit, v, query_norm, scratch),
+            None => self.query_scored(query_vec, limit, query_norm, scratch),
         }
+        let candidates = &mut scratch.candidates;
 
         // O(N) selection of the top K elements
         if candidates.len() > k {
@@ -1352,6 +1360,135 @@ where
         Ok(())
     }
 
+    /// Distance from the query to an indexed item under the index metric.
+    ///
+    /// ### Params
+    ///
+    /// * `item` - Internal (reordered) item id
+    /// * `query_vec` - Query vector
+    /// * `query_norm` - L2 norm of the query, only read for Cosine
+    ///
+    /// ### Returns
+    ///
+    /// The distance.
+    #[inline(always)]
+    fn distance_to_query(&self, item: usize, query_vec: &[T], query_norm: T) -> T {
+        match self.metric {
+            Dist::SquaredEuclidean => self.euclidean_distance_to_query(item, query_vec),
+            Dist::Cosine => self.cosine_distance_to_query(item, query_vec, query_norm),
+            Dist::Manhattan => unreachable!(),
+        }
+    }
+
+    /// Default search: score every distinct item the walk reaches.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `limit` - Budget of leaf items to visit
+    /// * `query_norm` - L2 norm of the query, only read for Cosine
+    /// * `scratch` - Reusable buffers; scored items land in `candidates`
+    fn query_scored(
+        &self,
+        query_vec: &[T],
+        limit: usize,
+        query_norm: T,
+        scratch: &mut AnnoyScratch<T>,
+    ) {
+        let AnnoyScratch {
+            visited,
+            candidates,
+            pq,
+            ..
+        } = scratch;
+        if visited.len() < self.n {
+            visited.grow(self.n);
+        }
+        candidates.reserve(limit);
+
+        self.trees.visit(query_vec, limit, pq, |leaf_items| {
+            for &item in leaf_items {
+                let item = item as usize;
+                if visited.contains(item) {
+                    continue;
+                }
+                visited.insert(item);
+                candidates.push((self.distance_to_query(item, query_vec, query_norm), item));
+            }
+        });
+
+        // Clear only the visited bits touched; every scored item is in
+        // `candidates`.
+        for &(_, item) in candidates.iter() {
+            visited.remove(item);
+        }
+    }
+
+    /// Voting search: count leaf hits per item, then score only the items
+    /// reached at least `vote` times.
+    ///
+    /// Falls back to scoring every reached item when fewer than `k` pass the
+    /// threshold, so the result is never shorter than the default path's.
+    ///
+    /// ### Params
+    ///
+    /// * `query_vec` - Query vector
+    /// * `k` - Number of neighbours requested
+    /// * `limit` - Budget of leaf items to visit
+    /// * `vote` - Minimum leaf hits, at least 2
+    /// * `query_norm` - L2 norm of the query, only read for Cosine
+    /// * `scratch` - Reusable buffers; scored items land in `candidates`
+    fn query_voted(
+        &self,
+        query_vec: &[T],
+        k: usize,
+        limit: usize,
+        vote: u8,
+        query_norm: T,
+        scratch: &mut AnnoyScratch<T>,
+    ) {
+        let AnnoyScratch {
+            candidates,
+            pq,
+            votes,
+            touched,
+            ..
+        } = scratch;
+        if votes.len() < self.n {
+            votes.resize(self.n, 0);
+        }
+        touched.clear();
+
+        self.trees.visit(query_vec, limit, pq, |leaf_items| {
+            for &item in leaf_items {
+                let c = &mut votes[item as usize];
+                if *c == 0 {
+                    touched.push(item);
+                }
+                *c = c.saturating_add(1);
+            }
+        });
+
+        for &item in touched.iter() {
+            let item = item as usize;
+            if votes[item] >= vote {
+                candidates.push((self.distance_to_query(item, query_vec, query_norm), item));
+            }
+        }
+        if candidates.len() < k {
+            for &item in touched.iter() {
+                let item = item as usize;
+                if votes[item] < vote {
+                    candidates.push((self.distance_to_query(item, query_vec, query_norm), item));
+                }
+            }
+        }
+
+        for &item in touched.iter() {
+            votes[item as usize] = 0;
+        }
+    }
+
     /// Query using a matrix row reference
     ///
     /// Optimised path for contiguous memory (stride == 1), otherwise copies
@@ -1362,7 +1499,8 @@ where
     /// * `query_row` - Row reference
     /// * `k` - Number of neighbours to search
     /// * `search_k` - Budget of items to examine (higher = better recall,
-    ///   slower). Defaults to `k * n_trees * 20` if None
+    ///   slower). See [`Self::query_into`] for the default
+    /// * `vote_threshold` - Candidate voting, see [`Self::query_into`]
     ///
     /// ### Returns
     ///
@@ -1373,15 +1511,16 @@ where
         query_row: RowRef<T>,
         k: usize,
         search_k: Option<usize>,
+        vote_threshold: Option<u8>,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         if query_row.col_stride() == 1 {
             let slice =
                 unsafe { std::slice::from_raw_parts(query_row.as_ptr(), query_row.ncols()) };
-            return self.query(slice, k, search_k);
+            return self.query(slice, k, search_k, vote_threshold);
         }
 
         let query_vec: Vec<T> = query_row.iter().cloned().collect();
-        self.query(&query_vec, k, search_k)
+        self.query(&query_vec, k, search_k, vote_threshold)
     }
 
     /// Generate kNN graph from vectors stored in the index
@@ -1392,7 +1531,8 @@ where
     /// ### Params
     ///
     /// * `k` - Number of neighbours per vector
-    /// * `search_k` - Search budget (defaults to k * n_trees * 20 if None)
+    /// * `search_k` - Search budget. See [`Self::query_into`] for the default
+    /// * `vote_threshold` - Candidate voting, see [`Self::query_into`]
     /// * `return_dist` - Whether to return distances
     /// * `verbosity` - Prints start, progress and end at `Normal`
     ///
@@ -1404,6 +1544,7 @@ where
         &self,
         k: usize,
         search_k: Option<usize>,
+        vote_threshold: Option<u8>,
         return_dist: bool,
         verbosity: Verbosity,
     ) -> KnnOptionResult<T> {
@@ -1421,7 +1562,7 @@ where
 
                 progress.tick();
 
-                self.query_into(vec, k, search_k, scratch)?;
+                self.query_into(vec, k, search_k, vote_threshold, scratch)?;
                 let (indices, dists) = scratch.results().iter().map(|&(d, i)| (i, d)).unzip();
                 Ok((orig_id, indices, dists))
             })
@@ -1462,7 +1603,7 @@ where
         k: usize,
     ) -> Result<(Vec<usize>, Vec<T>), AnnSearchErrors> {
         // Use the default here
-        self.query(query_vec, k, None)
+        self.query(query_vec, k, None, None)
     }
 
     fn n(&self) -> usize {
@@ -1569,7 +1710,7 @@ mod tests {
 
         // Query with point 0, should find itself first
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 1, None).unwrap();
+        let (indices, distances) = index.query(&query, 1, None, None).unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0], 0);
@@ -1589,7 +1730,7 @@ mod tests {
         .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None).unwrap();
+        let (indices, distances) = index.query(&query, 3, None, None).unwrap();
 
         // Should find point 0 first (exact match)
         assert_eq!(indices[0], 0);
@@ -1609,7 +1750,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 8, Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None).unwrap();
+        let (indices, distances) = index.query(&query, 3, None, None).unwrap();
 
         // Should find point 0 first (identical direction)
         assert_eq!(indices[0], 0);
@@ -1632,7 +1773,7 @@ mod tests {
 
         let query = vec![1.0, 0.0, 0.0];
         // ask for 10 neighbours but only 5 points exist
-        let (indices, _) = index.query(&query, 10, None).unwrap();
+        let (indices, _) = index.query(&query, 10, None, None).unwrap();
 
         // Should return at most 5 results
         assert!(indices.len() <= 5);
@@ -1655,8 +1796,8 @@ mod tests {
         let query = vec![1.0, 0.0, 0.0];
 
         // With higher search_k, should get same or better results
-        let (indices1, _) = index.query(&query, 3, Some(10)).unwrap();
-        let (indices2, _) = index.query(&query, 3, Some(50)).unwrap();
+        let (indices1, _) = index.query(&query, 3, Some(10), None).unwrap();
+        let (indices2, _) = index.query(&query, 3, Some(50), None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1685,8 +1826,8 @@ mod tests {
         .unwrap();
 
         let query = vec![0.9, 0.1, 0.0];
-        let (indices1, _) = index_few.query(&query, 3, None).unwrap();
-        let (indices2, _) = index_many.query(&query, 3, None).unwrap();
+        let (indices1, _) = index_few.query(&query, 3, None, None).unwrap();
+        let (indices2, _) = index_many.query(&query, 3, None, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1705,7 +1846,7 @@ mod tests {
         .unwrap();
 
         // Query using a row from the matrix
-        let (indices, distances) = index.query_row(mat.row(0), 1, None).unwrap();
+        let (indices, distances) = index.query_row(mat.row(0), 1, None, None).unwrap();
 
         assert_eq!(indices[0], 0);
         assert_relative_eq!(distances[0], 0.0, epsilon = 1e-5);
@@ -1734,8 +1875,8 @@ mod tests {
         .unwrap();
 
         let query = vec![0.5, 0.5, 0.0];
-        let (indices1, _) = index1.query(&query, 3, None).unwrap();
-        let (indices2, _) = index2.query(&query, 3, None).unwrap();
+        let (indices1, _) = index1.query(&query, 3, None, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None, None).unwrap();
 
         assert_eq!(indices1, indices2);
     }
@@ -1765,8 +1906,8 @@ mod tests {
         let query = vec![0.5, 0.5, 0.0];
 
         // Both should still find reasonable neighbours (though order might differ)
-        let (indices1, _) = index1.query(&query, 3, None).unwrap();
-        let (indices2, _) = index2.query(&query, 3, None).unwrap();
+        let (indices1, _) = index1.query(&query, 3, None, None).unwrap();
+        let (indices2, _) = index2.query(&query, 3, None, None).unwrap();
 
         assert_eq!(indices1.len(), 3);
         assert_eq!(indices2.len(), 3);
@@ -1797,7 +1938,7 @@ mod tests {
 
         // Query for point 0
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 5, None).unwrap();
+        let (indices, _) = index.query(&query, 5, None, None).unwrap();
 
         assert_eq!(indices.len(), 5);
         assert_eq!(indices[0], 0); // Should find exact match
@@ -1811,7 +1952,7 @@ mod tests {
         let index = AnnoyIndex::new(mat.as_ref(), 4, Dist::Cosine, 42, Verbosity::Quiet).unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
-        let (indices, distances) = index.query(&query, 3, None).unwrap();
+        let (indices, distances) = index.query(&query, 3, None, None).unwrap();
 
         // First result should be the parallel vector
         assert_eq!(indices[0], 0);
@@ -1839,8 +1980,58 @@ mod tests {
         .unwrap();
 
         let query: Vec<f32> = (0..dim).map(|_| 0.0).collect();
-        let (indices, _) = index.query(&query, 3, None).unwrap();
+        let (indices, _) = index.query(&query, 3, None, None).unwrap();
 
         assert_eq!(indices.len(), 3);
+    }
+
+    /// Random-ish index shared by the voting tests.
+    ///
+    /// ### Returns
+    ///
+    /// `(index, data)` with 2,000 points in 16 dimensions and 20 trees.
+    fn voting_index() -> (AnnoyIndex<f32>, Mat<f32>) {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mat = Mat::from_fn(2000, 16, |_, _| rng.random::<f32>());
+        let index = AnnoyIndex::new(
+            mat.as_ref(),
+            20,
+            Dist::SquaredEuclidean,
+            42,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        (index, mat)
+    }
+
+    #[test]
+    fn test_annoy_vote_threshold_one_is_default_path() {
+        let (index, mat) = voting_index();
+        for i in (0..2000).step_by(97) {
+            let a = index.query_row(mat.row(i), 10, Some(2000), None).unwrap();
+            let b = index.query_row(mat.row(i), 10, Some(2000), Some(1)).unwrap();
+            assert_eq!(a.0, b.0);
+        }
+    }
+
+    #[test]
+    fn test_annoy_voting_finds_self() {
+        let (index, mat) = voting_index();
+        for i in (0..2000).step_by(97) {
+            let (indices, distances) = index.query_row(mat.row(i), 10, None, Some(2)).unwrap();
+            assert_eq!(indices.len(), 10);
+            assert_eq!(indices[0], i);
+            assert_relative_eq!(distances[0], 0.0, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_annoy_voting_unreachable_threshold_falls_back() {
+        let (index, mat) = voting_index();
+        // More votes than trees: nothing passes, so every reached item is
+        // scored and the result matches the default path at the same budget.
+        let a = index.query_row(mat.row(5), 10, Some(500), None).unwrap();
+        let b = index.query_row(mat.row(5), 10, Some(500), Some(50)).unwrap();
+        assert_eq!(a.0, b.0);
     }
 }

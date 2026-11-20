@@ -186,12 +186,12 @@ fn annoy_cosine_is_non_negative() {
     let (data, n, dim) = blobs();
     let index = build_annoy_index((&data[..], n, dim), "cosine", 8, 42, Verbosity::Quiet).unwrap();
 
-    let (_, self_d) = query_annoy_self(&index, K, None, true, Verbosity::Quiet).unwrap();
+    let (_, self_d) = query_annoy_self(&index, K, None, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("annoy self", &self_d);
 
     let queries = &data[..50 * dim];
     let (_, cross_d) =
-        query_annoy_index((queries, 50, dim), &index, K, None, true, Verbosity::Quiet).unwrap();
+        query_annoy_index((queries, 50, dim), &index, K, None, None, true, Verbosity::Quiet).unwrap();
     assert_non_negative("annoy cross", &cross_d);
 }
 

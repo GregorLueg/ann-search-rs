@@ -106,6 +106,7 @@ fn main() {
                 &annoy_idx,
                 cli.k,
                 search_budget,
+                None,
                 true,
                 Verbosity::Quiet,
             )
@@ -140,7 +141,7 @@ fn main() {
         println!("Self-querying Annoy index...");
         let start = Instant::now();
         let (approx_neighbors_self, approx_distances_self) =
-            query_annoy_self(&annoy_idx, cli.k, None, true, Verbosity::Quiet).unwrap();
+            query_annoy_self(&annoy_idx, cli.k, None, None, true, Verbosity::Quiet).unwrap();
         let self_query_time = start.elapsed().as_secs_f64() * 1000.0;
 
         let recall_self = calculate_recall(&true_neighbors_self, &approx_neighbors_self, cli.k);

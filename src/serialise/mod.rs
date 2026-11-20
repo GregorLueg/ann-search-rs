@@ -462,7 +462,7 @@ mod tests {
         test_round_trip_annoy,
         AnnoyIndex<f32>,
         |m| build_annoy_index(m, "euclidean", 4, 1, Verbosity::Quiet).unwrap(),
-        |i, q| unwrap_knn(query_annoy_index(q, i, K, None, true, Verbosity::Quiet))
+        |i, q| unwrap_knn(query_annoy_index(q, i, K, None, None, true, Verbosity::Quiet))
     );
 
     round_trip!(
